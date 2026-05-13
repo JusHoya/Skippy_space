@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+out/
+target/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Tauri / Rust build artifacts
+apps/shell/src-tauri/target/
+apps/shell/src-tauri/WixTools/
+apps/shell/src-tauri/gen/
+apps/shell/src-tauri/.tauri/
+
+# Vault — local-only state
+vault/.smart-env/
+vault/.obsidian/workspace*.json
+
+# Replay artifacts
+.replay
+*.replay
+
+# Skippy_space local state
+.skippy/
+
+# Agent-space machine-local overrides
+agent_space/.claude/settings.local.json
+
+# Claude Code machine-local overrides (root .claude/)
+.claude/settings.local.json

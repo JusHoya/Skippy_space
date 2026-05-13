@@ -1,0 +1,441 @@
+/* Skippy_space HUD — palette pinned to PRD §3.4 */
+:root {
+  --c-dark-matter: #0B0C10;
+  --c-starlight: #C5C6C7;
+  --c-neon-cyan: #66FCF1;
+  --c-muted-cyan: #45A29E;
+  --c-electric-purple: #BC13FE;
+
+  --c-panel-bg: #11141a;
+  --c-panel-border: #1f2630;
+  --c-panel-bg-soft: #161a22;
+  --c-text-dim: #7b8a93;
+
+  --font-hud: 'Orbitron', 'Montserrat', 'Inter', system-ui, sans-serif;
+  --font-body: 'Inter', 'Roboto', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  background: var(--c-dark-matter);
+  color: var(--c-starlight);
+  font-family: var(--font-body);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  user-select: none;
+}
+
+button {
+  font-family: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--c-muted-cyan);
+  border-radius: 2px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+button:hover {
+  background: rgba(102, 252, 241, 0.08);
+  border-color: var(--c-neon-cyan);
+  color: var(--c-neon-cyan);
+}
+button:focus-visible {
+  outline: 1px solid var(--c-neon-cyan);
+  outline-offset: 2px;
+}
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+input,
+textarea {
+  font-family: inherit;
+  color: var(--c-starlight);
+  background: var(--c-panel-bg-soft);
+  border: 1px solid var(--c-panel-border);
+  border-radius: 2px;
+  padding: 6px 8px;
+  outline: none;
+}
+input:focus,
+textarea:focus {
+  border-color: var(--c-neon-cyan);
+  box-shadow: 0 0 0 1px rgba(102, 252, 241, 0.3);
+}
+
+/* The HUD grid — PRD §7.1
+ * topbar across the top.
+ * map fills the left/center; side panel is the right rail.
+ * terminal cluster lives below the map.
+ * minimap sits to the left of the terminal at the bottom. */
+.hud {
+  display: grid;
+  height: 100vh;
+  grid-template-areas:
+    "topbar topbar topbar"
+    "map    map    side"
+    "term   term   side"
+    "mini   term   side";
+  grid-template-columns: 1fr 3fr 360px;
+  grid-template-rows: 48px 1fr 240px 200px;
+  gap: 4px;
+  padding: 4px;
+}
+
+.topbar {
+  grid-area: topbar;
+}
+.map-area {
+  grid-area: map;
+  position: relative;
+  overflow: hidden;
+  background: radial-gradient(ellipse at center, #0d1117 0%, var(--c-dark-matter) 70%);
+  border: 1px solid var(--c-panel-border);
+  border-radius: 2px;
+}
+.side-panel {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  background: var(--c-panel-bg);
+  border: 1px solid var(--c-panel-border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.terminal-cluster {
+  grid-area: term;
+  background: var(--c-panel-bg);
+  border: 1px solid var(--c-panel-border);
+  border-radius: 2px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.minimap {
+  grid-area: mini;
+  background: var(--c-panel-bg);
+  border: 1px solid var(--c-panel-border);
+  border-radius: 2px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Reusable panel chrome */
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  font-family: var(--font-hud);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--c-muted-cyan);
+  background: var(--c-panel-bg-soft);
+  border-bottom: 1px solid var(--c-panel-border);
+  flex: 0 0 auto;
+}
+
+.panel-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 10px;
+}
+
+.panel-tabs {
+  display: flex;
+  gap: 0;
+  flex: 0 0 auto;
+  background: var(--c-panel-bg-soft);
+  border-bottom: 1px solid var(--c-panel-border);
+}
+.panel-tab {
+  flex: 1;
+  padding: 6px 10px;
+  font-family: var(--font-hud);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  cursor: pointer;
+}
+.panel-tab.active {
+  color: var(--c-neon-cyan);
+  border-bottom-color: var(--c-neon-cyan);
+}
+
+/* TopBar */
+.topbar-inner {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  gap: 18px;
+  padding: 0 12px;
+  background: var(--c-panel-bg);
+  border: 1px solid var(--c-panel-border);
+  border-radius: 2px;
+  font-family: var(--font-hud);
+}
+.topbar-brand {
+  color: var(--c-neon-cyan);
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  font-size: 13px;
+  text-transform: uppercase;
+}
+.topbar-stat {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--c-text-dim);
+}
+.topbar-stat .value {
+  color: var(--c-starlight);
+  font-variant-numeric: tabular-nums;
+}
+.topbar-stat .unit {
+  color: var(--c-muted-cyan);
+}
+.topbar-spacer {
+  flex: 1;
+}
+.topbar-actions {
+  display: flex;
+  gap: 6px;
+}
+.topbar-actions button {
+  padding: 2px 8px;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* CommandBar */
+.command-bar {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 12px;
+  width: min(720px, 90%);
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  background: rgba(17, 20, 26, 0.92);
+  border: 1px solid var(--c-muted-cyan);
+  border-radius: 2px;
+  backdrop-filter: blur(6px);
+  z-index: 20;
+}
+.command-bar input {
+  flex: 1;
+  font-family: var(--font-mono);
+}
+.command-bar .status {
+  font-family: var(--font-hud);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--c-electric-purple);
+  align-self: center;
+  padding: 0 8px;
+}
+
+/* Selected / Telemetry panel bits */
+.identity-block {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.portrait {
+  width: 64px;
+  height: 64px;
+  border: 1px solid var(--c-muted-cyan);
+  background: var(--c-panel-bg-soft);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-hud);
+  color: var(--c-neon-cyan);
+  font-size: 22px;
+}
+.identity-meta {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.identity-meta .name {
+  font-family: var(--font-hud);
+  letter-spacing: 0.1em;
+  color: var(--c-neon-cyan);
+  text-transform: uppercase;
+}
+.identity-meta .role {
+  font-size: 11px;
+  color: var(--c-text-dim);
+}
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 2px 0;
+  border-bottom: 1px dashed var(--c-panel-border);
+}
+.stat-row .k {
+  color: var(--c-text-dim);
+}
+.stat-row .v {
+  color: var(--c-starlight);
+  font-variant-numeric: tabular-nums;
+}
+
+.log-stream {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow: auto;
+  padding: 6px;
+  background: var(--c-panel-bg-soft);
+  border: 1px solid var(--c-panel-border);
+}
+
+/* Command card — 3 rows x 4 cols, SC2 style */
+.command-card {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 4px;
+  padding: 8px;
+  background: var(--c-panel-bg-soft);
+  border-top: 1px solid var(--c-panel-border);
+}
+.command-card .slot {
+  aspect-ratio: 1 / 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: var(--c-panel-bg);
+  border: 1px solid var(--c-panel-border);
+  font-family: var(--font-hud);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--c-text-dim);
+  cursor: pointer;
+  text-transform: uppercase;
+}
+.command-card .slot:hover {
+  border-color: var(--c-neon-cyan);
+  color: var(--c-neon-cyan);
+}
+.command-card .slot .hotkey {
+  color: var(--c-neon-cyan);
+  font-weight: 700;
+  font-size: 11px;
+}
+.command-card .slot.empty {
+  opacity: 0.35;
+  cursor: default;
+}
+.command-card .slot.empty:hover {
+  border-color: var(--c-panel-border);
+  color: var(--c-text-dim);
+}
+
+/* Terminal cluster */
+.terminal-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 4px 0 4px;
+  background: var(--c-panel-bg-soft);
+  border-bottom: 1px solid var(--c-panel-border);
+}
+.terminal-tab {
+  padding: 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--c-text-dim);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0;
+  cursor: pointer;
+}
+.terminal-tab.active {
+  color: var(--c-neon-cyan);
+  border-color: var(--c-panel-border);
+  border-bottom-color: var(--c-panel-bg);
+  background: var(--c-panel-bg);
+}
+.terminal-host {
+  flex: 1 1 auto;
+  position: relative;
+  background: var(--c-dark-matter);
+  padding: 4px;
+}
+
+/* Minimap */
+.minimap-canvas {
+  flex: 1;
+  background: repeating-linear-gradient(
+      0deg,
+      rgba(102, 252, 241, 0.04) 0,
+      rgba(102, 252, 241, 0.04) 1px,
+      transparent 1px,
+      transparent 16px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      rgba(102, 252, 241, 0.04) 0,
+      rgba(102, 252, 241, 0.04) 1px,
+      transparent 1px,
+      transparent 16px
+    );
+  margin: 8px;
+  border: 1px solid var(--c-muted-cyan);
+}
+.minimap-legend {
+  font-family: var(--font-hud);
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--c-text-dim);
+  padding: 0 10px 8px 10px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* Scrollbars — kept narrow + cyan, matches HUD chrome */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--c-panel-bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--c-panel-border);
+  border-radius: 2px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--c-muted-cyan);
+}

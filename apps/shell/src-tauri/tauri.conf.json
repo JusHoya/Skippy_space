@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Skippy_space",
+  "version": "0.1.0",
+  "identifier": "com.hoya.skippyspace",
+  "build": {
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../ui/dist",
+    "beforeDevCommand": "pnpm --filter @skippy/ui dev",
+    "beforeBuildCommand": "pnpm --filter @skippy/ui build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Skippy is, in fact, magnificent",
+        "width": 1600,
+        "height": 1000,
+        "minWidth": 1280,
+        "minHeight": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "category": "DeveloperTool",
+    "shortDescription": "Skippy_space — RTS-style AI agent orchestration dashboard.",
+    "longDescription": "A Windows desktop command bridge where Skippy the Magnificent orchestrates a board of AI agents that build software, write content, and curate a living Obsidian wiki.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "resources": ["../../agent-runtime/dist/**/*"]
+  }
+}

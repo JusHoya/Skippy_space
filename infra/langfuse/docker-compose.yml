@@ -1,0 +1,47 @@
+# Langfuse self-hosted OTLP backend — Phase 1 target (PRD §9.3).
+#
+# This stub is intentionally minimal. Phase 0 does NOT require Langfuse to be
+# running; the renderer reads OTel spans directly off the Tauri Channel until
+# the persistence layer comes online. Bring this up only when you start
+# exercising the OTLP exporter in `packages/otel`.
+#
+# Bring up:  docker compose -f infra/langfuse/docker-compose.yml up -d
+# Tear down: docker compose -f infra/langfuse/docker-compose.yml down
+#
+# Web UI:     http://localhost:3000
+# OTLP HTTP:  http://localhost:4318/v1/traces  (point the collector here)
+
+services:
+  langfuse-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - langfuse-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U langfuse -d langfuse']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  langfuse-server:
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    ports:
+      - '3000:3000'      # web UI
+      - '4318:4318'      # OTLP HTTP ingest (gen_ai semconv)
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: changeme-phase1
+      SALT: changeme-phase1
+      TELEMETRY_ENABLED: 'false'
+
+volumes:
+  langfuse-pgdata:

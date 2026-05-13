@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/shared" },
+    { "path": "./packages/sprite-kit" },
+    { "path": "./packages/otel" },
+    { "path": "./packages/memory" },
+    { "path": "./apps/shell" },
+    { "path": "./apps/ui" },
+    { "path": "./apps/agent-runtime" }
+  ]
+}

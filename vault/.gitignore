@@ -1,0 +1,12 @@
+# Obsidian local config — keep settings, ignore workspace state
+.obsidian/workspace*.json
+.obsidian/cache
+.obsidian/plugins/*/data.json
+
+# Smart Connections embeddings — regenerable, large
+.smart-env/
+
+# Skippy_space-specific
+.skippy/
+*.tmp
+*.lock

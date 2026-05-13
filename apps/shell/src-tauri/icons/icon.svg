@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Placeholder Skippy beercan silhouette for Skippy_space.
+  Palette per PRD §3.4. Replace with hand-pixeled v1 art before release.
+  Rasterize at 1024x1024 to produce src-tauri/icons/icon.png, then run
+  `pnpm --filter @skippy/shell tauri icon ./src-tauri/icons/icon.png`.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="canBody" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#45A29E"/>
+      <stop offset="50%" stop-color="#66FCF1"/>
+      <stop offset="100%" stop-color="#45A29E"/>
+    </linearGradient>
+    <radialGradient id="ledGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#BC13FE"/>
+      <stop offset="100%" stop-color="#BC13FE" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- background -->
+  <rect width="1024" height="1024" fill="#0B0C10"/>
+
+  <!-- subtle grid (cyberpunk ground plane hint) -->
+  <g stroke="#45A29E" stroke-opacity="0.12">
+    <path d="M0 768 L1024 768" stroke-width="2"/>
+    <path d="M0 832 L1024 832" stroke-width="1"/>
+    <path d="M0 896 L1024 896" stroke-width="1"/>
+  </g>
+
+  <!-- antenna -->
+  <line x1="512" y1="160" x2="512" y2="240" stroke="#66FCF1" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="512" cy="148" r="14" fill="#66FCF1"/>
+
+  <!-- beercan body -->
+  <rect x="336" y="240" width="352" height="544" rx="32" ry="32" fill="url(#canBody)" stroke="#C5C6C7" stroke-width="6"/>
+
+  <!-- top rim -->
+  <rect x="336" y="240" width="352" height="40" rx="20" ry="20" fill="#C5C6C7" stroke="#66FCF1" stroke-width="4"/>
+  <!-- pull tab -->
+  <rect x="486" y="252" width="52" height="16" rx="6" ry="6" fill="#0B0C10" stroke="#66FCF1" stroke-width="3"/>
+
+  <!-- bottom rim -->
+  <rect x="336" y="744" width="352" height="40" rx="20" ry="20" fill="#45A29E" stroke="#0B0C10" stroke-width="4"/>
+
+  <!-- the Magnificent insignia: gear + crown -->
+  <g transform="translate(512 480)">
+    <circle r="120" fill="none" stroke="#0B0C10" stroke-width="10"/>
+    <circle r="80" fill="none" stroke="#0B0C10" stroke-width="6"/>
+    <!-- crown over gear -->
+    <polygon points="-60,-90 -30,-130 0,-100 30,-130 60,-90 60,-60 -60,-60" fill="#0B0C10"/>
+  </g>
+
+  <!-- the LED (Skippy's signature blue eye, recolored neon cyan here) -->
+  <circle cx="512" cy="340" r="36" fill="url(#ledGlow)"/>
+  <circle cx="512" cy="340" r="18" fill="#66FCF1"/>
+  <circle cx="512" cy="340" r="8" fill="#0B0C10"/>
+
+  <!-- shimmer scratches -->
+  <g stroke="#C5C6C7" stroke-opacity="0.25" stroke-width="2" fill="none">
+    <path d="M380 320 L420 700"/>
+    <path d="M600 280 L640 720"/>
+  </g>
+</svg>

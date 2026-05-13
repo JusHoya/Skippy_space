@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for Skippy_space main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "dialog:default",
+    "process:default",
+    "shell:allow-execute",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        { "path": "$RESOURCE/**" },
+        { "path": "$APPCONFIG/**" },
+        { "path": "$APPDATA/**" }
+      ]
+    }
+  ]
+}

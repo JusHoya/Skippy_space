@@ -1,0 +1,19 @@
+# Letta self-hosted memory server — Phase 1 target (PRD §5.1, §8 hot memory).
+#
+# Bring up:  docker compose -f infra/letta/docker-compose.yml up -d
+# Tear down: docker compose -f infra/letta/docker-compose.yml down
+#
+# MCP endpoint: http://localhost:8283
+# Tools used by agents: letta_search_archival, letta_append_archival, letta_edit_core.
+
+services:
+  letta:
+    image: letta/letta:latest
+    restart: unless-stopped
+    ports:
+      - '8283:8283'
+    volumes:
+      - letta-data:/root/.letta
+
+volumes:
+  letta-data:

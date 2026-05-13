@@ -1,0 +1,25 @@
+node_modules/
+dist/
+build/
+out/
+target/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# Tauri build artifacts
+apps/shell/src-tauri/target/
+apps/shell/src-tauri/gen/
+apps/shell/src-tauri/WixTools/
+
+# Vault — content is authored by agents/humans, not formatted by prettier
+vault/
+
+# Lockfiles
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+
+# Generated
+*.min.js
+*.min.css
