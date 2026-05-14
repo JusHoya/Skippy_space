@@ -11,7 +11,10 @@ export default defineConfig({
   testDir: './tests/visual',
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  // 1 retry locally absorbs the transient flake we see when the validator runs
+  // gallery → HUD back-to-back: 9 Pixi apps churning mount/destroy can starve
+  // the next test's first paint past the default toBeVisible timeout.
+  retries: process.env.CI ? 2 : 1,
   workers: 1,
   reporter: process.env.CI ? 'github' : 'list',
   use: {

@@ -23,7 +23,8 @@
     "autocommit": "node scripts/git-autocommit.mjs --once",
     "test:visual": "playwright test",
     "test:visual:ui": "playwright test --ui",
-    "test:visual:headed": "playwright test --headed"
+    "test:visual:headed": "playwright test --headed",
+    "validate:phase0": "node scripts/phase0-validate.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
