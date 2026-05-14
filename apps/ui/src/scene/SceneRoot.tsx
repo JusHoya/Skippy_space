@@ -29,6 +29,7 @@ export default function SceneRoot() {
 
   useEffect(() => {
     let cancelled = false;
+    let initialized = false;
     const host = hostRef.current;
     if (!host) return;
 
@@ -37,18 +38,26 @@ export default function SceneRoot() {
     let detachTick: (() => void) | null = null;
 
     (async () => {
-      await app.init({
-        backgroundAlpha: 0,
-        antialias: true,
-        resizeTo: host,
-        preference: 'webgl',
-        powerPreference: 'high-performance',
-        resolution: typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
-        autoDensity: true,
-      });
+      try {
+        await app.init({
+          backgroundAlpha: 0,
+          antialias: true,
+          resizeTo: host,
+          preference: 'webgl',
+          powerPreference: 'high-performance',
+          resolution: typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
+          autoDensity: true,
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[SceneRoot] Pixi init failed:', err);
+        return;
+      }
+      initialized = true;
 
       if (cancelled || !hostRef.current) {
-        app.destroy(true);
+        // Unmounted during init (React StrictMode dev double-invoke).
+        app.destroy(true, { children: true, texture: true });
         return;
       }
 
@@ -89,20 +98,18 @@ export default function SceneRoot() {
       };
       app.ticker.add(onTick);
       detachTick = () => app.ticker.remove(onTick);
-    })().catch((err) => {
-      // Cleanly surface init failures — Pixi sometimes throws on WebGL2
-      // context creation when GPU drivers misbehave; we want a console
-      // breadcrumb rather than a silent black canvas.
-      // eslint-disable-next-line no-console
-      console.error('[SceneRoot] Pixi init failed:', err);
-    });
+    })();
 
     return () => {
       cancelled = true;
       detachTick?.();
       cleanupRO?.();
       sceneRefStore.clear();
-      app.destroy(true, { children: true, texture: true });
+      // Guard against StrictMode unmount-before-init: destroy() crashes on a
+      // pre-init Application.
+      if (initialized) {
+        app.destroy(true, { children: true, texture: true });
+      }
     };
   }, []);
 

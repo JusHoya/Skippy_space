@@ -51,6 +51,7 @@ export default function GalleryTile({ id, label, costume }: GalleryTileProps) {
 
   useEffect(() => {
     let cancelled = false;
+    let initialized = false;
     const host = hostRef.current;
     if (!host) return;
 
@@ -58,18 +59,27 @@ export default function GalleryTile({ id, label, costume }: GalleryTileProps) {
     let detachTick: (() => void) | null = null;
 
     (async () => {
-      await app.init({
-        backgroundAlpha: 0,
-        antialias: true,
-        width: TILE_W,
-        height: TILE_H,
-        preference: 'webgl',
-        powerPreference: 'low-power',
-        resolution: typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
-        autoDensity: true,
-      });
+      try {
+        await app.init({
+          backgroundAlpha: 0,
+          antialias: true,
+          width: TILE_W,
+          height: TILE_H,
+          preference: 'webgl',
+          powerPreference: 'low-power',
+          resolution: typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
+          autoDensity: true,
+        });
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[gallery] Pixi init failed for tile "${id}":`, err);
+        return;
+      }
+      initialized = true;
       if (cancelled || !hostRef.current) {
-        app.destroy(true);
+        // Unmounted during init (React StrictMode dev double-invoke).
+        // destroy() is safe now that init resolved.
+        app.destroy(true, { children: true, texture: true });
         return;
       }
       host.appendChild(app.canvas);
@@ -96,15 +106,16 @@ export default function GalleryTile({ id, label, costume }: GalleryTileProps) {
       };
       app.ticker.add(onTick);
       detachTick = () => app.ticker.remove(onTick);
-    })().catch((err) => {
-      // eslint-disable-next-line no-console
-      console.error(`[gallery] Pixi init failed for tile "${id}":`, err);
-    });
+    })();
 
     return () => {
       cancelled = true;
       detachTick?.();
-      app.destroy(true, { children: true, texture: true });
+      // Only call destroy() if init() resolved — calling on a pre-init
+      // Application throws `_cancelResize is not a function`.
+      if (initialized) {
+        app.destroy(true, { children: true, texture: true });
+      }
     };
     // We intentionally re-init on costume changes (cheap, n=9) so each tile
     // always reflects the latest costume descriptor.

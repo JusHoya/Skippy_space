@@ -85,13 +85,17 @@ textarea:focus {
 .hud {
   display: grid;
   height: 100vh;
-  grid-template-areas:
-    "topbar topbar topbar"
-    "map    map    side"
-    "term   term   side"
-    "mini   term   side";
-  grid-template-columns: 1fr 3fr 360px;
-  grid-template-rows: 48px 1fr 240px 200px;
+  /* The previous 4-row layout made `term` an L-shape (row 3 spanned cols
+     1-2, row 4 only col 2), which is invalid CSS — every named area must
+     be a rectangle. The browser silently drops the whole declaration when
+     that's violated. This 3-row variant keeps PRD §7.1's spirit (mini-map
+     bottom-left, terminal center-bottom, side-rail full-height) with valid
+     rectangular areas. */
+  grid-template:
+    'topbar topbar topbar' 48px
+    'map    map    side' 1fr
+    'mini   term   side' 240px
+    / 240px 1fr 360px;
   gap: 4px;
   padding: 4px;
 }

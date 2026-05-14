@@ -36,6 +36,11 @@ vault/.obsidian/workspace*.json
 .replay
 *.replay
 
+# Playwright transient outputs (screenshots in tests/visual/screenshots/ are committed)
+test-results/
+playwright-report/
+playwright/.cache/
+
 # Skippy_space local state
 .skippy/
 

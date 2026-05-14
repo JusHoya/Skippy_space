@@ -20,10 +20,14 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
     "format": "prettier --write .",
-    "autocommit": "node scripts/git-autocommit.mjs --once"
+    "autocommit": "node scripts/git-autocommit.mjs --once",
+    "test:visual": "playwright test",
+    "test:visual:ui": "playwright test --ui",
+    "test:visual:headed": "playwright test --headed"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",
+    "@playwright/test": "^1.60.0",
     "@types/node": "^22.10.5",
     "eslint": "^9.17.0",
     "prettier": "^3.4.2",
