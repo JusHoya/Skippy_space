@@ -15,7 +15,7 @@ mod sidecar;
 
 use std::sync::Arc;
 
-use tauri::{ipc::Channel, Manager, State};
+use tauri::{ipc::Channel, State};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
