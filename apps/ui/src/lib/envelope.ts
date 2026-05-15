@@ -10,10 +10,19 @@ export {
   AgentTokenEnvelope,
   AgentCompleteEnvelope,
   LogEnvelope,
+  BoardSpawnedEnvelope,
+  BoardReadyEnvelope,
+  BoardStateEnvelope,
+  DelegationEnvelope,
+  DelegationAckEnvelope,
+  DelegationCompleteEnvelope,
+  BoardIdSchema,
 } from '@skippy/shared';
 
 export type {
   Envelope as EnvelopeT,
   AgentId,
   AgentState,
+  BoardId,
+  BoardState,
 } from '@skippy/shared';

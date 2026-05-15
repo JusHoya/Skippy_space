@@ -16,6 +16,10 @@ export interface UiStore {
   paused: boolean;
   panelTab: PanelTab;
   setSelectedAgent: (id: AgentId | null) => void;
+  /** Alias for setSelectedAgent; matches the call shape used by SceneRoot. */
+  setSelected: (id: AgentId) => void;
+  /** Clear the current selection. */
+  clearSelected: () => void;
   togglePaused: () => void;
   setPaused: (v: boolean) => void;
   setPanelTab: (tab: PanelTab) => void;
@@ -26,7 +30,13 @@ export const useUiStore = create<UiStore>((set) => ({
   paused: false,
   panelTab: 'selected',
   setSelectedAgent: (id) => set({ selectedAgentId: id }),
+  setSelected: (id) => set({ selectedAgentId: id }),
+  clearSelected: () => set({ selectedAgentId: null }),
   togglePaused: () => set((s) => ({ paused: !s.paused })),
   setPaused: (v) => set({ paused: v }),
   setPanelTab: (tab) => set({ panelTab: tab }),
 }));
+
+/** Reactive selector hook — components re-render when selection changes. */
+export const useSelectedAgentId = (): AgentId | null =>
+  useUiStore((s) => s.selectedAgentId);
