@@ -9,7 +9,7 @@
 //   pnpm validate:phase0
 //   node scripts/phase0-validate.mjs
 
-import { spawn, execSync } from 'node:child_process';
+import { spawn, execSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,16 +30,25 @@ function loadDotEnv() {
 }
 loadDotEnv();
 
-// pnpm path resolution — handle winget-installed pnpm that isn't on PATH
+// pnpm path resolution — always return an absolute pnpm.exe path so that
+// spawnSync({ shell: false }) can invoke it directly. Going through cmd.exe
+// re-resolves `pnpm` against the parent pnpm shim's PATH when this script is
+// launched via `pnpm validate:phase0`, which corrupts the child cwd and
+// surfaces as a spurious "The system cannot find the path specified. /" fail.
 function resolvePnpm() {
+  // Prefer the winget user-scope canonical path (absolute, .exe form).
+  const wingetPath = `${process.env.LOCALAPPDATA}\\Microsoft\\WinGet\\Packages\\pnpm.pnpm_Microsoft.Winget.Source_8wekyb3d8bbwe\\pnpm.exe`;
+  if (existsSync(wingetPath)) return wingetPath;
+  // PATH lookup — explicitly ask for pnpm.exe to avoid the pnpm.cmd shim.
   try {
-    execSync('pnpm --version', { stdio: 'pipe' });
-    return 'pnpm';
-  } catch {
-    const wingetPath = `${process.env.LOCALAPPDATA}\\Microsoft\\WinGet\\Packages\\pnpm.pnpm_Microsoft.Winget.Source_8wekyb3d8bbwe\\pnpm.exe`;
-    if (existsSync(wingetPath)) return wingetPath;
-    throw new Error('pnpm not found on PATH or in winget user-scope. Install pnpm and retry.');
-  }
+    const lookup = process.platform === 'win32' ? 'where pnpm.exe' : 'command -v pnpm';
+    const out = execSync(lookup, { stdio: 'pipe' }).toString().trim();
+    const first = out.split(/\r?\n/).find((line) => existsSync(line));
+    if (first) return first;
+  } catch {}
+  throw new Error(
+    'pnpm.exe not found. Install via `winget install pnpm.pnpm` or ensure pnpm.exe is on PATH.',
+  );
 }
 const PNPM = resolvePnpm();
 
@@ -67,30 +76,50 @@ function record(name, ok, detail) {
   console.log(`  ${tag}  ${name}${tail}`);
 }
 
-function runShell(name, cmd, opts = {}) {
+function runStep(name, file, args = [], opts = {}) {
   const start = Date.now();
-  try {
-    execSync(cmd, { cwd: root, stdio: 'pipe', shell: true, ...opts });
-    record(name, true, `${Date.now() - start} ms`);
-  } catch (err) {
-    const out = (err.stdout?.toString() ?? '') + (err.stderr?.toString() ?? '');
-    const head = out.split('\n').slice(-5).join(' / ').trim().slice(0, 280);
-    record(name, false, head || err.message.slice(0, 200));
+  const result = spawnSync(file, args, {
+    cwd: root,
+    stdio: 'pipe',
+    // shell: false — invoke the resolved binary directly. cmd.exe re-resolves
+    // pnpm against the parent pnpm shim's PATH, corrupting child cwd.
+    shell: false,
+    ...opts,
+  });
+  if (result.error) {
+    record(name, false, result.error.message.slice(0, 200));
+    return;
   }
+  if (result.status !== 0) {
+    const out = (result.stdout?.toString() ?? '') + (result.stderr?.toString() ?? '');
+    const head = out.split('\n').slice(-5).join(' / ').trim().slice(0, 280);
+    record(name, false, head || `exit ${result.status}`);
+    return;
+  }
+  record(name, true, `${Date.now() - start} ms`);
 }
 
 // ── checks ──────────────────────────────────────────────────────────────────
 console.log(`\n${DIM}# Skippy_space — Phase 0 exit-gate validator${RESET}\n`);
 
 console.log(`${DIM}stack${RESET}`);
-runShell('typecheck (pnpm -r typecheck)', `"${PNPM}" -r typecheck`);
-runShell('agent-runtime build (tsup)', `"${PNPM}" --filter @skippy/agent-runtime build`);
-runShell('cargo check (Rust shell)', `cargo check --manifest-path apps/shell/src-tauri/Cargo.toml --quiet`, {
-  env: cargoEnv(),
-});
+runStep('typecheck (pnpm -r typecheck)', PNPM, ['-r', 'typecheck']);
+runStep('agent-runtime build (tsup)', PNPM, ['--filter', '@skippy/agent-runtime', 'build']);
+runStep(
+  'cargo check (Rust shell)',
+  'cargo',
+  ['check', '--manifest-path', 'apps/shell/src-tauri/Cargo.toml', '--quiet'],
+  { env: cargoEnv() },
+);
 
 console.log(`\n${DIM}renderer${RESET}`);
-runShell('visual smoke (Playwright, 3 specs)', `"${PNPM}" exec playwright test tests/visual/gallery.spec.ts --reporter=line`);
+runStep('visual smoke (Playwright, 3 specs)', PNPM, [
+  'exec',
+  'playwright',
+  'test',
+  'tests/visual/gallery.spec.ts',
+  '--reporter=line',
+]);
 
 console.log(`\n${DIM}artifacts${RESET}`);
 function checkExists(name, relPath) {

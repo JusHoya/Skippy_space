@@ -17,12 +17,21 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 1,
   workers: 1,
   reporter: process.env.CI ? 'github' : 'list',
+  // Per-test budget: Vite cold-start re-optimize after a lockfile change can
+  // swallow 30–60 s before the first test even gets to act; 9 Pixi apps in
+  // gallery.spec then add their own paint cost. 120 s leaves headroom.
+  timeout: 120_000,
+  expect: {
+    timeout: 15_000,
+  },
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'retain-on-failure',
     video: 'retain-on-failure',
     screenshot: 'only-on-failure',
     viewport: { width: 1280, height: 800 },
+    navigationTimeout: 30_000,
+    actionTimeout: 15_000,
   },
   projects: [
     {
@@ -34,7 +43,9 @@ export default defineConfig({
     command: 'pnpm --filter @skippy/ui dev',
     port: 5173,
     reuseExistingServer: !process.env.CI,
-    timeout: 60_000,
+    // 180 s tolerates Vite cold-start + dep re-optimize when launched fresh by
+    // `pnpm validate:phase0` after a lockfile change.
+    timeout: 180_000,
     stdout: 'pipe',
     stderr: 'pipe',
   },
