@@ -1,0 +1,73 @@
+# OpenTelemetry Collector (contrib) configuration — Phase 1.
+#
+# The Rust shell's bundled OTel collector forwards to this network collector
+# in dev; in v1 we will move the collector into the Rust shell process (per
+# PRD §9.2). For Phase 1 we run it as a sidecar Docker container so we can
+# iterate without rebuilding the Tauri shell every time.
+#
+# Pipeline:
+#   agent-runtime (Node) ──OTLP/HTTP :4319──► this collector
+#                          ──OTLP/gRPC :4317──► this collector
+#                                                  │
+#                                                  ├──► Langfuse OTLP at
+#                                                  │     http://langfuse-server:3000
+#                                                  │     /api/public/otel/v1/traces
+#                                                  │
+#                                                  └──► stdout (debug)
+#
+# Why HTTP on :4319 and not the canonical :4318:
+#   Langfuse's own server already binds :4318 (its OTLP ingest path). To run
+#   both on one host we shift this collector's HTTP receiver to :4319. The
+#   agent-runtime's OTEL_EXPORTER_OTLP_ENDPOINT env var must point here, not
+#   directly at Langfuse, so we can fan out to multiple exporters.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4319
+
+processors:
+  # Bound memory consumption — refuse new spans before the container OOMs.
+  # 512 MiB ballast is plenty for hobby-scale Skippy traffic; tune up when
+  # the board agents start chattering.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # Standard batching for throughput. Defaults are reasonable; explicit
+  # for clarity.
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  # Primary persistence: Langfuse's OTLP ingest path. The hostname
+  # `langfuse-server` resolves via the shared docker network — see
+  # infra/otel-collector/docker-compose.yml.
+  otlphttp/langfuse:
+    endpoint: http://langfuse-server:3000/api/public/otel
+    # Langfuse OTLP is HTTP, gen_ai semconv-aware. Headers carry auth in
+    # production; for hobby/local we rely on the Langfuse server's own
+    # default project. Override here (or via env) when multi-tenant.
+    # headers:
+    #   Authorization: 'Basic <base64(public:secret)>'
+    tls:
+      insecure: true
+
+  # Always-on debug fan-out so `docker compose logs` shows every span.
+  # `logging` is deprecated in newer collector builds in favor of `debug`;
+  # the contrib image at the version we pin still accepts `logging`.
+  logging:
+    loglevel: info
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlphttp/langfuse, logging]

@@ -1,0 +1,45 @@
+# OTel Collector (contrib) sidecar — Phase 1 (PRD §9.2).
+#
+# Sits between the agent-runtime sidecar and Langfuse so we can fan out
+# to multiple exporters and iterate the pipeline without rebuilding the
+# Tauri shell. In v1 the collector moves into the Rust shell process.
+#
+# Bring up:  docker compose --profile otel -f infra/otel-collector/docker-compose.yml up -d
+# Tear down: docker compose -f infra/otel-collector/docker-compose.yml down
+#
+# Ports:
+#   :4317  OTLP/gRPC receiver
+#   :4319  OTLP/HTTP receiver (shifted from canonical :4318 to avoid clashing
+#          with Langfuse's own ingest on :4318)
+#
+# Network: joins the default network for the langfuse compose stack so it
+# can resolve `langfuse-server` by name. Compose names that network
+# `langfuse_default` — declare it as external below.
+
+services:
+  otel-collector:
+    # 0.110.0 is the most recent known-good contrib tag at Phase 1 plan time
+    # (2026-05-14). Bump deliberately.
+    image: otel/opentelemetry-collector-contrib:0.110.0
+    restart: unless-stopped
+    profiles: ['otel']
+    command: ['--config=/etc/otelcol-contrib/config.yaml']
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - '4317:4317'    # OTLP/gRPC
+      - '4319:4319'    # OTLP/HTTP (note the shift away from :4318)
+    networks:
+      - default
+      - langfuse
+
+networks:
+  default:
+    driver: bridge
+  langfuse:
+    # Created by infra/langfuse/docker-compose.yml. Mark external so we
+    # don't try to manage its lifecycle from here. If the langfuse stack
+    # isn't running, this container starts fine but the otlphttp/langfuse
+    # exporter will fail-soft until it is.
+    external: true
+    name: langfuse_default

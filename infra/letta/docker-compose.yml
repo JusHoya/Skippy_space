@@ -1,19 +1,37 @@
 # Letta self-hosted memory server — Phase 1 target (PRD §5.1, §8 hot memory).
 #
-# Bring up:  docker compose -f infra/letta/docker-compose.yml up -d
+# Bring up:  docker compose --profile letta -f infra/letta/docker-compose.yml up -d
 # Tear down: docker compose -f infra/letta/docker-compose.yml down
 #
 # MCP endpoint: http://localhost:8283
 # Tools used by agents: letta_search_archival, letta_append_archival, letta_edit_core.
+#
+# Version note: Letta's tags churn fast and 0.5.x is the line we want
+# (compatible with the @letta-ai SDK shape the agent-runtime expects).
+# Leaving `:latest` here for now with a TODO — pin once we've verified
+# a specific build round-trips with the runtime in Phase 1.
 
 services:
   letta:
+    # TODO(infra): pin to letta/letta:0.5.x once Phase 1 validates a build.
+    # `:latest` is acceptable for hobby/dev use only.
     image: letta/letta:latest
     restart: unless-stopped
+    profiles: ['letta']
     ports:
       - '8283:8283'
     volumes:
       - letta-data:/root/.letta
+    healthcheck:
+      # TODO(infra): confirm Letta exposes /v1/health/ — the OSS image's
+      # endpoint has moved twice in the past year. If this fails, swap to
+      # `curl -fsS http://localhost:8283/` (root path returns 200 OK on
+      # current builds) or drop the healthcheck entirely until confirmed.
+      test: ['CMD-SHELL', 'curl -fsS http://localhost:8283/v1/health/ || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
 
 volumes:
   letta-data:

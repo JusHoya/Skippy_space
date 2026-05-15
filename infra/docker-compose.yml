@@ -1,0 +1,32 @@
+# Unified Phase 1 telemetry plane — Langfuse + OTel Collector + Letta.
+#
+# Bring everything up:
+#   docker compose -f infra/docker-compose.yml up -d
+#
+# Tear everything down:
+#   docker compose -f infra/docker-compose.yml down
+#
+# This file uses the Compose `include` directive (requires Docker Compose
+# v2.20+, which ships with Docker Desktop 4.27+, released Jan 2024).
+# On older Compose, fall back to the explicit multi-file invocation:
+#
+#   docker compose `
+#     -f infra/langfuse/docker-compose.yml `
+#     -f infra/otel-collector/docker-compose.yml `
+#     -f infra/letta/docker-compose.yml `
+#     up -d
+#
+# The PowerShell scripts under scripts/phase1-*.ps1 use the per-stack form
+# so they work regardless of Compose version.
+#
+# Boot order rationale (also encoded in scripts/phase1-up.ps1):
+#   1. Langfuse — receives spans; nothing depends on it being absent.
+#   2. OTel Collector — needs `langfuse-server` resolvable on the shared
+#      docker network to send via the otlphttp/langfuse exporter.
+#   3. Letta — independent of the telemetry pipeline; bring up last so
+#      Langfuse + collector have headroom on Docker's resource quota.
+
+include:
+  - path: ./langfuse/docker-compose.yml
+  - path: ./otel-collector/docker-compose.yml
+  - path: ./letta/docker-compose.yml
