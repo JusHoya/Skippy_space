@@ -13,3 +13,4 @@
 export * from './frontmatter.js';
 export * from './atomic.js';
 export * from './ulid.js';
+export * from './daily.js';
