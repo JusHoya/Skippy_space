@@ -10,6 +10,7 @@
 mod channel;
 mod envelope;
 mod git_autocommit;
+mod project_tree;
 mod pty;
 mod sidecar;
 
@@ -167,6 +168,7 @@ pub fn run() {
             pty_subscribe,
             events_subscribe,
             vault_autocommit_now,
+            project_tree::project_tree_scan,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Skippy_space shell");

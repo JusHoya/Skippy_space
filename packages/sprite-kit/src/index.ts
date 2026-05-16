@@ -40,6 +40,9 @@ export { SKIPPY_COSTUME, SKIPPY_LABEL } from './skippy';
 
 export { tickBeercan } from './tick';
 
+export type { CreateTaskAgentBeercanOpts } from './walker';
+export { createTaskAgentBeercan } from './walker';
+
 /**
  * Enumerate every named costume in the sprite kit — Skippy first, then the
  * eight boards in canonical order. Used by the sprite gallery (and any other

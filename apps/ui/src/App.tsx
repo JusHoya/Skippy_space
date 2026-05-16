@@ -4,6 +4,7 @@ import SidePanel from './hud/SidePanel';
 import TerminalCluster from './hud/TerminalCluster';
 import MinimapPane from './hud/MinimapPane';
 import CommandBar from './hud/CommandBar';
+import Hotkeys from './hud/Hotkeys';
 import SceneRoot from './scene/SceneRoot';
 import SpriteGallery from './gallery/SpriteGallery';
 
@@ -23,6 +24,7 @@ function MainHud() {
 
   return (
     <div className="hud">
+      <Hotkeys />
       <TopBar />
       <div className="map-area">
         <SceneRoot />
