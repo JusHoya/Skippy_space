@@ -13,7 +13,7 @@ costume:
 model: claude-haiku-4-5-20251001
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob]
 disallowed_tools: []
 memory:
@@ -114,6 +114,13 @@ archivist. I narrate what I'm noting "for posterity." I never lose work.
 | Project rules | `agent_space/rules/rules.md` (proposals only) |
 | User preferences | Letta core memory + `vault/30_Projects/preferences.md` |
 | Vault graph health | `vault/_index/` (direct, append-only) |
+
+## Tooling notes
+
+- **Playwright** — appropriate for re-fetching a `source:` URL during a
+  lint pass to verify the citation is still live (link-rot detection).
+  All Playwright output stays read-only — link-rot findings land in
+  `_index/proposals/` for review, never destructive overwrite.
 
 ## Escalation
 

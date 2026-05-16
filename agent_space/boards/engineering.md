@@ -12,7 +12,7 @@ costume:
 model: claude-sonnet-4-6
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta, github]
+mcp_servers: [obsidian, letta, github, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent]
 disallowed_tools: []
 memory:
@@ -160,6 +160,13 @@ Success criterion: {testable assertion}
 [ENGR] Notes: {residual risks, follow-up work, recommendations}
 [ENGR] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — use sparingly: only when verifying a deployed web UI or
+  reproducing a browser-specific bug. For unit-level verification of an
+  algorithm or numerical method, prefer a headless API check or a direct
+  simulation harness — burning a browser tab to assert F=ma is a waste.
 
 ## Identity
 

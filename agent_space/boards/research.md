@@ -14,7 +14,7 @@ model_overrides:
   deepdive: claude-sonnet-4-6
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent, WebSearch, WebFetch]
 disallowed_tools: []
 memory:
@@ -185,6 +185,14 @@ distilled_from: ["01HZX..."]
 [RSCH] Stats: {N sources cited, N atomic notes produced}
 [RSCH] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — appropriate when a source hides behind JavaScript
+  rendering or a paywall preview that `WebFetch` can't see. The
+  `research_specialist` may navigate, snapshot the DOM, and quote it with
+  the URL as citation. Never use it to defeat a real paywall — that's a
+  monkey-escalation, not a tooling decision.
 
 ## Identity
 

@@ -96,6 +96,42 @@ The costume stanza is consumed by `packages/sprite-kit/src/boards.ts` —
 costume is a Phase-1 lint failure (the `validate:phase1` script — owned by
 Agent F — will assert equality).
 
+## MCP server registry
+
+Charters declare available MCP servers via the `mcp_servers:` frontmatter
+array. The runtime sidecar (`apps/agent-runtime/`) doesn't consume that
+array yet — Phase 3 wires it into each agent's `query()` config — but the
+declarations are the source of truth for *what an agent will be able to
+call once the loop is wired*. PRD §8.9 lists the Obsidian-side MCP servers
+(`cyanheads/obsidian-mcp-server`, `jacksteamdev/obsidian-mcp-tools`).
+Beyond those, the registry currently includes:
+
+| Server | Source | Purpose | Scope |
+|---|---|---|---|
+| `obsidian` | `cyanheads/obsidian-mcp-server` + `jacksteamdev/obsidian-mcp-tools` (PRD §8.9) | Surgical vault edits, frontmatter ops, Dataview queries, semantic search via Smart Connections. | All Boards + Skippy + Staff Officers. |
+| `letta` | Letta server (self-hosted via `infra/letta/`) | Long-term agent memory (core, archival, episodic). Each agent binds to `letta_agent_id`. | All Boards + Skippy + Staff Officers. |
+| `github` | `github/github-mcp-server` | Repo, PR, issue, and Actions ops for Boards that touch git. | Engineering, Coding, DevOps. |
+| `playwright` | `@playwright/mcp` (npm; official Microsoft Playwright MCP server) | Headless + headful browser automation — `browser_navigate`, `browser_click`, `browser_type`, `browser_snapshot`, `browser_evaluate`, etc. | Skippy + every Board + every Staff Officer. |
+
+### Playwright — install + setup
+
+- **One-shot invocation:** `pnpm dlx @playwright/mcp@latest` lets a Phase-3
+  agent pull the latest server without installing it permanently.
+- **Pinned install:** `pnpm add -g @playwright/mcp` (or pin a specific
+  version inside the future `agent_space/settings.json`) when you want a
+  reproducible toolchain across sessions.
+- **Browser dependency:** the MCP server doesn't bundle browsers; run
+  `npx playwright install chromium` once per machine to drop a Chromium
+  build into the Playwright cache. Firefox/WebKit are optional and added
+  on demand.
+- **Sample registration:** see `docs/PLAYWRIGHT.md` for a five-line JSON
+  snippet an agent's `mcp_servers` config consumes.
+
+`playwright` is registered on Skippy + every Board + every Staff Officer
+so that any agent can verify a web surface without needing to escalate
+for tooling. The Iron Law still applies: Skippy delegates browser work
+to a Board rather than running it himself.
+
 ## Hoya_Box is upstream
 
 This folder **ports from** `C:\Users\hoyer\WorkSpace\Projects\Hoya_Box\agent_space\`.

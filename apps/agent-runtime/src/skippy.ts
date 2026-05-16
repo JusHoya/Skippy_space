@@ -19,17 +19,19 @@
 //
 // The on-the-wire lifecycle this function drives:
 //   1. agent_state: thinking
-//   2. (first text chunk) agent_state: speaking
+//   2. (first text chunk)            agent_state: speaking
 //   3. agent_token × N
-//   4. agent_complete
-//   5. agent_state: idle (or 'error' if the call failed)
+//   4. (tool_use_started)            agent_state: working
+//   5. (next text chunk after tool)  agent_state: speaking
+//   6. agent_complete
+//   7. agent_state: idle (or 'error' if the call failed)
 
 import { SpanStatusCode, trace } from '@opentelemetry/api';
 
 import type { UserPromptEnvelope } from '@skippy/shared';
 
 import { loadCharter } from './charter.js';
-import { streamSkippy, streamSkippyWithTools } from './claude.js';
+import { streamSkippy, streamSkippyWithTools, type SkippyChunk } from './claude.js';
 import { logger } from './logger.js';
 import { writeEnvelope } from './protocol.js';
 
@@ -104,30 +106,76 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
 
         const system = await getSystemPrompt();
 
-        let firstToken = true;
         let totalChars = 0;
-        const stream = DELEGATE_OFF
-          ? streamSkippy(system, env.text)
-          : streamSkippyWithTools(system, env.text);
-        for await (const chunk of stream) {
-          if (firstToken) {
-            firstToken = false;
-            writeEnvelope({
-              type: 'agent_state',
-              agentId: SKIPPY_ID,
-              state: 'speaking',
-              promptId: env.promptId,
-              ts: new Date().toISOString(),
-            });
-          }
+        // Two distinct lifecycle states the stream can be in. We use this so
+        // an inbound chunk only fires an agent_state envelope when it would
+        // actually change state (avoids a stream of duplicate envelopes).
+        type Phase = 'thinking' | 'speaking' | 'working';
+        let phase: Phase = 'thinking';
+        const setPhase = (next: Phase) => {
+          if (phase === next) return;
+          phase = next;
           writeEnvelope({
-            type: 'agent_token',
+            type: 'agent_state',
             agentId: SKIPPY_ID,
+            state: next,
             promptId: env.promptId,
-            text: chunk,
             ts: new Date().toISOString(),
           });
-          totalChars += chunk.length;
+        };
+
+        if (DELEGATE_OFF) {
+          // Phase 0 / Phase 0 exit-gate path. Yields plain string chunks.
+          for await (const chunk of streamSkippy(system, env.text)) {
+            setPhase('speaking');
+            writeEnvelope({
+              type: 'agent_token',
+              agentId: SKIPPY_ID,
+              promptId: env.promptId,
+              text: chunk,
+              ts: new Date().toISOString(),
+            });
+            totalChars += chunk.length;
+          }
+        } else {
+          // Phase 1+ path. Yields a discriminated union so we can flip the
+          // agent_state envelope between speaking and working as the
+          // tool-use loop progresses.
+          const stream: AsyncGenerator<SkippyChunk> = streamSkippyWithTools(
+            system,
+            env.text,
+          );
+          for await (const chunk of stream) {
+            switch (chunk.kind) {
+              case 'text':
+                setPhase('speaking');
+                writeEnvelope({
+                  type: 'agent_token',
+                  agentId: SKIPPY_ID,
+                  promptId: env.promptId,
+                  text: chunk.text,
+                  ts: new Date().toISOString(),
+                });
+                totalChars += chunk.text.length;
+                break;
+              case 'tool_use_started':
+                setPhase('working');
+                break;
+              case 'tool_use_done':
+                // We don't flip back to `speaking` here — the next iteration's
+                // first text delta will (see the `text` case above). Holding
+                // `working` while we await the next model turn is more
+                // informative than oscillating to `speaking` between turns.
+                break;
+              case 'bail':
+                logger.warn({
+                  msg: 'skippy tool-use loop hit iteration cap',
+                  iteration: chunk.iteration,
+                  promptId: env.promptId,
+                });
+                break;
+            }
+          }
         }
 
         writeEnvelope({

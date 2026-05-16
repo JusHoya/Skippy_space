@@ -128,6 +128,15 @@ export const DelegationCompleteEnvelope = z.object({
   ts: Iso,
 });
 
+// Phase 3-prep envelopes — declared in `./phase3prep.ts` so the schema lives
+// alongside the related ModelId / spawn types. They join the discriminated
+// union here so the channel router can dispatch on `type` exhaustively.
+import {
+  SetModelEnvelope,
+  ClaudeCodeSpawnedEnvelope,
+  ClaudeCodeExitedEnvelope,
+} from './phase3prep.js';
+
 export const Envelope = z.discriminatedUnion('type', [
   UserPromptEnvelope,
   AgentStateEnvelope,
@@ -140,6 +149,9 @@ export const Envelope = z.discriminatedUnion('type', [
   DelegationEnvelope,
   DelegationAckEnvelope,
   DelegationCompleteEnvelope,
+  SetModelEnvelope,
+  ClaudeCodeSpawnedEnvelope,
+  ClaudeCodeExitedEnvelope,
 ]);
 
 export type UserPromptEnvelope = z.infer<typeof UserPromptEnvelope>;

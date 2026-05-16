@@ -3,11 +3,21 @@
 // Phase 0 satisfied the hello-world bar in PRD §14.1 with `streamSkippy` (one
 // turn, tokens streamed back).
 //
-// Phase 1 adds `streamSkippyWithTools` — the same surface, plus the
+// Phase 1 added `streamSkippyWithTools` — the same surface, plus the
 // `delegate_to_board` tool from `mcp-delegate.ts`. Per the Iron Law of
 // Delegation (PRD §3.1), Skippy should call this tool for ALL implementation
 // work. The loop iterates while the model returns `stop_reason: 'tool_use'`,
 // executes the tool, and appends the tool_result so the model can continue.
+//
+// Phase 3-prep (the hang fix): the Phase 1 implementation used
+// `c.messages.create()` inside the tool loop. That call is non-streaming —
+// the user sees nothing until the full Opus turn lands (20-40 s on a
+// delegation-heavy prompt). We now use `c.messages.stream()` instead. The
+// MessageStream type exposes BOTH:
+//   • async iteration over RawMessageStreamEvent (per-token text deltas), and
+//   • `finalMessage()` returning the full Message with stop_reason + blocks,
+// so we can stream tokens AND drive the tool loop with the same call. See
+// `node_modules/.../@anthropic-ai/sdk/lib/MessageStream.d.ts`.
 //
 // We pick the Messages-API tool-use path because `@anthropic-ai/claude-agent-sdk`
 // is not yet a dependency in `apps/agent-runtime/package.json`. The SDK can be
@@ -20,6 +30,7 @@ import {
   DELEGATE_TO_BOARD_TOOL,
   handleDelegateToBoard,
 } from './mcp-delegate.js';
+import { getModelFor } from './modelRegistry.js';
 
 let _client: Anthropic | null = null;
 
@@ -33,7 +44,10 @@ function client(): Anthropic {
   return _client;
 }
 
-const MODEL = process.env.SKIPPY_MODEL ?? 'claude-opus-4-7';
+// Phase 3-prep: model selection is dynamic. The boot-time `SKIPPY_MODEL` env
+// var still wins as the registry's initial value (modelRegistry.ts) but every
+// call below resolves through `getModelFor('skippy')` so a renderer-side
+// `set_model` envelope takes effect on the very next request.
 const MAX_TOOL_ITERATIONS = 6; // Generous; Skippy rarely cascades > 2 boards in one turn.
 
 /**
@@ -45,7 +59,7 @@ export async function* streamSkippy(
   userText: string,
 ): AsyncGenerator<string> {
   const stream = client().messages.stream({
-    model: MODEL,
+    model: getModelFor('skippy'),
     max_tokens: 1024,
     system,
     messages: [{ role: 'user', content: userText }],
@@ -62,52 +76,72 @@ export async function* streamSkippy(
 }
 
 /**
- * Phase 1 streaming path — tool-use enabled. Yields incremental text deltas
- * the same way `streamSkippy` does, *plus* invokes `handleDelegateToBoard`
- * whenever the model emits a `tool_use` block. Tool results are appended to
- * the conversation and the loop continues until the model returns
- * `stop_reason: 'end_turn' | 'stop_sequence' | 'max_tokens'`.
+ * Discriminated union yielded by `streamSkippyWithTools`.
+ *
+ * `text` chunks are forwarded straight to the user as agent_token envelopes.
+ * `tool_use_started` / `tool_use_done` give the caller a hook to flip the
+ * agent_state envelope to `working` while a delegation is in flight so the
+ * user sees the orchestrator is alive between tokens (PRD §5.2). `bail` is
+ * emitted exactly once when the MAX_TOOL_ITERATIONS cap fires.
+ */
+export type SkippyChunk =
+  | { kind: 'text'; text: string }
+  | { kind: 'tool_use_started'; toolName: string; iteration: number }
+  | { kind: 'tool_use_done'; toolName: string; iteration: number }
+  | { kind: 'bail'; iteration: number };
+
+/**
+ * Phase 1 streaming path — tool-use enabled, now token-streamed end-to-end.
+ *
+ * Per iteration:
+ *   1. Open a MessageStream and yield `text` chunks as `text_delta` events arrive.
+ *   2. Await `finalMessage()` to inspect `stop_reason` and content blocks.
+ *   3. If `stop_reason !== 'tool_use'`, return.
+ *   4. Otherwise, append the assistant turn, execute every tool_use block,
+ *      append the tool_result blocks, and continue the loop. We emit
+ *      `tool_use_started` / `tool_use_done` so the caller can flip
+ *      agent_state to `working` for the duration of the supervisor call.
  *
  * Caller is responsible for the `agent_state` lifecycle around this generator
- * (thinking → speaking → idle).
+ * (thinking → speaking → working → speaking → idle).
  */
 export async function* streamSkippyWithTools(
   system: string,
   userText: string,
-): AsyncGenerator<string> {
+): AsyncGenerator<SkippyChunk> {
   const c = client();
   const messages: Anthropic.Messages.MessageParam[] = [
     { role: 'user', content: userText },
   ];
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
-    // Each iteration: one full Messages.create roundtrip (we use non-streaming
-    // for the tool-use path because we need the full response to inspect
-    // stop_reason + content blocks; the SDK does not give us a clean way to
-    // do both streaming AND tool-use loop in v0.30).
-    //
-    // The "stream" of text deltas we yield from this generator therefore
-    // emits one final chunk per assistant turn rather than per-token. This is
-    // a Phase 1 compromise: the user still sees a paragraph land as it
-    // resolves; per-token granularity comes back in Phase 2 when we adopt
-    // the Claude Agent SDK's query() which exposes both surfaces cleanly.
-    const resp = await c.messages.create({
-      model: MODEL,
+    const stream = c.messages.stream({
+      model: getModelFor('skippy'),
       max_tokens: 1024,
       system,
       tools: [DELEGATE_TO_BOARD_TOOL],
       messages,
     });
 
-    // Yield any assistant text from this turn so the user sees Skippy's
-    // narration before tool dispatch.
-    for (const block of resp.content) {
-      if (block.type === 'text' && block.text.length > 0) {
-        yield block.text;
+    // Stream text deltas as they arrive so the user sees Skippy's narration
+    // token-by-token (the hang fix — Phase 1 only delivered text once the
+    // whole turn had landed).
+    for await (const event of stream) {
+      if (
+        event.type === 'content_block_delta' &&
+        event.delta.type === 'text_delta' &&
+        event.delta.text.length > 0
+      ) {
+        yield { kind: 'text', text: event.delta.text };
       }
     }
 
-    // If the model is done, exit.
+    // Stream is done. Inspect the assembled Message for stop_reason +
+    // content blocks. finalMessage() resolves with the same shape that
+    // messages.create() used to return, so the tool loop bookkeeping
+    // below is unchanged from the Phase 1 implementation.
+    const resp = await stream.finalMessage();
+
     if (resp.stop_reason !== 'tool_use') {
       return;
     }
@@ -121,6 +155,7 @@ export async function* streamSkippyWithTools(
     );
     const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
     for (const tu of toolUseBlocks) {
+      yield { kind: 'tool_use_started', toolName: tu.name, iteration: iter };
       if (tu.name === 'delegate_to_board') {
         const result = await handleDelegateToBoard(tu.input);
         toolResults.push({
@@ -137,13 +172,18 @@ export async function* streamSkippyWithTools(
           content: `Unknown tool: ${tu.name}`,
         });
       }
+      yield { kind: 'tool_use_done', toolName: tu.name, iteration: iter };
     }
     messages.push({ role: 'user', content: toolResults });
   }
 
   // If we hit the iteration cap, the model is in a loop. Yield a narrated
   // bail-out so the user sees it and the loop terminates cleanly.
-  yield `\n\n[SKIPPY] My tool-use loop reached the iteration cap (${MAX_TOOL_ITERATIONS}). Stepping back to replan. The monkeys should ask again with a tighter scope.`;
+  yield {
+    kind: 'text',
+    text: `\n\n[SKIPPY] My tool-use loop reached the iteration cap (${MAX_TOOL_ITERATIONS}). Stepping back to replan. The monkeys should ask again with a tighter scope.`,
+  };
+  yield { kind: 'bail', iteration: MAX_TOOL_ITERATIONS };
 }
 
 // TODO Phase 2: migrate to @anthropic-ai/claude-agent-sdk query() for true

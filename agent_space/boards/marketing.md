@@ -12,7 +12,7 @@ costume:
 model: claude-haiku-4-5-20251001
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent, WebSearch]
 disallowed_tools: []
 memory:
@@ -142,6 +142,14 @@ Constraint: {no hallucinated claims; cite source IDs}
 [MKTG] Expected impact: {qualitative or quant if available}
 [MKTG] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — primary tool for scheduling and posting on web-only
+  platforms (LinkedIn personal-page composer, TikTok web upload),
+  capturing screenshot proof of a deployed post, and pulling competitive
+  thumbnails for the algorithm-literacy file. `social_media_engineer`
+  drives it most; `growth_hacker` uses it for reference capture.
 
 ## Identity
 

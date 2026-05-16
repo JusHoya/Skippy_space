@@ -12,7 +12,7 @@ costume:
 model: claude-haiku-4-5-20251001
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent, WebSearch]
 disallowed_tools: []
 memory:
@@ -148,6 +148,14 @@ inline for READMEs, etc.).
 [PUB] Stats: {word count, citation count, humanization pass: yes/no}
 [PUB] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — appropriate for capturing the rendered version of a
+  publication (post-Pandoc PDF preview, conference-portal submission page,
+  README on GitHub), and for collecting reference screenshots that get
+  embedded in finished artifacts. `technical_writer` may drive it to grab
+  a chart from a Coding-Board demo page for inclusion in a paper.
 
 ## Identity
 

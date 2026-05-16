@@ -34,8 +34,13 @@ fn locate_workspace_root() -> Option<PathBuf> {
 }
 
 /// Spawn the 5-minute interval loop.
+///
+/// Uses `tauri::async_runtime::spawn` rather than `tokio::spawn` so the caller
+/// can invoke this from Tauri's synchronous `setup` callback. Inside that
+/// callback the Tokio reactor is owned by Tauri's async runtime; raw
+/// `tokio::spawn` would panic with "no reactor running."
 pub fn spawn_autocommit(bus: Arc<EventBus>) {
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         let root = match locate_workspace_root() {
             Some(r) => r,
             None => {

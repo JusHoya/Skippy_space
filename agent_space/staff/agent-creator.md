@@ -13,7 +13,7 @@ costume:
 model: claude-sonnet-4-6
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob]
 disallowed_tools: []
 memory:
@@ -104,6 +104,13 @@ broadcast in the established RTS log format.
 [FORGE] [AUDIT] Notifying skill-auditor for review.
 [FORGE] [READY] Unit ready: {name}. Awaiting audit verdict.
 ```
+
+## Tooling notes
+
+- **Playwright** — appropriate when fabricating a new task agent whose
+  capability brief includes browser automation (e.g., a future
+  `release_engineer` that smokes a web installer). I register it on the
+  new agent only when the brief calls for it.
 
 ## Constraints
 

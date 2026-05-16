@@ -12,7 +12,7 @@ costume:
 model: claude-sonnet-4-6
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta, github]
+mcp_servers: [obsidian, letta, github, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent]
 disallowed_tools: []
 memory:
@@ -133,6 +133,14 @@ APPROVE / REQUEST CHANGES / BLOCK
 [CODE] Notes: {residual issues, tech debt, follow-ups}
 [CODE] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — appropriate for browser-driven integration tests, E2E
+  smoke verification, and reproducing user-reported UI regressions. The
+  `tdd_specialist` may drive Playwright tests; the `code_reviewer` may
+  reference Playwright traces in a verdict. Not a substitute for unit
+  tests against pure functions.
 
 ## Identity
 

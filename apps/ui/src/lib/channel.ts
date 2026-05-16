@@ -1,9 +1,17 @@
 import { useEffect } from 'react';
-import { Envelope, type AgentId, type AgentState, type BoardState } from '@skippy/shared';
+import {
+  Envelope,
+  type AgentId,
+  type AgentState,
+  type BoardState,
+  type ModelId,
+  type ModelScope,
+} from '@skippy/shared';
 import { Channel, invoke, isTauri, safeInvoke } from './tauri';
 import { useAgentStore } from '../stores/agentStore';
 import { usePromptStore } from '../stores/promptStore';
 import { useDelegationStore } from '../stores/delegationStore';
+import { useClaudeCodeStore } from '../stores/claudeCodeStore';
 
 /**
  * Map a Board lifecycle state onto the unified AgentState the sprite scene
@@ -191,6 +199,36 @@ export function useEventChannel(): void {
           );
           break;
         }
+        // ── Phase 3-prep variants — Zone 2 + Zone 5 own the real handlers,
+        // wired into their respective stores. These cases are no-ops here so
+        // the discriminated-union exhaustiveness check still compiles.
+        case 'set_model': {
+          // Renderer → sidecar direction; we shouldn't normally receive these
+          // here, but if the shell echoes one back we drop it silently.
+          break;
+        }
+        case 'claude_code_spawned': {
+          // Rust shell opened a `claude` CLI PTY on behalf of a board/Skippy.
+          // The renderer's TerminalCluster reads `claudeCodeStore.spawns` to
+          // attach a new tab to the assigned ptyId. The task brief was stashed
+          // at request time by `spawnClaudeCode` (via `setTaskBrief`); the
+          // envelope itself doesn't carry it, so the upsert preserves whatever
+          // we have.
+          useClaudeCodeStore.getState().upsertFromSpawned(env);
+          console.info(
+            `[skippy/ui] claude-code spawned pty=${env.ptyId} parent=${env.parentAgentId} model=${env.model}`,
+          );
+          break;
+        }
+        case 'claude_code_exited': {
+          // Mark the spawn as exited but don't drop it — the user gets to
+          // close the tab manually (preserves scrollback for forensics).
+          useClaudeCodeStore.getState().markExited(env);
+          console.info(
+            `[skippy/ui] claude-code exited pty=${env.ptyId} code=${env.exitCode}`,
+          );
+          break;
+        }
         default: {
           // Exhaustiveness check — TS will yell if we miss a variant.
           const _exhaustive: never = env;
@@ -222,4 +260,28 @@ export async function dispatchPrompt(text: string): Promise<string | null> {
     return null;
   }
   return safeInvoke<string>('dispatch_user_prompt', { text });
+}
+
+/**
+ * Rebind a model for a given scope (`skippy` or `board.<id>`) on the sidecar.
+ *
+ * The Rust shell forwards this to the agent-runtime as a `set_model` JSONL
+ * envelope; the runtime's `modelRegistry` updates its in-memory binding so the
+ * next call from that scope picks up the new model. In-flight calls keep
+ * their original model (per `SetModelEnvelope` docstring in @skippy/shared).
+ *
+ * The helper is a no-op outside Tauri so the renderer can boot in a plain
+ * browser tab during dev without crashing.
+ */
+export async function dispatchSetModel(
+  scope: ModelScope,
+  modelId: ModelId,
+): Promise<void> {
+  if (!isTauri()) {
+    console.warn(
+      `[skippy/ui] dispatchSetModel: not in Tauri, would have set ${scope} → ${modelId}`,
+    );
+    return;
+  }
+  await safeInvoke<void>('dispatch_set_model', { scope, modelId });
 }

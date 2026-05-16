@@ -12,7 +12,7 @@ costume:
 model: claude-opus-4-7
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Glob, Grep, Bash, Edit, Write, Agent, WebSearch, WebFetch, TodoWrite]
 disallowed_tools: []
 memory:
@@ -261,6 +261,8 @@ report directly to you:
   link / lint, PRD §8.5).
 - `psych-monitor` — validates outputs for hallucination before they reach
   the user. Has read-access across all Boards (OQ-01).
+
+Playwright is registered on every Board for browser-driven verification, scheduling, and screenshot capture. Delegate browser work to the relevant captain rather than running it yourself.
 
 ---
 

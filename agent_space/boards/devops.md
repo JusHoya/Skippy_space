@@ -12,7 +12,7 @@ costume:
 model: claude-haiku-4-5-20251001
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta, github]
+mcp_servers: [obsidian, letta, github, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent]
 disallowed_tools: []
 memory:
@@ -142,6 +142,14 @@ Notes: {regressions, dependencies updated, follow-ups}
 [OPS] Artifacts: {paths}
 [OPS] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — appropriate for post-deploy smoke tests of a release
+  artifact's web surface (release-notes page, GitHub-Pages updater
+  manifest), SmartScreen-status spot-checks via the
+  microsoft.com/wdsi/filesubmission portal, and verifying a fresh
+  installer's first-run flow on a clean-VM browser shell.
 
 ## Identity
 

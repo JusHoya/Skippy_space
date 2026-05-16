@@ -1,7 +1,9 @@
 import { useMemo } from 'react';
 import { useAgentStore } from '../stores/agentStore';
 import { useUiStore } from '../stores/uiStore';
+import { useModelStore } from '../stores/modelStore';
 import { safeInvoke } from '../lib/tauri';
+import ModelPicker from './ModelPicker';
 
 /**
  * Top status strip — PRD §7.1. In Phase 0 the values are placeholders driven
@@ -12,6 +14,8 @@ export default function TopBar() {
   const agents = useAgentStore((s) => s.agents);
   const paused = useUiStore((s) => s.paused);
   const togglePaused = useUiStore((s) => s.togglePaused);
+  const skippyModel = useModelStore((s) => s.skippyModel);
+  const setSkippyModel = useModelStore((s) => s.setSkippyModel);
 
   const supply = useMemo(() => {
     const total = Object.keys(agents).length;
@@ -39,6 +43,17 @@ export default function TopBar() {
           <span className="value">
             {supply.used}/{supply.cap}
           </span>
+        </span>
+        <span
+          className="topbar-stat"
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+        >
+          model
+          <ModelPicker
+            scope="skippy"
+            currentModel={skippyModel}
+            onChange={setSkippyModel}
+          />
         </span>
         <span className="topbar-stat">
           {paused ? (

@@ -8,7 +8,10 @@ import {
 import { useAgentStore } from '../stores/agentStore';
 import { useUiStore } from '../stores/uiStore';
 import { usePromptStore } from '../stores/promptStore';
+import { useModelStore } from '../stores/modelStore';
 import { safeInvoke } from '../lib/tauri';
+import ModelPicker from './ModelPicker';
+import type { ModelId, ModelScope } from '@skippy/shared';
 
 /**
  * Selected-agent inspector — PRD §7.4.
@@ -44,6 +47,8 @@ export default function SelectedPanel() {
   const selectedId = useUiStore((s) => s.selectedAgentId);
   const agent = useAgentStore((s) => (selectedId ? s.agents[selectedId] : undefined));
   const current = usePromptStore((s) => s.current);
+  const boardModels = useModelStore((s) => s.boardModels);
+  const setBoardModel = useModelStore((s) => s.setBoardModel);
 
   const display = useMemo<Display>(() => {
     if (!selectedId) {
@@ -160,6 +165,21 @@ export default function SelectedPanel() {
         </div>
       </div>
 
+      {display.kind === 'board' && display.boardId && (
+        <div
+          className="stat-row"
+          style={{ display: 'flex', alignItems: 'center', gap: 8 }}
+        >
+          <span className="k">Model</span>
+          <span className="v" style={{ display: 'flex', alignItems: 'center' }}>
+            <ModelPicker
+              scope={`board.${display.boardId}` as ModelScope}
+              currentModel={boardModels[display.boardId] as ModelId}
+              onChange={(next) => setBoardModel(display.boardId!, next)}
+            />
+          </span>
+        </div>
+      )}
       <div className="stat-row">
         <span className="k">Task</span>
         <span className="v">{taskText}</span>

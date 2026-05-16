@@ -14,11 +14,13 @@
 import { createInterface } from 'node:readline';
 
 import { logger } from './logger.js';
+import { setModelFor, type ScopeId } from './modelRegistry.js';
 import { initOtel, shutdownOtel } from './otel.js';
 import { parseEnvelope, writeEnvelope } from './protocol.js';
 import { setupGracefulShutdown } from './shutdown.js';
 import { handleUserPrompt } from './skippy.js';
 import { getSupervisor } from './supervisor.js';
+import type { ModelId } from '@skippy/shared';
 
 async function main(): Promise<void> {
   await initOtel();
@@ -66,10 +68,17 @@ async function main(): Promise<void> {
             ts: new Date().toISOString(),
           });
         });
+      } else if (env.type === 'set_model') {
+        // Phase 3-prep: renderer rebinds an agent's model. We update the
+        // in-process registry; subsequent LLM calls from that scope pick up
+        // the new model. In-flight calls keep their original model per the
+        // `SetModelEnvelope` contract in @skippy/shared.
+        setModelFor(env.scope as ScopeId, env.modelId as ModelId);
       } else {
-        // Phase 1 still only consumes user_prompt envelopes from stdin —
-        // delegation envelopes are produced by the sidecar, not consumed. The
-        // Rust shell and renderer can co-evolve without bricking us.
+        // Phase 1 still only consumes user_prompt + set_model envelopes from
+        // stdin — delegation envelopes are produced by the sidecar, not
+        // consumed. The Rust shell and renderer can co-evolve without
+        // bricking us.
         logger.debug({ msg: 'unhandled envelope type', type: env.type });
       }
     } catch (e) {

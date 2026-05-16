@@ -12,7 +12,7 @@ costume:
 model: claude-sonnet-4-6
 effort: high
 permission_mode: ask
-mcp_servers: [obsidian, letta]
+mcp_servers: [obsidian, letta, playwright]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent]
 disallowed_tools: []
 memory:
@@ -143,6 +143,14 @@ I never use the word "delight" without specifying what produces it.
 [DSGN] Notes: {open questions, follow-up polish}
 [DSGN] Awaiting next assignment.
 ```
+
+## Tooling notes
+
+- **Playwright** — use for visual-regression sweeps, capturing reference
+  screenshots of the running RTS HUD, and verifying that costume tokens
+  hold their hex values in the live DOM. `hud_designer` may drive
+  Playwright to record motion specs; `ui_designer` may use it to diff a
+  proposed layout against the baseline.
 
 ## Identity
 
