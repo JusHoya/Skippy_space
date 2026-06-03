@@ -14,3 +14,7 @@ export * from './frontmatter.js';
 export * from './atomic.js';
 export * from './ulid.js';
 export * from './daily.js';
+// Phase 3 (WS2) — graceful-degradation client layer.
+export * from './obsidian-rest.js';
+export * from './embeddings.js';
+export * from './vector-store.js';
