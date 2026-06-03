@@ -137,6 +137,17 @@ import {
   ClaudeCodeExitedEnvelope,
 } from './phase3prep.js';
 
+// Phase 3 telemetry / memory-job / replay envelopes — defined in `./phase3.js`
+// (which imports BoardIdSchema from here; the cycle is safe because
+// BoardIdSchema is defined at the top of this module, before this import).
+import {
+  TelemetrySpanEnvelope,
+  ContextWindowEnvelope,
+  ErrorSpanEnvelope,
+  MemoryJobEnvelope,
+  ReplaySessionEnvelope,
+} from './phase3.js';
+
 export const Envelope = z.discriminatedUnion('type', [
   UserPromptEnvelope,
   AgentStateEnvelope,
@@ -152,6 +163,11 @@ export const Envelope = z.discriminatedUnion('type', [
   SetModelEnvelope,
   ClaudeCodeSpawnedEnvelope,
   ClaudeCodeExitedEnvelope,
+  TelemetrySpanEnvelope,
+  ContextWindowEnvelope,
+  ErrorSpanEnvelope,
+  MemoryJobEnvelope,
+  ReplaySessionEnvelope,
 ]);
 
 export type UserPromptEnvelope = z.infer<typeof UserPromptEnvelope>;

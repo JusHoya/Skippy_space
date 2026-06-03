@@ -29,6 +29,7 @@
 import { SpanStatusCode, trace } from '@opentelemetry/api';
 
 import type { UserPromptEnvelope } from '@skippy/shared';
+import { getCost, contextLimitFor } from '@skippy/shared';
 
 import { loadCharter } from './charter.js';
 import { streamSkippy, streamSkippyWithTools, type SkippyChunk } from './claude.js';
@@ -95,6 +96,12 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
       },
     },
     async (span) => {
+      const startedAt = Date.now();
+      // WS6/D5 — usage from the LLM turn, captured off the stream's `usage`
+      // chunk. Null on the Phase-0 DELEGATE_OFF path (no tool loop, no usage).
+      let usage:
+        | { inputTokens: number; outputTokens: number; contextTokens: number; model: string }
+        | null = null;
       try {
         writeEnvelope({
           type: 'agent_state',
@@ -174,14 +181,57 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
                   promptId: env.promptId,
                 });
                 break;
+              case 'usage':
+                usage = {
+                  inputTokens: chunk.inputTokens,
+                  outputTokens: chunk.outputTokens,
+                  contextTokens: chunk.contextTokens,
+                  model: chunk.model,
+                };
+                break;
             }
           }
+        }
+
+        // WS6/D5 — emit the billable telemetry span + context-window pressure
+        // snapshot once the turn is done. Pure arithmetic over usage already in
+        // hand; independent of Langfuse/Docker being up.
+        if (usage) {
+          const costUsd = getCost(usage.model, usage.inputTokens, usage.outputTokens);
+          const durationMs = Date.now() - startedAt;
+          const sc = span.spanContext();
+          writeEnvelope({
+            type: 'telemetry_span',
+            spanId: sc.spanId,
+            traceId: sc.traceId,
+            agentId: SKIPPY_ID,
+            promptId: env.promptId,
+            model: usage.model,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+            costUsd,
+            durationMs,
+            ts: new Date().toISOString(),
+          });
+          writeEnvelope({
+            type: 'context_window',
+            agentId: SKIPPY_ID,
+            model: usage.model,
+            usedTokens: usage.contextTokens,
+            limitTokens: contextLimitFor(usage.model),
+            ts: new Date().toISOString(),
+          });
+          span.setAttribute('gen_ai.usage.input_tokens', usage.inputTokens);
+          span.setAttribute('gen_ai.usage.output_tokens', usage.outputTokens);
+          span.setAttribute('gen_ai.response.model', usage.model);
+          span.setAttribute('skippy.cost_usd', costUsd);
         }
 
         writeEnvelope({
           type: 'agent_complete',
           agentId: SKIPPY_ID,
           promptId: env.promptId,
+          ...(usage ? { totalTokens: usage.inputTokens + usage.outputTokens } : {}),
           ts: new Date().toISOString(),
         });
         writeEnvelope({
@@ -197,6 +247,16 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
       } catch (err) {
         span.recordException(err as Error);
         span.setStatus({ code: SpanStatusCode.ERROR });
+        const e = err as Error;
+        // WS6/D5 — surface the failure to the telemetry error feed (§9.4).
+        writeEnvelope({
+          type: 'error_span',
+          spanId: span.spanContext().spanId,
+          agentId: SKIPPY_ID,
+          errorKind: e.name || 'Error',
+          message: e.message || String(err),
+          ts: new Date().toISOString(),
+        });
         writeEnvelope({
           type: 'agent_state',
           agentId: SKIPPY_ID,

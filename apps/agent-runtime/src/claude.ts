@@ -88,7 +88,19 @@ export type SkippyChunk =
   | { kind: 'text'; text: string }
   | { kind: 'tool_use_started'; toolName: string; iteration: number }
   | { kind: 'tool_use_done'; toolName: string; iteration: number }
-  | { kind: 'bail'; iteration: number };
+  | { kind: 'bail'; iteration: number }
+  // Emitted exactly once at the end of the turn (WS6 / D5). `inputTokens` +
+  // `outputTokens` are summed across all tool-loop iterations for cost;
+  // `contextTokens` is the LAST turn's input count (the conversation-tail size)
+  // for the context-window-pressure bar. `model` is the model the API reported
+  // actually serving the request.
+  | {
+      kind: 'usage';
+      inputTokens: number;
+      outputTokens: number;
+      contextTokens: number;
+      model: string;
+    };
 
 /**
  * Phase 1 streaming path — tool-use enabled, now token-streamed end-to-end.
@@ -113,6 +125,13 @@ export async function* streamSkippyWithTools(
   const messages: Anthropic.Messages.MessageParam[] = [
     { role: 'user', content: userText },
   ];
+
+  // WS6 telemetry accumulators: sum tokens across the tool loop for cost;
+  // track the last turn's input count for context-window pressure.
+  let totalInput = 0;
+  let totalOutput = 0;
+  let lastInput = 0;
+  let usedModel: string = getModelFor('skippy');
 
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
     const stream = c.messages.stream({
@@ -142,7 +161,21 @@ export async function* streamSkippyWithTools(
     // below is unchanged from the Phase 1 implementation.
     const resp = await stream.finalMessage();
 
+    // Accumulate usage from this turn (WS6). The Anthropic SDK reports usage on
+    // every finalMessage; input_tokens is the full prompt (history + tools).
+    totalInput += resp.usage.input_tokens ?? 0;
+    totalOutput += resp.usage.output_tokens ?? 0;
+    lastInput = resp.usage.input_tokens ?? lastInput;
+    usedModel = resp.model ?? usedModel;
+
     if (resp.stop_reason !== 'tool_use') {
+      yield {
+        kind: 'usage',
+        inputTokens: totalInput,
+        outputTokens: totalOutput,
+        contextTokens: lastInput,
+        model: usedModel,
+      };
       return;
     }
 
@@ -182,6 +215,13 @@ export async function* streamSkippyWithTools(
   yield {
     kind: 'text',
     text: `\n\n[SKIPPY] My tool-use loop reached the iteration cap (${MAX_TOOL_ITERATIONS}). Stepping back to replan. The monkeys should ask again with a tighter scope.`,
+  };
+  yield {
+    kind: 'usage',
+    inputTokens: totalInput,
+    outputTokens: totalOutput,
+    contextTokens: lastInput,
+    model: usedModel,
   };
   yield { kind: 'bail', iteration: MAX_TOOL_ITERATIONS };
 }

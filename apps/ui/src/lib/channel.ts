@@ -12,6 +12,7 @@ import { useAgentStore } from '../stores/agentStore';
 import { usePromptStore } from '../stores/promptStore';
 import { useDelegationStore } from '../stores/delegationStore';
 import { useClaudeCodeStore } from '../stores/claudeCodeStore';
+import { useTelemetryStore } from '../stores/telemetryStore';
 
 /**
  * Map a Board lifecycle state onto the unified AgentState the sprite scene
@@ -227,6 +228,33 @@ export function useEventChannel(): void {
           console.info(
             `[skippy/ui] claude-code exited pty=${env.ptyId} code=${env.exitCode}`,
           );
+          break;
+        }
+        // ── Phase 3 telemetry / memory-job / replay (WS6/WS5/WS8) ──────────────
+        case 'telemetry_span': {
+          useTelemetryStore.getState().recordSpan(env);
+          break;
+        }
+        case 'context_window': {
+          useTelemetryStore.getState().recordContext(env);
+          break;
+        }
+        case 'error_span': {
+          useTelemetryStore.getState().recordError(env);
+          console.warn(`[skippy/ui] error_span ${env.agentId}: ${env.errorKind} — ${env.message}`);
+          break;
+        }
+        case 'memory_job': {
+          // The four-job pipeline's progress. Surfaced as log activity for now;
+          // a later pass animates a beercan walking to the source pedestal.
+          console.info(
+            `[skippy/ui] memory_job ${env.job}:${env.phase}${env.sourcePath ? ` ${env.sourcePath}` : ''}`,
+          );
+          break;
+        }
+        case 'replay_session': {
+          // WS8's ReplayScrubber owns the real handler; log the session boundary.
+          console.info(`[skippy/ui] replay_session ${env.event}: ${env.sessionId}`);
           break;
         }
         default: {

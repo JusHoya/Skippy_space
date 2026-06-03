@@ -7,3 +7,6 @@ export * from './time.js';
 export * from './boards.js';
 export * from './phase2.js';
 export * from './phase3prep.js';
+export * from './phase3.js';
+export * from './pricing.js';
+export * from './model-limits.js';
