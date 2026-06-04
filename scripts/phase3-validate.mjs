@@ -145,6 +145,8 @@ const PHASE3_FILES = [
   ['apps/agent-runtime/src/replay-writer.ts', 'Replay JSONL writer'],
   ['apps/ui/src/hud/ReplayScrubber.tsx', 'Replay scrubber'],
   ['apps/ui/src/stores/replayStore.ts', 'Replay store'],
+  // WS3 SDK adoption (gated, off by default)
+  ['apps/agent-runtime/src/sdk-board.ts', 'Gated Claude Agent SDK board execution'],
   // WS4 task charters
   ['agent_space/tasks/ingest.md', 'Ingest charter'],
   ['agent_space/tasks/distiller.md', 'Distiller charter'],
@@ -203,6 +205,21 @@ console.log(`\n${DIM}rust wiring${RESET}`);
   record('lib.rs declares `mod replay`', /mod\s+replay\s*;/.test(libRs), null);
   record('lib.rs registers `replay_list_sessions`', /\breplay_list_sessions\b/.test(libRs), null);
   record('lib.rs registers `replay_load`', /\breplay_load\b/.test(libRs), null);
+}
+
+// ── WS3 SDK adoption (gated) ───────────────────────────────────────────────
+console.log(`\n${DIM}sdk adoption (gated)${RESET}`);
+{
+  const board = readIf('apps/agent-runtime/src/board.ts') ?? '';
+  record('board.ts routes through the gated SDK path', /sdkBoardsEnabled\(\)/.test(board), null);
+  const sdkBoard = readIf('apps/agent-runtime/src/sdk-board.ts') ?? '';
+  record(
+    'sdk-board.ts gates on PHASE3_AGENTS_ENABLED + dynamic-imports the SDK',
+    /PHASE3_AGENTS_ENABLED/.test(sdkBoard) && /import\(['"]@anthropic-ai\/claude-agent-sdk/.test(sdkBoard),
+    null,
+  );
+  const pkg = readIf('apps/agent-runtime/package.json') ?? '';
+  record('agent-runtime depends on @anthropic-ai/claude-agent-sdk', /@anthropic-ai\/claude-agent-sdk/.test(pkg), null);
 }
 
 // ── task charters parse as §6.1 frontmatter ────────────────────────────────

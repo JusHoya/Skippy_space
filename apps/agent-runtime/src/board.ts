@@ -34,7 +34,9 @@ import { BOARD_META, type BoardId } from '@skippy/shared';
 
 import type { Charter } from './charter.js';
 import { logger } from './logger.js';
+import { getModelFor } from './modelRegistry.js';
 import { writeEnvelope } from './protocol.js';
+import { sdkBoardsEnabled, executeBoardMissionViaSdk } from './sdk-board.js';
 
 const tracer = trace.getTracer('skippy-board');
 
@@ -224,7 +226,10 @@ export class Board {
           // ack path. Supervisor / Skippy continue without blocking.
           if (decision === 'accept') {
             queueMicrotask(() => {
-              this.emitDelegationComplete(env);
+              void this.emitDelegationComplete(env).catch((e: unknown) => {
+                logger.warn({ msg: 'emitDelegationComplete failed', boardId: this.boardId, err: String(e) });
+                this.markReady();
+              });
             });
           } else {
             // Drop back to ready immediately on decline/counter.
@@ -267,13 +272,34 @@ export class Board {
     return 'accept';
   }
 
-  private emitDelegationComplete(env: BoardDelegation): void {
+  /**
+   * Emit the delegation outcome. By default (PHASE3_AGENTS_ENABLED off) this is
+   * the Phase-1 stub acknowledgement. When the flag is on AND an API key is
+   * present, the board executes the mission for real via the Claude Agent SDK
+   * (`sdk-board.ts`), using its charter as the system prompt; any SDK failure
+   * falls back to the stub summary so a delegation never wedges.
+   */
+  private async emitDelegationComplete(env: BoardDelegation): Promise<void> {
+    let summary = `Board ${this.boardId} acknowledges and is queuing this mission. (Stub — set PHASE3_AGENTS_ENABLED=1 for real SDK execution.)`;
+
+    if (sdkBoardsEnabled()) {
+      const sdk = await executeBoardMissionViaSdk({
+        boardId: this.boardId,
+        systemPrompt: this.charter.body,
+        model: getModelFor(this.agentId),
+        missionBrief: env.missionBrief,
+      });
+      summary = sdk.ok
+        ? sdk.summary
+        : `Board ${this.boardId}: real execution unavailable, acknowledged only. ${sdk.summary}`.trim();
+    }
+
     writeEnvelope({
       type: 'delegation_complete',
       delegationId: env.delegationId,
       fromBoardId: this.boardId,
       result: 'success',
-      summary: `Board ${this.boardId} acknowledges and is queuing this mission. Concrete task spawn is Phase 2.`,
+      summary,
       ts: new Date().toISOString(),
     });
     this.markReady();
