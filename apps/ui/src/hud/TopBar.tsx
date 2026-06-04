@@ -2,13 +2,14 @@ import { useMemo } from 'react';
 import { useAgentStore } from '../stores/agentStore';
 import { useUiStore } from '../stores/uiStore';
 import { useModelStore } from '../stores/modelStore';
+import { useTelemetryStore } from '../stores/telemetryStore';
 import { safeInvoke } from '../lib/tauri';
 import ModelPicker from './ModelPicker';
 
 /**
- * Top status strip — PRD §7.1. In Phase 0 the values are placeholders driven
- * by what the renderer can compute locally; Phase 3 wires in real telemetry
- * from the OTel stream and Letta context-window stats.
+ * Top status strip — PRD §7.1. Phase 3 wires `tok/s` + `ctx` to the live
+ * telemetry stream (Skippy's most-recent-turn throughput + context-window
+ * pressure); `supply` stays a local agent-population count.
  */
 export default function TopBar() {
   const agents = useAgentStore((s) => s.agents);
@@ -16,11 +17,16 @@ export default function TopBar() {
   const togglePaused = useUiStore((s) => s.togglePaused);
   const skippyModel = useModelStore((s) => s.skippyModel);
   const setSkippyModel = useModelStore((s) => s.setSkippyModel);
+  const lastTokPerSec = useTelemetryStore((s) => s.lastTokPerSec);
+  const skippyCtx = useTelemetryStore((s) => s.contextByAgent['skippy']);
 
   const supply = useMemo(() => {
     const total = Object.keys(agents).length;
     return { used: total, cap: 30 };
   }, [agents]);
+
+  const ctxUsedK = skippyCtx ? Math.round(skippyCtx.usedTokens / 1000) : 0;
+  const ctxLimitK = skippyCtx ? Math.round(skippyCtx.limitTokens / 1000) : 200;
 
   const handleAutoCommit = async () => {
     await safeInvoke('vault_autocommit_now');
@@ -31,12 +37,11 @@ export default function TopBar() {
       <div className="topbar-inner">
         <span className="topbar-brand">SKIPPY · SPACE</span>
         <span className="topbar-stat">
-          tok/s <span className="value">0.0</span>
-          <span className="unit">k</span>
+          tok/s <span className="value">{Math.round(lastTokPerSec)}</span>
         </span>
         <span className="topbar-stat">
-          ctx <span className="value">0</span>
-          <span className="unit">/200k</span>
+          ctx <span className="value">{ctxUsedK}</span>
+          <span className="unit">/{ctxLimitK}k</span>
         </span>
         <span className="topbar-stat">
           supply{' '}

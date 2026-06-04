@@ -50,6 +50,8 @@ export interface TelemetryStore {
   /** Cumulative token counters. */
   totalInputTokens: number;
   totalOutputTokens: number;
+  /** Output tokens/sec of the most recent turn (for the TopBar gauge). */
+  lastTokPerSec: number;
   /** Epoch ms of the last telemetry envelope, or null if none yet. */
   lastSpanAt: number | null;
 
@@ -67,6 +69,7 @@ const EMPTY = {
   errors: [] as ErrorEntry[],
   totalInputTokens: 0,
   totalOutputTokens: 0,
+  lastTokPerSec: 0,
   lastSpanAt: null as number | null,
 };
 
@@ -87,6 +90,7 @@ export const useTelemetryStore = create<TelemetryStore>((set) => ({
         latencies,
         totalInputTokens: s.totalInputTokens + e.inputTokens,
         totalOutputTokens: s.totalOutputTokens + e.outputTokens,
+        lastTokPerSec: e.durationMs > 0 ? e.outputTokens / (e.durationMs / 1000) : 0,
         lastSpanAt: Date.now(),
       };
     }),
