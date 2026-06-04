@@ -14,7 +14,10 @@
 
 import { z } from 'zod';
 
-import { BoardIdSchema } from './envelope.js';
+// Import from the leaf agents.ts (NOT envelope.ts): envelope.ts imports this
+// module for the discriminated union, so importing BoardIdSchema back from it
+// would form an eval-time cycle (TDZ crash). agents.ts has no such dependency.
+import { BoardIdSchema } from './agents.js';
 
 const Iso = z.string().datetime({ offset: true });
 

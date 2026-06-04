@@ -1,17 +1,13 @@
 import { z } from 'zod';
 import { AgentStateSchema, BoardStateSchema } from './states.js';
-import { AgentIdSchema, BOARDS, type BoardId } from './agents.js';
+import { AgentIdSchema, BoardIdSchema } from './agents.js';
 
 const Iso = z.string().datetime({ offset: true });
 
-/**
- * Zod enum derived from the canonical BOARDS const so we never have a parallel
- * list of board names drifting from agents.ts. The `BoardId` *type* is already
- * exported from agents.ts; this schema is its runtime validator. The cast
- * preserves the literal union narrowing (rather than widening to `string`)
- * so downstream `z.infer` produces BoardId, not string.
- */
-export const BoardIdSchema = z.enum(BOARDS as unknown as readonly [BoardId, ...BoardId[]]);
+// `BoardIdSchema` now lives in agents.ts (a leaf) so phase3.ts/phase3prep.ts can
+// import it without a cycle through this module. Re-export it here for any
+// consumer that historically imported it from './envelope.js'.
+export { BoardIdSchema };
 
 export const UserPromptEnvelope = z.object({
   type: z.literal('user_prompt'),

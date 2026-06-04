@@ -12,8 +12,7 @@
 // Zod schema. Pure intra-renderer shapes stay TS-only.
 
 import { z } from 'zod';
-import { AgentIdSchema } from './agents.js';
-import { BoardIdSchema } from './envelope.js';
+import { AgentIdSchema, BoardIdSchema } from './agents.js';
 
 // ── 1. Model picker (Zone 5) ─────────────────────────────────────────────────
 

@@ -35,3 +35,11 @@ export const AgentIdSchema = z.string().refine((v): v is AgentId => {
   if (v.startsWith('task.') && v.length > 5) return true;
   return false;
 }, { message: 'invalid AgentId' });
+
+/**
+ * Runtime validator for BoardId, derived from BOARDS so the two never drift.
+ * Lives in this leaf module (not envelope.ts) so telemetry/envelope schemas can
+ * import it without forming an import cycle — phase3.ts and phase3prep.ts both
+ * use it at module-eval time, and pulling it from a leaf avoids a TDZ crash.
+ */
+export const BoardIdSchema = z.enum(BOARDS as unknown as readonly [BoardId, ...BoardId[]]);
