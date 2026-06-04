@@ -18,3 +18,6 @@ export * from './daily.js';
 export * from './obsidian-rest.js';
 export * from './embeddings.js';
 export * from './vector-store.js';
+// Phase 3 (WS5) — the four-job memory pipeline + inbox watcher.
+export * from './jobs/index.js';
+export * from './vault-watcher.js';

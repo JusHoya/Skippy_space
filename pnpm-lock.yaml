@@ -53,6 +53,9 @@ importers:
       '@opentelemetry/semantic-conventions':
         specifier: ^1.27
         version: 1.41.1
+      '@skippy/memory':
+        specifier: workspace:^
+        version: link:../../packages/memory
       '@skippy/shared':
         specifier: workspace:*
         version: link:../../packages/shared

@@ -21,6 +21,7 @@
     "@opentelemetry/resources": "^1.27",
     "@opentelemetry/sdk-node": "^0.55",
     "@opentelemetry/semantic-conventions": "^1.27",
+    "@skippy/memory": "workspace:^",
     "@skippy/shared": "workspace:*",
     "node-cron": "^4.2.1",
     "pino": "^9",

@@ -14,6 +14,7 @@
 import { createInterface } from 'node:readline';
 
 import { logger } from './logger.js';
+import { startMemoryJobs, type MemoryJobsHandle } from './memory-jobs.js';
 import { setModelFor, type ScopeId } from './modelRegistry.js';
 import { initOtel, shutdownOtel } from './otel.js';
 import { parseEnvelope, writeEnvelope } from './protocol.js';
@@ -52,6 +53,12 @@ async function main(): Promise<void> {
     });
   });
 
+  // Phase 3 (WS5): start the four-job memory pipeline — an inbox watcher that
+  // runs ingest→distill→link→lint on dropped files, plus a nightly Link/Lint
+  // cron. Degrades gracefully (no-op watcher) when vault/ is absent; disable
+  // entirely with SKIPPY_MEMORY_JOBS=0.
+  const memoryJobs: MemoryJobsHandle = startMemoryJobs();
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -87,6 +94,7 @@ async function main(): Promise<void> {
   }
 
   // stdin EOF -> graceful drain.
+  await memoryJobs.stop();
   await supervisor.shutdown();
   await shutdownOtel();
 }
