@@ -16,6 +16,8 @@ export * from './ulid.js';
 export * from './daily.js';
 // Phase 3 (WS2) — graceful-degradation client layer.
 export * from './obsidian-rest.js';
+// Phase 3.5 (WS-C) — Letta hot-memory client (non-throwing, zero-dep types).
+export * from './letta-client.js';
 export * from './embeddings.js';
 export * from './vector-store.js';
 // Phase 3 (WS5) — the four-job memory pipeline + inbox watcher.

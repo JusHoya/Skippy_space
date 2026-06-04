@@ -10,6 +10,8 @@ export * from './ingest.js';
 export * from './distill.js';
 export * from './link.js';
 export * from './lint.js';
+// Phase 3.5 (WS-D) — archival->vault mirror (pure filesystem durable fallback).
+export * from './archival-mirror.js';
 
 import { runIngest, type IngestResult } from './ingest.js';
 import { runDistill, mockDistill, type DistillFn, type DistillResult } from './distill.js';

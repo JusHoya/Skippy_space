@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc -b --noEmit",
-    "test": "node --import tsx --test src/frontmatter.test.ts src/atomic.test.ts src/clients.degraded.test.ts src/jobs/pipeline.e2e.test.ts"
+    "test": "node --import tsx --test src/frontmatter.test.ts src/atomic.test.ts src/clients.degraded.test.ts src/letta-client.test.ts src/jobs/pipeline.e2e.test.ts src/jobs/archival-mirror.test.ts"
   },
   "dependencies": {
     "@xenova/transformers": "^2.17.2",
