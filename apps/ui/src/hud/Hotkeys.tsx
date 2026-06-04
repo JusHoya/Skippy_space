@@ -11,6 +11,7 @@ import type { AgentId, ControlGroupKey, HotkeyEvent, MinimapLayer } from '@skipp
 import { useUiStore } from '../stores/uiStore';
 import { useAgentStore } from '../stores/agentStore';
 import { useSelectionStore } from '../stores/selectionStore';
+import { useReplayStore } from '../stores/replayStore';
 
 // ── Pub/sub dispatcher ──────────────────────────────────────────────────────
 
@@ -166,6 +167,9 @@ export default function Hotkeys(): null {
           e.preventDefault();
           return;
         case 'KeyR':
+          // WS8: open the replay scrubber. We also emit the pub/sub command so
+          // any other subscriber (Zone 6) can react to the same intent.
+          useReplayStore.getState().openScrubber();
           emit({ command: 'replay.open' });
           e.preventDefault();
           return;

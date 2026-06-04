@@ -5,6 +5,7 @@ import TerminalCluster from './hud/TerminalCluster';
 import MinimapPane from './hud/MinimapPane';
 import CommandBar from './hud/CommandBar';
 import Hotkeys from './hud/Hotkeys';
+import ReplayScrubber from './hud/ReplayScrubber';
 import SceneRoot from './scene/SceneRoot';
 import SpriteGallery from './gallery/SpriteGallery';
 
@@ -33,6 +34,7 @@ function MainHud() {
       <SidePanel />
       <TerminalCluster />
       <MinimapPane />
+      <ReplayScrubber />
     </div>
   );
 }

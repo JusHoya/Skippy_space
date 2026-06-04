@@ -13,6 +13,7 @@ import { usePromptStore } from '../stores/promptStore';
 import { useDelegationStore } from '../stores/delegationStore';
 import { useClaudeCodeStore } from '../stores/claudeCodeStore';
 import { useTelemetryStore } from '../stores/telemetryStore';
+import { useReplayStore } from '../stores/replayStore';
 
 /**
  * Map a Board lifecycle state onto the unified AgentState the sprite scene
@@ -253,8 +254,10 @@ export function useEventChannel(): void {
           break;
         }
         case 'replay_session': {
-          // WS8's ReplayScrubber owns the real handler; log the session boundary.
+          // WS8: note the active session id so the ReplayScrubber's picker can
+          // surface the current session boundary.
           console.info(`[skippy/ui] replay_session ${env.event}: ${env.sessionId}`);
+          useReplayStore.getState().setActiveSession(env.sessionId);
           break;
         }
         default: {

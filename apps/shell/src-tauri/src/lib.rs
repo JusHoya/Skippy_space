@@ -13,6 +13,7 @@ mod envelope;
 mod git_autocommit;
 mod project_tree;
 mod pty;
+mod replay;
 mod sidecar;
 
 use std::sync::Arc;
@@ -315,6 +316,8 @@ pub fn run() {
             claude_code_spawn,
             cmd_set_model::dispatch_set_model,
             project_tree::project_tree_scan,
+            replay::replay_list_sessions,
+            replay::replay_load,
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Skippy_space shell");

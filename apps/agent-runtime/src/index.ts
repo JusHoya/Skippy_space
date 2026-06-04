@@ -11,17 +11,40 @@
 // board comes online; Skippy's `delegate_to_board` tool routes through the
 // same supervisor singleton.
 
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
 
 import { logger } from './logger.js';
 import { startMemoryJobs, type MemoryJobsHandle } from './memory-jobs.js';
 import { setModelFor, type ScopeId } from './modelRegistry.js';
 import { initOtel, shutdownOtel } from './otel.js';
-import { parseEnvelope, writeEnvelope } from './protocol.js';
+import { parseEnvelope, registerReplaySink, writeEnvelope } from './protocol.js';
+import { appendToReplay, closeReplayWriter, initReplayWriter } from './replay-writer.js';
 import { setupGracefulShutdown } from './shutdown.js';
 import { handleUserPrompt } from './skippy.js';
 import { getSupervisor } from './supervisor.js';
 import type { ModelId } from '@skippy/shared';
+
+/**
+ * Resolve the vault root: explicit env wins, else walk up to the repo's vault/.
+ * Mirrors `resolveVaultRoot` in memory-jobs.ts (kept local to avoid coupling the
+ * replay writer's boot to the memory subsystem).
+ */
+function resolveVaultRoot(): string {
+  const fromEnv = process.env.SKIPPY_VAULT_ROOT;
+  if (fromEnv) return fromEnv;
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(path.join(dir, 'vault'))) return path.join(dir, 'vault');
+    if (existsSync(path.join(dir, 'pnpm-workspace.yaml'))) return path.join(dir, 'vault');
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.resolve(dir, 'vault');
+}
 
 async function main(): Promise<void> {
   await initOtel();
@@ -59,6 +82,27 @@ async function main(): Promise<void> {
   // entirely with SKIPPY_MEMORY_JOBS=0.
   const memoryJobs: MemoryJobsHandle = startMemoryJobs();
 
+  // Phase 3 (WS8): TEE every outbound envelope to a per-session .replay file
+  // (PRD §9.5). We register the writer as a sink on `writeEnvelope` and emit a
+  // `replay_session: started` boundary so the renderer's ReplayScrubber can
+  // pick up the active session. Disable entirely with SKIPPY_REPLAY=0; the
+  // writer also degrades to a no-op if vault/.skippy is unwritable.
+  let replaySessionId: string | null = null;
+  if (process.env.SKIPPY_REPLAY !== '0') {
+    const replay = initReplayWriter(resolveVaultRoot());
+    replaySessionId = replay.sessionId;
+    registerReplaySink(appendToReplay);
+    writeEnvelope({
+      type: 'replay_session',
+      sessionId: replay.sessionId,
+      event: 'started',
+      path: replay.path,
+      ts: new Date().toISOString(),
+    });
+  } else {
+    logger.info({ msg: 'replay writer disabled via SKIPPY_REPLAY=0' });
+  }
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -94,6 +138,17 @@ async function main(): Promise<void> {
   }
 
   // stdin EOF -> graceful drain.
+  // Emit the `replay_session: ended` boundary *before* closing the writer so the
+  // boundary lands inside the replay file itself, then flush + close it.
+  if (replaySessionId !== null) {
+    writeEnvelope({
+      type: 'replay_session',
+      sessionId: replaySessionId,
+      event: 'ended',
+      ts: new Date().toISOString(),
+    });
+    await closeReplayWriter();
+  }
   await memoryJobs.stop();
   await supervisor.shutdown();
   await shutdownOtel();

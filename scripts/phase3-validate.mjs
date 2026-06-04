@@ -141,6 +141,10 @@ const PHASE3_FILES = [
   ['packages/shared/src/phase3.ts', 'Phase 3 telemetry/memory/replay envelopes'],
   ['apps/ui/src/stores/telemetryStore.ts', 'Telemetry aggregation store'],
   ['apps/ui/src/hud/TelemetryPanel.tsx', 'Cost/latency/context/error widgets'],
+  // WS8 replay
+  ['apps/agent-runtime/src/replay-writer.ts', 'Replay JSONL writer'],
+  ['apps/ui/src/hud/ReplayScrubber.tsx', 'Replay scrubber'],
+  ['apps/ui/src/stores/replayStore.ts', 'Replay store'],
   // WS4 task charters
   ['agent_space/tasks/ingest.md', 'Ingest charter'],
   ['agent_space/tasks/distiller.md', 'Distiller charter'],
@@ -190,6 +194,15 @@ console.log(`\n${DIM}wire contracts${RESET}`);
   ]) {
     record(`Envelope union includes ${t}`, env.includes(t), null);
   }
+}
+
+// ── Rust wiring — WS8 replay commands registered in invoke_handler ─────────
+console.log(`\n${DIM}rust wiring${RESET}`);
+{
+  const libRs = readIf('apps/shell/src-tauri/src/lib.rs') ?? '';
+  record('lib.rs declares `mod replay`', /mod\s+replay\s*;/.test(libRs), null);
+  record('lib.rs registers `replay_list_sessions`', /\breplay_list_sessions\b/.test(libRs), null);
+  record('lib.rs registers `replay_load`', /\breplay_load\b/.test(libRs), null);
 }
 
 // ── task charters parse as §6.1 frontmatter ────────────────────────────────

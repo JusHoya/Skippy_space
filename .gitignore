@@ -35,6 +35,9 @@ vault/.obsidian/workspace*.json
 # Replay artifacts
 .replay
 *.replay
+# Per-session .replay (.jsonl) writers land here; transient, never committed
+# (PRD git-only vault, but replays are ephemeral — OQ-21).
+vault/.skippy/
 
 # Playwright transient outputs (screenshots in tests/visual/screenshots/ are committed)
 test-results/
