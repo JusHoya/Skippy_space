@@ -34,9 +34,11 @@ import { BOARD_META, type BoardId } from '@skippy/shared';
 
 import type { Charter } from './charter.js';
 import { logger } from './logger.js';
+import { buildMcpServers } from './mcp-registry.js';
 import { getModelFor } from './modelRegistry.js';
 import { writeEnvelope } from './protocol.js';
 import { sdkBoardsEnabled, executeBoardMissionViaSdk } from './sdk-board.js';
+import { resolveVaultRoot } from './vault-root.js';
 
 const tracer = trace.getTracer('skippy-board');
 
@@ -283,11 +285,17 @@ export class Board {
     let summary = `Board ${this.boardId} acknowledges and is queuing this mission. (Stub — set PHASE3_AGENTS_ENABLED=1 for real SDK execution.)`;
 
     if (sdkBoardsEnabled()) {
+      // Build this board's MCP servers (obsidian/letta) from its charter, so the
+      // real agent can do surgical vault edits, semantic search, and archival
+      // memory. Only happens on the gated path — never when the flag is off.
+      const vaultRoot = resolveVaultRoot();
+      const mcpServers = await buildMcpServers(this.charter, vaultRoot);
       const sdk = await executeBoardMissionViaSdk({
         boardId: this.boardId,
         systemPrompt: this.charter.body,
         model: getModelFor(this.agentId),
         missionBrief: env.missionBrief,
+        mcpServers,
       });
       summary = sdk.ok
         ? sdk.summary

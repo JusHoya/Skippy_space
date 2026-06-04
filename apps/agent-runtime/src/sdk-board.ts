@@ -8,17 +8,16 @@
 // the R-01 cold-start, a permission hang) is caught and the caller falls back
 // to the stub summary, so enabling the flag can never wedge a delegation.
 //
-// SCOPE NOTE (deliberate): the Obsidian/Letta MCP *tools* are NOT wired here.
-// The SDK's `tool()` / `createSdkMcpServer()` helpers require the SDK's bundled
-// zod v4 raw shapes, and this workspace is on zod v3 (envelope + frontmatter
-// schemas). Adopting those tools means a workspace-wide zod 3->4 upgrade, which
-// is a separate, gated task (it touches .datetime()/.passthrough() usages). So
-// boards here run with the SDK's built-in tools only; the WS2 Obsidian REST
-// client + embeddings are ready to back those MCP tools once the upgrade lands.
-// Live execution is validated manually (an API key + a real prompt) — it cannot
-// run in the headless, no-key exit gate.
+// MCP tools (Phase 3.5): the Obsidian (D1) + Letta (D4) MCP servers ARE now
+// wired — board.ts builds them from the charter's `mcp_servers:` via
+// mcp-registry.ts and passes them in as `mcpServers`. They're constructed with
+// agent-runtime's own zod@4 (matching the SDK's bundled v4), scoped so
+// @skippy/shared + @skippy/memory stay on zod@3. Live execution still needs an
+// API key (and, for full effect, a running Obsidian/Letta) — it cannot run in
+// the headless, no-key exit gate.
 
 import type { ModelId } from '@skippy/shared';
+import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 
 import { logger } from './logger.js';
 
@@ -43,6 +42,8 @@ export interface ExecuteBoardMissionParams {
   systemPrompt: string;
   model: ModelId;
   missionBrief: string;
+  /** Per-board MCP servers (obsidian/letta) from the charter, wired into query(). */
+  mcpServers?: Record<string, McpServerConfig>;
   /** Tool-loop ceiling (R-01 cost guard). */
   maxTurns?: number;
 }
@@ -64,6 +65,7 @@ export async function executeBoardMissionViaSdk(
         systemPrompt: params.systemPrompt,
         maxTurns: params.maxTurns ?? 8,
         permissionMode: 'bypassPermissions',
+        ...(params.mcpServers ? { mcpServers: params.mcpServers } : {}),
       },
     });
 

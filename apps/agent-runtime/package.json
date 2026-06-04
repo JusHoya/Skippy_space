@@ -11,11 +11,13 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsup",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/mcp-registry.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.162",
     "@anthropic-ai/sdk": "^0.30",
+    "@modelcontextprotocol/sdk": "^1.2",
     "@opentelemetry/api": "^1.9",
     "@opentelemetry/exporter-trace-otlp-http": "^0.55",
     "@opentelemetry/resources": "^1.27",
@@ -26,7 +28,7 @@
     "node-cron": "^4.2.1",
     "pino": "^9",
     "ulid": "^2.3",
-    "zod": "^3.23"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22",

@@ -99,11 +99,19 @@ Agent F — will assert equality).
 ## MCP server registry
 
 Charters declare available MCP servers via the `mcp_servers:` frontmatter
-array. The runtime sidecar (`apps/agent-runtime/`) doesn't consume that
-array yet — Phase 3 wires it into each agent's `query()` config — but the
-declarations are the source of truth for *what an agent will be able to
-call once the loop is wired*. PRD §8.9 lists the Obsidian-side MCP servers
-(`cyanheads/obsidian-mcp-server`, `jacksteamdev/obsidian-mcp-tools`).
+array. As of **Phase 3.5**, the runtime sidecar consumes that array:
+`apps/agent-runtime/src/mcp-registry.ts` `buildMcpServers(charter, vaultRoot)`
+builds an in-process SDK MCP server per declared name and passes them into the
+board's gated `query()` (`PHASE3_AGENTS_ENABLED`). Implemented today:
+- **`obsidian`** — `obsidian_read_note`, `obsidian_search`,
+  `obsidian_patch_frontmatter`, `obsidian_append_block`, `obsidian_write_note`
+  (backed by the WS2 `ObsidianRestClient` + atomic fs; our in-process equivalents
+  of the PRD §8.9 `cyanheads/obsidian-mcp-server` + `jacksteamdev/obsidian-mcp-tools`).
+- **`letta`** — `letta_search_archival`, `letta_append_archival` (also mirrors
+  to `50_Agents/{board}/agent_log.md`), `letta_edit_core`, bound per-board to
+  `memory.letta_agent_id`.
+`github` / `playwright` are declared-but-not-yet-implemented (skipped with a warn).
+Every tool degrades to an `isError` text result when its service is offline.
 Beyond those, the registry currently includes:
 
 | Server | Source | Purpose | Scope |

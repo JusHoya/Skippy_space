@@ -27,7 +27,8 @@
     "validate:phase0": "node scripts/phase0-validate.mjs",
     "validate:phase1": "node scripts/phase1-validate.mjs",
     "validate:phase2": "node scripts/phase2-validate.mjs",
-    "validate:phase3": "node scripts/phase3-validate.mjs"
+    "validate:phase3": "node scripts/phase3-validate.mjs",
+    "validate:phase3.5": "node scripts/phase3p5-validate.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

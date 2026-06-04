@@ -71,3 +71,31 @@ To validate the production path end-to-end: set `ANTHROPIC_API_KEY` and
 `SKIPPY_DISTILL_MODE=llm`, start Obsidian with the Local REST API + Smart
 Connections plugins, then drop a real `paper.pdf`/`.md` into `vault/00_Inbox/`
 and confirm a richly-linked atomic-note set appears within 5 minutes.
+
+## `phase3p5-validate.mjs` — Obsidian MCP (D1) + Letta (D4)
+
+`pnpm validate:phase3.5` is headless: it proves the Obsidian + Letta MCP tools
+build, degrade to `isError` when their service is offline, and that
+`letta_append_archival` still mirrors to `vault/50_Agents/<board>/agent_log.md`
+even with Letta down. It also re-runs `pnpm validate:phase3` to prove the gated
+SDK board path (off by default) caused no regression. The SDK MCP tool schemas
+use a **zod@4 scoped to `apps/agent-runtime` only** (the SDK's `tool()` requires
+zod v4); `@skippy/shared` + `@skippy/memory` stay on zod@3.
+
+### Manual live-validation checklist (NOT in the headless gate)
+
+1. `docker compose -f infra/letta/docker-compose.yml up -d`; confirm Letta on
+   `http://localhost:8283`. Pre-create each board agent (e.g. `bd_research_v1`)
+   — there is no bootstrap job yet (OQ-D4-04).
+2. Start Obsidian on `vault/` with the Local REST API plugin; set
+   `OBSIDIAN_API_KEY` (+ `OBSIDIAN_API_URL` if non-default).
+3. Run a board mission with `PHASE3_AGENTS_ENABLED=1` + `ANTHROPIC_API_KEY`;
+   confirm `obsidian_*` / `letta_*` tool calls in the OTel/Langfuse spans.
+4. Trigger `letta_append_archival`; confirm it round-trips via
+   `letta_search_archival` AND that `agent_log.md` mirrored the write.
+5. `docker stop` Letta and re-run: `letta_*` tools return `isError` but
+   `agent_log.md` STILL grows (the mirror fallback). Close Obsidian and confirm
+   `obsidian_*` degrades while atomic fs writes keep working.
+
+Letta REST endpoint paths (insert/search/core-memory) are provisional — verify
+against the pinned Letta image during this pass (OQ-D4-01/02/03).

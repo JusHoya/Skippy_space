@@ -220,6 +220,10 @@ console.log(`\n${DIM}sdk adoption (gated)${RESET}`);
   );
   const pkg = readIf('apps/agent-runtime/package.json') ?? '';
   record('agent-runtime depends on @anthropic-ai/claude-agent-sdk', /@anthropic-ai\/claude-agent-sdk/.test(pkg), null);
+  // Phase 3.5 wired the Obsidian/Letta MCP tools into the gated path (full D1 + D4
+  // coverage lives in `pnpm validate:phase3.5`).
+  const reg = readIf('apps/agent-runtime/src/mcp-registry.ts');
+  record('mcp-registry.ts present (Obsidian/Letta MCP, Phase 3.5)', reg !== null && /buildMcpServers/.test(reg), null);
 }
 
 // ── task charters parse as §6.1 frontmatter ────────────────────────────────
