@@ -1,9 +1,10 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Envelope,
   type AgentId,
   type AgentState,
   type BoardState,
+  type MemoryJobEnvelope,
   type ModelId,
   type ModelScope,
 } from '@skippy/shared';
@@ -44,13 +45,170 @@ function boardStateToAgentState(s: BoardState): AgentState {
   }
 }
 
+// ── Token-stream coalescing (REVIEW-2026-06-10 §4 / perf) ───────────────────
+//
+// `agent_token` arrives at token rate — many per animation frame during a
+// burst. The naive handler wrote BOTH `promptStore.appendToken` (re-renders
+// CommandBar + SelectedPanel) and `agentStore.setAgent` (mints a fresh `agents`
+// object → re-runs the SceneRoot glow subscription + TopBar + TelemetryPanel +
+// SelectedPanel) on EVERY token. Per CLAUDE.md convention #3, streamed text is
+// effectively per-frame data and must not thrash Zustand: a burst of N tokens
+// should cost at most one render per frame, not N.
+//
+// So we buffer incoming tokens and flush them in a single batched store write,
+// scheduled on the next animation frame (one `appendToken` with the concatenated
+// run, one `setAgent` carrying the latest token). The visible narration stays
+// correct because tokens are appended in arrival order and a flush always runs
+// before `agent_complete` finalizes the prompt. `appendToken`'s own promptId
+// guard discards a buffered run whose prompt was superseded mid-flight.
+
+interface PendingTokenRun {
+  /** Concatenated token text awaiting a single `appendToken`. */
+  text: string;
+  /** Newest agent id that emitted into this prompt — drives the speaking glow. */
+  agentId: AgentId;
+  /** Newest envelope timestamp, surfaced as the agent's `updatedAt`. */
+  ts: string;
+  /** Newest single token, mirrored to `agentStore` as the `lastToken` peek. */
+  lastToken: string;
+}
+
+/** Buffered token runs keyed by promptId; drained by `flushTokenBatch`. */
+const pendingTokens = new Map<string, PendingTokenRun>();
+let tokenFlushHandle: number | null = null;
+
+/**
+ * Schedule a single coalesced flush on the next frame. Prefers
+ * `requestAnimationFrame` (true per-frame batching in the browser/Tauri webview)
+ * and degrades to a macrotask when rAF is unavailable (Node test env, SSR), so
+ * the buffer always drains even off-screen.
+ */
+function scheduleTokenFlush(): void {
+  if (tokenFlushHandle !== null) return;
+  if (typeof requestAnimationFrame === 'function') {
+    tokenFlushHandle = requestAnimationFrame(() => {
+      tokenFlushHandle = null;
+      flushTokenBatch();
+    });
+  } else {
+    tokenFlushHandle = setTimeout(() => {
+      tokenFlushHandle = null;
+      flushTokenBatch();
+    }, 0) as unknown as number;
+  }
+}
+
+/**
+ * Drain every buffered token run into the stores in one pass: one `appendToken`
+ * per prompt and one `setAgent` per emitting agent. Idempotent when the buffer
+ * is empty, so `agent_complete` can call it eagerly to guarantee ordering.
+ */
+export function flushTokenBatch(): void {
+  // Cancel any frame/timer already scheduled: we're draining now (often eagerly
+  // from agent_complete), so the pending callback would otherwise fire next frame
+  // as a no-op — and in tests leave a stray timer running past the case.
+  if (tokenFlushHandle !== null) {
+    if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(tokenFlushHandle);
+    else clearTimeout(tokenFlushHandle);
+    tokenFlushHandle = null;
+  }
+  if (pendingTokens.size === 0) return;
+  const runs = [...pendingTokens.values()];
+  const keys = [...pendingTokens.keys()];
+  pendingTokens.clear();
+  // The per-prompt guards inside the stores make a single batched write
+  // equivalent to N per-token writes — minus the N−1 redundant renders.
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i]!;
+    usePromptStore.getState().appendToken(keys[i]!, run.text);
+    useAgentStore.getState().setAgent(run.agentId, {
+      state: 'speaking',
+      lastToken: run.lastToken,
+      updatedAt: run.ts,
+    });
+  }
+}
+
+/** Buffer one streamed token, scheduling a coalesced flush for the next frame. */
+function bufferToken(promptId: string, agentId: AgentId, text: string, ts: string): void {
+  const existing = pendingTokens.get(promptId);
+  if (existing) {
+    existing.text += text;
+    existing.agentId = agentId;
+    existing.ts = ts;
+    existing.lastToken = text;
+  } else {
+    pendingTokens.set(promptId, { text, agentId, ts, lastToken: text });
+  }
+  scheduleTokenFlush();
+}
+
+/** Visible for tests: how many prompts have un-flushed buffered tokens. */
+export function _pendingTokenPromptCount(): number {
+  return pendingTokens.size;
+}
+
+// ── Memory-job activity surface (REVIEW-2026-06-10 §4) ──────────────────────
+//
+// `memory_job` envelopes carry the four-job Karpathy pipeline's progress
+// (ingest/distill/link/lint). They used to be logged and dropped. We publish
+// the latest pulse through a tiny module-level ref + subscriber set — the same
+// "append-rarely, don't spin up a whole Zustand store" idiom MinimapPane uses
+// for pedestal layouts — so a HUD widget (or the future beercan-to-pedestal
+// animation) can react to pipeline activity instead of it vanishing.
+//
+// These pulses are NOT per-frame (a few per pipeline run), so a plain
+// React-state mirror is fine; no coalescing needed.
+
+const lastMemoryJobRef: { current: MemoryJobEnvelope | null } = { current: null };
+const memoryJobSubs = new Set<(e: MemoryJobEnvelope) => void>();
+
+/** Publish a memory-job pulse to every subscriber and stash it as the latest. */
+function publishMemoryJob(env: MemoryJobEnvelope): void {
+  lastMemoryJobRef.current = env;
+  // Snapshot before iterating so a subscriber unmounting itself synchronously
+  // can't shrink the live set mid-loop.
+  for (const fn of [...memoryJobSubs]) fn(env);
+}
+
+/** The most recent memory-job pulse seen this session, or null if none yet. */
+export function latestMemoryJob(): MemoryJobEnvelope | null {
+  return lastMemoryJobRef.current;
+}
+
+/**
+ * React hook: mirror the latest memory-job pulse into component state so a HUD
+ * widget can render pipeline progress. Re-renders only on a new pulse (a few
+ * per run), never per frame.
+ */
+export function useMemoryJobActivity(): MemoryJobEnvelope | null {
+  const [state, setState] = useState<MemoryJobEnvelope | null>(lastMemoryJobRef.current);
+  useEffect(() => {
+    const fn = (e: MemoryJobEnvelope): void => setState(e);
+    memoryJobSubs.add(fn);
+    // Catch up to any pulse that landed before this mount subscribed.
+    if (lastMemoryJobRef.current !== null) setState(lastMemoryJobRef.current);
+    return () => {
+      memoryJobSubs.delete(fn);
+    };
+  }, []);
+  return state;
+}
+
+/** Visible for tests: number of live `useMemoryJobActivity` subscribers. */
+export function _memoryJobSubscriberCount(): number {
+  return memoryJobSubs.size;
+}
+
 /**
  * Route a single raw channel message into the appropriate Zustand store
  * (PRD §5.2, §9.2). Extracted from the subscription so it can be driven
  * directly in tests and reused by the module-level singleton below.
  *
  * Per CLAUDE.md, this only carries state that has UI-visible discrete
- * changes — per-frame sprite data does not flow through here.
+ * changes — per-frame sprite data does not flow through here. Token-stream
+ * text is the one near-per-frame signal: it's coalesced (see `bufferToken`)
+ * so a burst causes at most one render per frame.
  */
 export function dispatchEnvelope(raw: unknown): void {
   const parsed = Envelope.safeParse(raw);
@@ -69,15 +227,15 @@ export function dispatchEnvelope(raw: unknown): void {
       break;
     }
     case 'agent_token': {
-      usePromptStore.getState().appendToken(env.promptId, env.text);
-      useAgentStore.getState().setAgent(env.agentId, {
-        state: 'speaking',
-        lastToken: env.text,
-        updatedAt: env.ts,
-      });
+      // Coalesced: buffer the token and flush once per frame instead of
+      // re-rendering three HUD components + the scene glow on every token.
+      bufferToken(env.promptId, env.agentId, env.text, env.ts);
       break;
     }
     case 'agent_complete': {
+      // Drain any tokens still buffered for this turn before finalizing, so the
+      // completed prompt's `streamed` text is whole and ordering is preserved.
+      flushTokenBatch();
       usePromptStore.getState().completePrompt(env.promptId);
       useAgentStore.getState().setAgent(env.agentId, {
         state: 'idle',
@@ -236,8 +394,11 @@ export function dispatchEnvelope(raw: unknown): void {
       break;
     }
     case 'memory_job': {
-      // The four-job pipeline's progress. Surfaced as log activity for now;
-      // a later pass animates a beercan walking to the source pedestal.
+      // The four-job pipeline's progress. Previously dropped on the floor; now
+      // published to a module-level surface (see `publishMemoryJob`) that the
+      // HUD subscribes to via `useMemoryJobActivity`. A later pass animates a
+      // beercan walking to the source pedestal off this same signal.
+      publishMemoryJob(env);
       console.info(
         `[skippy/ui] memory_job ${env.job}:${env.phase}${env.sourcePath ? ` ${env.sourcePath}` : ''}`,
       );

@@ -17,6 +17,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import type { CameraView } from '@skippy/shared';
+import { DEFAULT_CAMERA_VIEW, lodForScale } from '@skippy/shared';
 import { useCameraStore } from './cameraStore.js';
 import { worldSpaceFromHostPoint } from '../scene/Camera.js';
 
@@ -81,4 +82,25 @@ test('zoomBy without a focus point pans nothing (pure scale)', () => {
   assert.equal(after.scale, 1.5);
   assert.equal(after.panX, 42);
   assert.equal(after.panY, -17);
+});
+
+test('resetView restores the default/fit view (pan + scale) and LOD', () => {
+  // Drag the camera far from home: zoomed + panned + custom clamp bounds.
+  useCameraStore.getState().setView({
+    scale: 2.1,
+    panX: 480,
+    panY: -260,
+    minScale: 0.01,
+    maxScale: 100,
+  });
+  useCameraStore.getState().resetView();
+  const after = useCameraStore.getState().view;
+  // Every field — including pan AND the clamp bounds — snaps back to default.
+  assert.deepEqual(after, DEFAULT_CAMERA_VIEW);
+  assert.equal(after.panX, 0);
+  assert.equal(after.panY, 0);
+  assert.equal(after.scale, DEFAULT_CAMERA_VIEW.scale);
+  // LOD is recomputed from the default scale — this is the §7.4 default the
+  // `Backspace` camera-reset binding (Hotkeys.tsx → camera.resetView) reaches.
+  assert.equal(useCameraStore.getState().lod, lodForScale(DEFAULT_CAMERA_VIEW.scale));
 });

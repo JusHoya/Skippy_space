@@ -86,7 +86,18 @@ export default function TerminalPane({ tabId, existingPtyId }: Props) {
             () => undefined,
           );
         } else {
-          ptyId = await invoke<string>('pty_open', { cols: term.cols, rows: term.rows });
+          const opened = await invoke<string>('pty_open', { cols: term.cols, rows: term.rows });
+          // If the tab unmounted while `pty_open` was in flight (guaranteed by
+          // StrictMode's mount→unmount→mount on every dev boot), the cleanup
+          // below already ran with `ptyId === null` and could not close
+          // anything. The Rust side nonetheless spawned a live pwsh process, so
+          // close it here using the handle we just resolved — otherwise the
+          // double-mount strands an orphan shell on every boot.
+          if (disposed) {
+            void invoke('pty_close', { ptyId: opened }).catch(() => undefined);
+            return;
+          }
+          ptyId = opened;
         }
         if (disposed) return;
         const ch = new Channel<string>();

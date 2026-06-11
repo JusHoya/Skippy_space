@@ -117,7 +117,7 @@ test('StrictMode mount → cleanup → mount yields a single live subscription',
 });
 
 test('an envelope routed through the singleton is processed exactly once', async () => {
-  const { _subscribeEffect } = currentMod;
+  const { _subscribeEffect, flushTokenBatch } = currentMod;
   // The channel module imports the store via a BARE specifier, so every
   // cache-busted channel copy shares the one canonical store module. Import it
   // the same (unsuffixed) way to observe the exact state the dispatcher writes.
@@ -141,6 +141,10 @@ test('an envelope routed through the singleton is processed exactly once', async
     text: 'X',
     ts: new Date().toISOString(),
   });
+
+  // Token writes are now coalesced onto the next frame, so drain the batch
+  // synchronously before asserting (no rAF in the Node test env).
+  flushTokenBatch();
 
   // The pre-fix bug opened two channels, so a single delivery fanned out to two
   // `appendToken` calls → 'XX'. With one channel it must be exactly 'X'.
@@ -170,4 +174,120 @@ test('a failed events_subscribe rolls back so a later mount can retry', async ()
   );
 
   cleanup();
+});
+
+// ── Token coalescing (REVIEW-2026-06-10 §4 / perf) ──────────────────────────
+//
+// A burst of N `agent_token` envelopes used to write to promptStore AND
+// agentStore N times — re-rendering three HUD components + re-running the scene
+// glow subscription per token. The fix buffers them and flushes once per frame.
+// These lock-ins prove (a) a burst collapses to a single store write yet (b)
+// the concatenated narration is still whole and in order.
+
+test('a burst of tokens collapses to ONE appendToken / setAgent write', async () => {
+  const { _subscribeEffect, flushTokenBatch, _pendingTokenPromptCount } = currentMod;
+  const { usePromptStore } = (await import(
+    '../stores/promptStore.js'
+  )) as typeof import('../stores/promptStore.js');
+  const { useAgentStore } = (await import(
+    '../stores/agentStore.js'
+  )) as typeof import('../stores/agentStore.js');
+
+  // Count store writes by wrapping the actions.
+  let appendCalls = 0;
+  const realAppend = usePromptStore.getState().appendToken;
+  usePromptStore.setState({
+    appendToken: (id: string, chunk: string) => {
+      appendCalls += 1;
+      realAppend(id, chunk);
+    },
+  });
+  let setAgentCalls = 0;
+  const realSetAgent = useAgentStore.getState().setAgent;
+  useAgentStore.setState({
+    setAgent: ((id: Parameters<typeof realSetAgent>[0], patch) => {
+      setAgentCalls += 1;
+      realSetAgent(id, patch);
+    }) as typeof realSetAgent,
+  });
+
+  const cleanup = _subscribeEffect();
+  const promptId = 'prompt-burst';
+  usePromptStore.getState().setPrompt(promptId, 'hi');
+
+  // Five tokens, all delivered before any frame flush.
+  for (const t of ['H', 'e', 'l', 'l', 'o']) {
+    deliver({
+      type: 'agent_token',
+      agentId: 'skippy',
+      promptId,
+      text: t,
+      ts: new Date().toISOString(),
+    });
+  }
+
+  // Nothing written yet — all five sit in the per-prompt buffer.
+  assert.equal(appendCalls, 0, 'tokens must not write to the store until the frame flush');
+  assert.equal(_pendingTokenPromptCount(), 1, 'one prompt should have buffered tokens');
+
+  // One frame later (driven manually): a single batched write per store.
+  flushTokenBatch();
+  assert.equal(appendCalls, 1, 'a 5-token burst must coalesce to ONE appendToken');
+  assert.equal(setAgentCalls, 1, 'a 5-token burst must coalesce to ONE setAgent');
+  assert.equal(_pendingTokenPromptCount(), 0, 'the buffer must drain on flush');
+
+  // Narration is whole and in order.
+  assert.equal(usePromptStore.getState().current?.streamed, 'Hello');
+
+  cleanup();
+  // Restore the real actions so the shared store singleton doesn't leak the
+  // call-counting wrappers into later tests.
+  usePromptStore.setState({ appendToken: realAppend });
+  useAgentStore.setState({ setAgent: realSetAgent });
+});
+
+test('agent_complete flushes buffered tokens before finalizing', async () => {
+  const { _subscribeEffect } = currentMod;
+  const { usePromptStore } = (await import(
+    '../stores/promptStore.js'
+  )) as typeof import('../stores/promptStore.js');
+
+  const cleanup = _subscribeEffect();
+  const promptId = 'prompt-complete';
+  usePromptStore.getState().setPrompt(promptId, 'hi');
+
+  const ts = new Date().toISOString();
+  deliver({ type: 'agent_token', agentId: 'skippy', promptId, text: 'done', ts });
+  // Completion arrives with the last token still buffered — it must flush first.
+  deliver({ type: 'agent_complete', agentId: 'skippy', promptId, ts });
+
+  const cur = usePromptStore.getState().current;
+  assert.equal(cur?.complete, true, 'prompt should be marked complete');
+  assert.equal(cur?.streamed, 'done', 'the final buffered token must survive completion');
+
+  cleanup();
+});
+
+// ── memory_job is no longer dropped (REVIEW-2026-06-10 §4) ──────────────────
+
+test('memory_job envelopes are published, not dropped', () => {
+  const { dispatchEnvelope, latestMemoryJob } = currentMod;
+
+  assert.equal(latestMemoryJob(), null, 'no memory-job pulse seen yet');
+
+  const env = {
+    type: 'memory_job' as const,
+    job: 'ingest' as const,
+    phase: 'complete' as const,
+    sourcePath: 'vault/00_Inbox/x.md',
+    counts: { sources: 1, atomic: 7 },
+    ts: new Date().toISOString(),
+  };
+  dispatchEnvelope(env);
+
+  const latest = latestMemoryJob();
+  assert.ok(latest, 'memory_job must be surfaced, not silently discarded');
+  assert.equal(latest?.job, 'ingest');
+  assert.equal(latest?.phase, 'complete');
+  assert.equal(latest?.counts?.atomic, 7);
 });

@@ -221,50 +221,86 @@ impl PtyManager {
 
         spawn_reader_thread(id.clone(), entry.clone(), reader, sub_rx, shutdown);
 
-        // Wait for the child on a dedicated tokio task. portable-pty's
-        // `Child` is `Send` but not `Sync`; ownership transfers cleanly.
-        // We use `spawn_blocking` because `Child::wait` is blocking and we
-        // don't want to occupy a tokio worker thread for the full lifetime
-        // of the subprocess.
+        // Insert into the manager map *before* spawning the exit watcher so the
+        // entry is guaranteed present when the watcher later removes it on exit.
+        self.inner.lock().insert(id.clone(), entry);
+
+        // Ordering gate: the caller (`claude_code_spawn`) publishes
+        // `ClaudeCodeSpawned` immediately after this function returns. A child
+        // that exits instantly could otherwise let the watcher publish
+        // `ClaudeCodeExited` *before* the spawn envelope — and the renderer's
+        // `markExited` is a no-op for an unknown spawn, so the exit would be lost
+        // and the tab would hang "running" forever. We hold the watcher behind a
+        // oneshot that we only fire once the entry is registered and we're about
+        // to hand control back to the caller, so the exit can never overtake the
+        // spawn.
+        let (spawned_gate_tx, spawned_gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Wait for the child and publish the exit envelope, then evict the map
+        // entry. portable-pty's `Child` is `Send` but not `Sync`; ownership
+        // transfers cleanly into the task. We do the blocking `Child::wait`
+        // inside `spawn_blocking` so a tokio worker isn't pinned for the whole
+        // subprocess lifetime, and await the spawn gate first.
         let pty_id_for_task = id.clone();
         let spawn_id_for_task = spawn_id.clone();
         let bus_for_task = bus.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut child = child;
-            let exit_status = match child.wait() {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("claude_code pty {pty_id_for_task} wait failed: {e}");
-                    let env = Envelope::ClaudeCodeExited {
-                        spawn_id: spawn_id_for_task,
-                        pty_id: pty_id_for_task,
-                        exit_code: None,
-                        ts: chrono::Utc::now().to_rfc3339(),
-                    };
-                    bus_for_task.publish(env);
-                    return;
+        let map_for_task = self.inner.clone();
+        tokio::spawn(async move {
+            // Block the exit publish until the spawn envelope is on its way.
+            // If the sender is dropped (open path errored out), proceed anyway —
+            // we still need to reap the child and clean up the map entry.
+            let _ = spawned_gate_rx.await;
+
+            let pty_id_for_wait = pty_id_for_task.clone();
+            let exit_code = tokio::task::spawn_blocking(move || {
+                let mut child = child;
+                match child.wait() {
+                    Ok(s) => {
+                        // portable-pty's `ExitStatus::exit_code()` is `u32`; on
+                        // Windows there's no signal concept so this is the actual
+                        // exit code. Cast to i32 for parity with the TS-side
+                        // `number|null` shape.
+                        Some(s.exit_code() as i32)
+                    }
+                    Err(e) => {
+                        warn!("claude_code pty {pty_id_for_wait} wait failed: {e}");
+                        None
+                    }
                 }
-            };
-            // portable-pty's `ExitStatus::exit_code()` is `u32`; on Windows
-            // there's no signal concept so this is the actual exit code.
-            // We cast to i32 for parity with the TS-side `number|null` shape.
-            let code = exit_status.exit_code() as i32;
-            info!(
-                "claude_code pty {pty_id_for_task} exited (code={code}, spawn_id={spawn_id_for_task})"
-            );
+            })
+            .await
+            .unwrap_or(None);
+
+            match exit_code {
+                Some(code) => info!(
+                    "claude_code pty {pty_id_for_task} exited (code={code}, spawn_id={spawn_id_for_task})"
+                ),
+                None => info!(
+                    "claude_code pty {pty_id_for_task} exit code unavailable (spawn_id={spawn_id_for_task})"
+                ),
+            }
+
+            // Evict the now-dead entry from the manager map. Dropping the entry
+            // releases the ConPTY master + writer; the reader thread already
+            // observed EOF. A later `pty_close` for this id becomes a clean
+            // "no such pty" rather than acting on a corpse.
+            map_for_task.lock().remove(&pty_id_for_task);
+
             let env = Envelope::ClaudeCodeExited {
                 spawn_id: spawn_id_for_task,
                 pty_id: pty_id_for_task,
-                exit_code: Some(code),
+                exit_code,
                 ts: chrono::Utc::now().to_rfc3339(),
             };
             bus_for_task.publish(env);
         });
 
-        self.inner.lock().insert(id.clone(), entry);
         info!(
             "opened claude_code pty {id} ({cols}x{rows}, program={program}, spawn_id={spawn_id})"
         );
+        // Release the watcher now that the entry is registered and we're
+        // returning to the caller, which publishes `ClaudeCodeSpawned` next.
+        let _ = spawned_gate_tx.send(());
         Ok(id)
     }
 
@@ -656,5 +692,49 @@ mod tests {
         assert!(carry.is_empty());
         // Empty carry flushes to None.
         assert!(flush_carry(&mut carry).is_none());
+    }
+
+    /// `close` must remove the entry from the manager map, so a *second* close
+    /// for the same id is a clean "no such pty" rather than acting on a corpse.
+    /// This is the map-eviction invariant the `claude_code` exit-watcher relies
+    /// on (it calls the same `map.remove`): once an entry is evicted, a later
+    /// `pty_close` for that id can't double-kill or resurrect it. We exercise the
+    /// real `open` path (a ConPTY-backed shell) so the removal is end-to-end, not
+    /// a mocked map. Skipped gracefully if no shell is on PATH (portable CI).
+    #[test]
+    fn close_evicts_entry_so_second_close_is_no_such_pty() {
+        // The user-shell open path uses pwsh/powershell; if neither resolves on
+        // PATH (e.g. a stripped CI container) there's nothing to open, so skip
+        // rather than fail spuriously.
+        if !is_on_path("pwsh.exe") && !is_on_path("powershell.exe") {
+            eprintln!("no PowerShell on PATH; skipping ConPTY close-eviction test");
+            return;
+        }
+
+        let mgr = PtyManager::new();
+        let id = mgr.open(80, 24).expect("open a user-shell PTY");
+        // The freshly-opened PTY is in the map.
+        assert!(mgr.get(&id).is_ok(), "opened PTY should be present in the map");
+
+        // First close tears it down and removes it from the map.
+        mgr.close(&id).expect("first close should succeed");
+
+        // The entry is gone: a second close — and any later lookup — sees a
+        // clean miss, proving the map was evicted rather than left holding a
+        // dead entry. This is exactly the post-exit state the exit-watcher
+        // produces via `map_for_task.lock().remove(&pty_id)`.
+        assert!(
+            mgr.get(&id).is_err(),
+            "closed PTY must be evicted from the map"
+        );
+        let second = mgr.close(&id);
+        assert!(
+            second.is_err(),
+            "second close of an evicted PTY must be a clean 'no such pty', not a corpse op"
+        );
+        assert!(
+            second.unwrap_err().to_string().contains("no such pty"),
+            "the miss should surface as the canonical 'no such pty' error"
+        );
     }
 }

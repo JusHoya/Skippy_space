@@ -287,7 +287,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_shell::init())
+        // tauri-plugin-shell intentionally NOT registered: the webview must not have
+        // an arbitrary-local-exec primitive (review §security). PTYs are spawned in
+        // Rust via portable_pty, not the shell plugin.
         .plugin(tauri_plugin_process::init())
         // tauri-plugin-updater is wired in Phase 4 along with the EV cert and
         // signing keypair (PRD §11.2 + §14.5). Without those configured it

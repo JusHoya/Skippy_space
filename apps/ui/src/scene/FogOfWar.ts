@@ -42,10 +42,39 @@ const FOG_STYLES: Record<FogState, FogStyle> = {
 const FOG_DEFAULT: FogStyle = FOG_STYLES.unexplored;
 
 /**
+ * Tints that fog "owns" on a pedestal. Two writers touch a pedestal's `.tint`:
+ * this module (fog state) and `FilePedestals.setActiveTint` (the delegation
+ * highlight that paints a board's accent color while a walker is en route).
+ * They run from independent Zustand subscriptions, so without coordination a
+ * fog regions-delta would clobber a live highlight — and the highlight would
+ * clobber the fog dim — depending on which subscription fired last.
+ *
+ * The contract: the highlight wins the `tint` channel while it is active. We
+ * detect an active highlight by checking whether the pedestal currently carries
+ * a tint that fog did NOT write (the highlight uses a board accent color, which
+ * is never one of fog's own values). When a highlight is present we still apply
+ * the fog `alpha` (dimming is fog's exclusive channel and never conflicts), but
+ * we leave `tint` alone so the accent color survives. The instant the highlight
+ * clears — `setActiveTint(id, null)` resets tint to 0xffffff — fog reclaims the
+ * pedestal on its next pass.
+ */
+const FOG_OWNED_TINTS: ReadonlySet<number> = new Set(
+  Object.values(FOG_STYLES).map((s) => s.tint),
+);
+
+/** True when the pedestal's current tint was written by fog (not a highlight). */
+function fogOwnsTint(tint: number): boolean {
+  return FOG_OWNED_TINTS.has(tint);
+}
+
+/**
  * Walk the pedestal container's direct children and apply the fog style for
  * each one's region. Missing region entries → `unexplored` (alpha 0). This is
  * O(n) over the pedestal count and does not allocate — safe to call inside a
  * Zustand subscription on every regions delta.
+ *
+ * `tint` is shared with the delegation highlight writer; we only write it when
+ * fog already owns the current tint, so an active highlight is preserved.
  */
 export function applyFogToPedestals(
   pedestals: Container,
@@ -59,10 +88,14 @@ export function applyFogToPedestals(
     if (typeof label !== 'string' || !label.startsWith('pedestal.')) continue;
     const region = regions[label];
     const style = region ? FOG_STYLES[region.state] : FOG_DEFAULT;
+    // Alpha is fog's exclusive channel — always apply it.
     child.alpha = style.alpha;
+    // Tint is shared with the delegation highlight; defer to a live highlight.
     // Pixi v8 promoted `tint` onto Container itself (typed as ColorSource);
-    // assigning a numeric color directly is the documented happy path.
-    child.tint = style.tint;
+    // it reads back as a 24-bit number, so the ownership check is exact.
+    if (fogOwnsTint(child.tint as number)) {
+      child.tint = style.tint;
+    }
   }
 }
 

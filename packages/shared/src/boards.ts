@@ -1,4 +1,4 @@
-import type { BoardId } from './agents.js';
+import { BOARDS, type BoardId } from './agents.js';
 
 /**
  * Per-Board static metadata for the eight Captain processes (PRD §5.1).
@@ -25,7 +25,7 @@ export const BOARD_META: Record<BoardId, BoardMeta> = {
   },
   coding: {
     displayName: 'Coding Captain',
-    codename: 'Caret',
+    codename: 'Hammer',
     defaultModel: 'claude-sonnet-4-6',
     accentHex: '#45A29E',
   },
@@ -49,7 +49,7 @@ export const BOARD_META: Record<BoardId, BoardMeta> = {
   },
   research: {
     displayName: 'Research Captain',
-    codename: 'Scribe',
+    codename: 'Scroll',
     defaultModel: 'claude-haiku-4-5-20251001',
     accentHex: '#9B59B6',
   },
@@ -66,3 +66,24 @@ export const BOARD_META: Record<BoardId, BoardMeta> = {
     accentHex: '#2ECC71',
   },
 };
+
+/**
+ * Single-source-of-truth guard: every id in `BOARDS` (agents.ts) must have a
+ * `BOARD_META` row and vice-versa, so the 8-board roster can't silently drift
+ * between the two literals. The `Record<BoardId, …>` type already pins the keys
+ * at compile time; this is the runtime backstop for that invariant (and the
+ * hook the wave-4 charter-parity lint will assert against). The codenames here
+ * mirror the captain charters in `agent_space/boards/{id}.md` — those YAML
+ * frontmatter `codename` fields are the persona source of truth; keep this in
+ * lockstep when a charter is renamed.
+ */
+for (const id of BOARDS) {
+  if (!(id in BOARD_META)) {
+    throw new Error(`BOARD_META is missing a row for board '${id}'`);
+  }
+}
+for (const id of Object.keys(BOARD_META)) {
+  if (!(BOARDS as readonly string[]).includes(id)) {
+    throw new Error(`BOARD_META has a stray row '${id}' not in BOARDS`);
+  }
+}

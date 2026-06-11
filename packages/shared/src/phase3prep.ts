@@ -12,7 +12,7 @@
 // Zod schema. Pure intra-renderer shapes stay TS-only.
 
 import { z } from 'zod';
-import { AgentIdSchema, BoardIdSchema } from './agents.js';
+import { AgentIdSchema, BoardIdSchema, BOARDS } from './agents.js';
 
 // ── 1. Model picker (Zone 5) ─────────────────────────────────────────────────
 
@@ -62,10 +62,9 @@ export const ModelScopeSchema = z.union([
   z
     .string()
     .startsWith('board.')
-    .refine((s) => {
-      const id = s.slice(6);
-      return ['engineering', 'coding', 'design', 'marketing', 'finance', 'research', 'publishing', 'devops'].includes(id);
-    }, { message: 'invalid board scope' }),
+    .refine((s) => (BOARDS as readonly string[]).includes(s.slice(6)), {
+      message: 'invalid board scope',
+    }),
 ]);
 export type ModelScope = z.infer<typeof ModelScopeSchema>;
 

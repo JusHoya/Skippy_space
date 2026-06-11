@@ -133,9 +133,13 @@ import {
   ClaudeCodeExitedEnvelope,
 } from './phase3prep.js';
 
-// Phase 3 telemetry / memory-job / replay envelopes — defined in `./phase3.js`
-// (which imports BoardIdSchema from here; the cycle is safe because
-// BoardIdSchema is defined at the top of this module, before this import).
+// Phase 3 telemetry / memory-job / replay envelopes — defined in `./phase3.js`.
+// `phase3.ts` pulls `BoardIdSchema` from the leaf `./agents.js`, NOT back from
+// this module: envelope.ts imports phase3.ts (below) for the discriminated
+// union, so a back-import here would close an eval-time cycle and re-trigger the
+// TDZ crash fixed at f568417 (BoardIdSchema was hoisted out to agents.ts for
+// exactly this reason). Keep this import one-directional — do not add a
+// `BoardIdSchema` import into phase3.ts/phase3prep.ts from here.
 import {
   TelemetrySpanEnvelope,
   ContextWindowEnvelope,

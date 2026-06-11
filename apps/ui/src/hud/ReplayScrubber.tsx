@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from 'react';
 import {
   reconstructAt,
+  recordAgentId,
   useReplayStore,
   type ReplayRecord,
 } from '../stores/replayStore';
@@ -26,7 +27,10 @@ function fmtBytes(n: number): string {
 function recordSummary(rec: ReplayRecord): string {
   if (!rec || typeof rec !== 'object') return String(rec);
   const t = typeof rec.type === 'string' ? rec.type : '(no type)';
-  const agent = typeof rec.agentId === 'string' ? ` · ${rec.agentId}` : '';
+  // ReplayRecord is now the strict Envelope union — only some variants carry an
+  // agentId, so read it through the type-safe helper rather than a bare property.
+  const id = recordAgentId(rec);
+  const agent = id ? ` · ${id}` : '';
   return `${t}${agent}`;
 }
 
@@ -41,16 +45,26 @@ export default function ReplayScrubber() {
   const setSelectedIndex = useReplayStore((s) => s.setSelectedIndex);
 
   // Esc closes the panel while it's open.
+  //
+  // The global Hotkeys listener also handles Esc (→ clearMulti, clearing the
+  // map selection). Both are window keydown listeners, so an un-scoped handler
+  // here would let a single Esc both close the scrubber AND wipe the user's map
+  // selection. We register in the CAPTURE phase — which runs before the
+  // Hotkeys bubble-phase listener regardless of mount order — and call
+  // stopImmediatePropagation so the keystroke is consumed by the scrubber alone
+  // while it is open. When the scrubber is closed this effect is torn down, so
+  // Esc falls through to Hotkeys as normal.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') {
         e.preventDefault();
+        e.stopImmediatePropagation();
         closeScrubber();
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener('keydown', onKey, { capture: true });
+    return () => window.removeEventListener('keydown', onKey, { capture: true });
   }, [open, closeScrubber]);
 
   const selectedRecord = records[selectedIndex];

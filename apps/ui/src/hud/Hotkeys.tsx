@@ -105,9 +105,15 @@ export default function Hotkeys(): null {
       }
 
       // ── Tab → cycle primary through multi-selection ───────────────────────
+      // Only hijack Tab when there's actually a group to cycle (>1 member).
+      // With nothing (or one) selected we must let Tab through so it keeps
+      // driving the browser/HUD focus ring — swallowing it unconditionally
+      // breaks keyboard navigation everywhere else (REVIEW §4).
       if (e.code === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) {
-        useSelectionStore.getState().cycleTabForward();
-        e.preventDefault();
+        if (useSelectionStore.getState().multiSelected.length > 1) {
+          useSelectionStore.getState().cycleTabForward();
+          e.preventDefault();
+        }
         return;
       }
 
@@ -129,6 +135,19 @@ export default function Hotkeys(): null {
           const pick = idleIds[((idx % idleIds.length) + idleIds.length) % idleIds.length];
           if (pick) useSelectionStore.getState().setMulti([pick]);
         }
+        e.preventDefault();
+        return;
+      }
+
+      // ── Backspace → reset camera to the default/fit view ──────────────────
+      // RTS camera-home convention (cf. SC2 Backspace). SceneRoot consumes the
+      // `camera.resetView` command and calls `useCameraStore.resetView()`,
+      // which restores DEFAULT_CAMERA_VIEW (pan + scale). Without this binding
+      // the reset action — and the §7.4 strategic-zoom default — is unreachable
+      // (REVIEW §4). Guarded by `isEditableTarget` above so we never eat a
+      // Backspace meant for a text field.
+      if (e.code === 'Backspace' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+        emit({ command: 'camera.resetView' });
         e.preventDefault();
         return;
       }

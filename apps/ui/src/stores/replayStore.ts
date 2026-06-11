@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { Envelope, type EnvelopeT } from '@skippy/shared';
 import { safeInvoke } from '../lib/tauri';
 
 /**
@@ -12,6 +13,12 @@ import { safeInvoke } from '../lib/tauri';
  * Per CLAUDE.md this is discrete UI-visible state (the scrubber is open or not,
  * a session is selected or not), so Zustand is the right home — not the
  * per-frame ref-store. Records are loaded on demand, not streamed per frame.
+ *
+ * Replay records are held to the SAME `Envelope` zod discipline as the live
+ * channel (`lib/channel.ts`): each parsed JSONL line is validated against the
+ * shared discriminated union and dropped if it doesn't conform, so the scrubber
+ * and `reconstructAt` only ever consume well-typed envelopes — never arbitrary
+ * untyped JSON off disk.
  */
 
 /** Metadata for one available replay file (mirrors Rust `ReplaySession`). */
@@ -22,9 +29,11 @@ export interface ReplaySessionMeta {
   modifiedMs: number;
 }
 
-/** A parsed replay record — a raw envelope plus its line index. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type ReplayRecord = any;
+/**
+ * A parsed replay record: a single validated wire envelope. Same union the live
+ * channel dispatches on, so the scrubber gets the same per-`type` narrowing.
+ */
+export type ReplayRecord = EnvelopeT;
 
 /**
  * The reconstructed view of a single agent at a given scrub index: the most
@@ -60,9 +69,18 @@ export interface ReplayStore {
   setSelectedIndex: (i: number) => void;
 }
 
-/** Extract a permissive `agentId` from a raw envelope, if it carries one. */
-function recordAgentId(rec: ReplayRecord): string | null {
-  if (rec && typeof rec === 'object' && typeof rec.agentId === 'string') {
+/**
+ * Extract the `agentId` from an envelope, if its variant carries one.
+ *
+ * Exported so HUD consumers (e.g. `ReplayScrubber`) can read an envelope's
+ * agentId without reaching into `rec.agentId` directly — only some members of
+ * the `Envelope` union have that field, so a bare access doesn't type-check.
+ */
+export function recordAgentId(rec: ReplayRecord): string | null {
+  // Not every envelope in the union has an `agentId` (e.g. `user_prompt`,
+  // `log`, `replay_session`, `memory_job`). The `in` check narrows to the
+  // members that do, so the field access is type-safe.
+  if ('agentId' in rec && typeof rec.agentId === 'string') {
     return rec.agentId;
   }
   return null;
@@ -107,11 +125,18 @@ export const useReplayStore = create<ReplayStore>((set, get) => ({
     for (const line of text.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
+      let raw: unknown;
       try {
-        records.push(JSON.parse(trimmed));
+        raw = JSON.parse(trimmed);
       } catch {
         // Skip a torn/partial line (the file may have been mid-write).
+        continue;
       }
+      // Hold replay records to the same Envelope discipline as the live
+      // channel: drop anything that isn't a well-formed wire envelope rather
+      // than trusting arbitrary JSON off disk.
+      const parsed = Envelope.safeParse(raw);
+      if (parsed.success) records.push(parsed.data);
     }
     set({
       activeSessionId: id,
@@ -142,6 +167,9 @@ export function reconstructAt(
   const upTo = Math.max(0, Math.min(records.length - 1, i));
   for (let idx = 0; idx <= upTo && idx < records.length; idx++) {
     const rec = records[idx];
+    // `noUncheckedIndexedAccess` widens the element to `Envelope | undefined`;
+    // the loop bound guarantees it's present, but guard so the union narrows.
+    if (rec === undefined) continue;
     const agentId = recordAgentId(rec);
     if (agentId === null) continue;
     const prev = out[agentId];

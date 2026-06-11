@@ -66,48 +66,64 @@ export function createHexPad(opts: HexPadOpts): HexPadContainer {
     .stroke({ width: 2, color: accentColor, alpha: 1 });
 
   // Inner 20% glow ring — a slightly smaller hex stroked in the lightened
-  // accent. We animate this layer's alpha (or stroke alpha via re-draw) when
-  // setGlow > 0, so it acts as the activity indicator.
+  // accent. It acts as the activity indicator: we animate the layer's node
+  // `alpha` each tick rather than re-tessellating the hex geometry.
+  //
+  // The "active" and "error" pulses differ in stroke color + width, both of
+  // which Pixi v8 bakes into the geometry at draw time. So we pre-draw both
+  // variants ONCE at full stroke alpha and toggle which one is visible in
+  // `setGlow`. Per-frame work is then a pure `.alpha` write — no `clear()`,
+  // no `poly()`, no re-tessellation. (We avoid Pixi Filters here: they're
+  // heavy on integrated GPUs and CLAUDE.md flags per-frame ref-store
+  // discipline.)
   const innerRadius = radius * 0.78;
   const innerPts = hexagonPoints(innerRadius);
-  const innerGlow = new Graphics();
-  innerGlow.label = 'hexpad.innerGlow';
-  innerGlow.poly(innerPts).stroke({ width: 1, color: glowColor, alpha: 0.2 });
 
-  c.addChild(pad, innerGlow);
+  // Active/idle variant: lightened accent stroke. Drawn at alpha 1 so node
+  // `.alpha` scales it linearly to the target effective alpha.
+  const activeGlow = new Graphics();
+  activeGlow.label = 'hexpad.innerGlow';
+  activeGlow.poly(innerPts).stroke({ width: 1.25, color: glowColor, alpha: 1 });
+  activeGlow.alpha = 0.2; // idle baseline (was width-1 stroke @ alpha 0.2)
+
+  // Error variant: marketingRed stroke, slightly heavier. Hidden until needed.
+  const errorGlow = new Graphics();
+  errorGlow.label = 'hexpad.innerGlow.error';
+  errorGlow.poly(innerPts).stroke({ width: 1.5, color: PALETTE_NUM.marketingRed, alpha: 1 });
+  errorGlow.alpha = 0;
+  errorGlow.visible = false;
+
+  c.addChild(pad, activeGlow, errorGlow);
 
   // ── glow state ─────────────────────────────────────────────────────────
-  // We avoid Pixi Filters here (filters are heavy on integrated GPUs and
-  // CLAUDE.md flags per-frame ref-store discipline). Instead we mutate the
-  // inner stroke's alpha each tick.
   let glowLevel: HexPadGlow = 0;
 
   c.setGlow = (intensity: HexPadGlow): void => {
     glowLevel = intensity;
-    if (intensity === 0) {
-      // Reset to baseline; static draw.
-      innerGlow.clear().poly(innerPts).stroke({ width: 1, color: glowColor, alpha: 0.2 });
+    // Toggle which pre-built variant is live; geometry is never rebuilt.
+    const erroring = intensity === 2;
+    errorGlow.visible = erroring;
+    if (erroring) {
+      // Error variant takes over; suppress the active layer entirely.
+      activeGlow.alpha = 0;
+    } else {
+      // Leaving error (or idling): seed the active layer's baseline so the pad
+      // is coherent before the next tick. tickGlow drives the pulse from here
+      // when active; for idle (0) it returns early and this 0.2 stays.
+      activeGlow.alpha = 0.2;
     }
   };
 
   c.tickGlow = (t: number): void => {
     if (glowLevel === 0) return;
-    // Sine pulse, 0.45 .. 0.95 alpha at ~0.4Hz when active; 0.5 .. 1.0 at
-    // ~1.4Hz and using marketingRed when erroring.
+    // Sine pulse, 0.45 .. 0.95 alpha at ~0.4Hz when active; 0.4 .. 1.0 at
+    // ~1.4Hz and using marketingRed when erroring. We only mutate node alpha.
     if (glowLevel === 2) {
       const a = 0.5 + 0.5 * Math.sin(t * 2 * Math.PI * 1.4);
-      innerGlow.clear().poly(innerPts).stroke({
-        width: 1.5,
-        color: PALETTE_NUM.marketingRed,
-        alpha: 0.4 + 0.6 * a,
-      });
+      errorGlow.alpha = 0.4 + 0.6 * a;
     } else {
       const a = 0.5 + 0.5 * Math.sin(t * 2 * Math.PI * 0.4);
-      innerGlow.clear().poly(innerPts).stroke({
-        width: 1.25,
-        color: glowColor,
-        alpha: 0.35 + 0.6 * a,
-      });
+      activeGlow.alpha = 0.35 + 0.6 * a;
     }
   };
 

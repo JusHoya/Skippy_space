@@ -33,9 +33,11 @@ import {
   MINIMAP_LAYERS,
   type AgentId,
   type AgentState,
+  type FogRegion,
   type MinimapLayer,
   type PedestalLayout,
   type TaskAgentSpec,
+  type ZoomLod,
 } from '@skippy/shared';
 import { sceneRefStore } from './refStore';
 import { tickAllBeercans } from './tickLoop';
@@ -48,6 +50,7 @@ import { createPedestalField, type PedestalFieldContainer } from './FilePedestal
 import {
   applyCameraToWorld,
   attachWheelZoom,
+  lodVisibility,
   worldSpaceFromHostPoint,
 } from './Camera';
 import { applyFogToPedestals } from './FogOfWar';
@@ -135,6 +138,10 @@ export default function SceneRoot() {
     let cleanupRO: (() => void) | null = null;
     let detachTick: (() => void) | null = null;
     let detachWheel: (() => void) | null = null;
+    // Set inside the async init to drain every live walker (destroy its Pixi
+    // container + drop its WALKER_REF_STORE entry) on unmount. Null until the
+    // walker structures exist; the cleanup guards for that.
+    let drainWalkers: (() => void) | null = null;
     const disposers: (() => void)[] = [];
 
     (async () => {
@@ -202,6 +209,17 @@ export default function SceneRoot() {
       // ── Skippy's throne + beercan at the origin ───────────────────────────
       const throne = createThronePad(PALETTE_NUM.neonCyan);
       world.addChild(throne);
+      // The throne is an always-visible minimap-dot layer (never hidden by LOD),
+      // so it carries a Skippy-select hit target too. At 'sprite' LOD the beercan
+      // sits on top and handles the tap (its stopPropagation wins); at icon/dot LOD
+      // the beercan is hidden, so the throne keeps Skippy selectable — otherwise
+      // hiding skippy.container would make Skippy unclickable at strategic zoom.
+      throne.eventMode = 'static';
+      throne.cursor = 'pointer';
+      throne.on('pointertap', (evt: FederatedPointerEvent) => {
+        evt.stopPropagation();
+        useSelectionStore.getState().setMulti([SKIPPY_ID]);
+      });
 
       const baseY = 0; // world-local; world is positioned at canvas center.
       const skippy = createBeercan({ accentColor: PALETTE_NUM.neonCyan, baseY });
@@ -268,6 +286,36 @@ export default function SceneRoot() {
       // Track which delegation ids have already spawned a walker so we don't
       // double-spawn on a re-emitted envelope.
       const walkerByDelegation = new Map<string, string>();
+      // Walker id → pedestal id it tinted, so despawn can reset the tint.
+      const walkerPedestal = new Map<string, string>();
+
+      // Tear a walker fully out of every per-frame structure: destroy its Pixi
+      // container (via WALKER_REF_STORE), drop the renderer-side spec the tick
+      // loop iterates, release the delegation→walker mapping, and clear the
+      // pedestal highlight. Keeping these four in lockstep is what stops the
+      // ref-store from retaining destroyed containers (review §4) and the tick
+      // cost from growing unbounded. Per CLAUDE.md #3 none of this routes
+      // through Zustand — it's the per-frame walker path.
+      const removeWalker = (delegationId: string): void => {
+        const walkerId = walkerByDelegation.get(delegationId);
+        if (!walkerId) return;
+        despawnWalker(walkerId);
+        walkerSpecs.delete(walkerId);
+        walkerByDelegation.delete(delegationId);
+        const pedestalId = walkerPedestal.get(walkerId);
+        if (pedestalId) {
+          pedestalField?.setActiveTint(pedestalId, null);
+          walkerPedestal.delete(walkerId);
+        }
+      };
+      // Expose a full drain to the outer cleanup so unmount/HMR tears down
+      // every live walker instead of orphaning destroyed containers in
+      // WALKER_REF_STORE. Snapshot the keys — removeWalker mutates the map.
+      drainWalkers = (): void => {
+        for (const delegationId of [...walkerByDelegation.keys()]) {
+          removeWalker(delegationId);
+        }
+      };
 
       // ── Drag-box overlay (screen-space, NOT inside world) ─────────────────
       // Lives on app.stage so it doesn't scale with the camera.
@@ -360,6 +408,35 @@ export default function SceneRoot() {
         if (s.view !== prev.view) applyCamera();
       });
       disposers.push(unsubCamera);
+
+      // ── Strategic-zoom LOD (PRD §7.4) ─────────────────────────────────────
+      // The store derives `lod` from `view.scale` via `lodForScale`, but until
+      // now nothing consumed it, so the SC-style sprite→icon→dot detail drop
+      // never executed (review §4). Toggle each layer's visibility per the
+      // `lodVisibility` contract in scene/Camera.ts:
+      //   • sprites — the beercans (captains + Skippy + walkers); only at lod
+      //     'sprite'. We hide the *beercan*, not the whole captain container,
+      //     so the hex pad + selection ring stay drawn as the dot face.
+      //   • pedestals — at lod 'sprite' and 'icon'.
+      //   • minimap-dots (throne + captain hex pads/rings) — always on; nothing
+      //     to toggle here, the strategic dot face stays drawn at every zoom.
+      // This is discrete UI-visible state (a handful of `.visible` flips on an
+      // LOD-boundary crossing), not per-frame work, so driving it from the
+      // Zustand `lod` subscription respects CLAUDE.md #3.
+      const applyLod = (lod: ZoomLod): void => {
+        const spritesVisible = lodVisibility('sprites', lod);
+        for (const boardId of BOARD_IDS) {
+          captains[boardId].beercan.container.visible = spritesVisible;
+        }
+        skippy.container.visible = spritesVisible;
+        walkersStage.visible = spritesVisible;
+        pedestalSlot.visible = lodVisibility('pedestals', lod);
+      };
+      applyLod(useCameraStore.getState().lod);
+      const unsubLod = useCameraStore.subscribe((s, prev) => {
+        if (s.lod !== prev.lod) applyLod(s.lod);
+      });
+      disposers.push(unsubLod);
 
       // Wheel zoom on the canvas host.
       detachWheel = attachWheelZoom(host, {
@@ -467,13 +544,31 @@ export default function SceneRoot() {
       });
       disposers.push(offHotkey);
 
-      // ── Delegation → walker spawn glue ────────────────────────────────────
+      // ── Delegation → walker spawn / despawn glue ──────────────────────────
+      // A walker is the on-map embodiment of a live delegation. It is spawned
+      // when the delegation is accepted and torn down when the delegation ends
+      // — a terminal failure (`declined`/`failed`) or the record disappearing
+      // from the store (project switch / clear). A `succeeded` walker is left
+      // standing: it represents completed work the user should still see on the
+      // map. Without this despawn the WALKER_REF_STORE would retain destroyed
+      // containers and the per-frame tick cost would grow without bound
+      // (review §4).
+      const TERMINAL_FAIL = new Set(['declined', 'failed']);
       const onDelegationDelta = (
         delegations: Record<string, { delegationId: string; toBoardId: BoardId; status: string }>,
       ): void => {
+        // 1. Despawn walkers whose delegation vanished from the store.
+        for (const delegationId of [...walkerByDelegation.keys()]) {
+          if (!(delegationId in delegations)) removeWalker(delegationId);
+        }
         if (pedestalLayouts.length === 0) return;
         for (const [id, rec] of Object.entries(delegations)) {
-          // Spawn a walker once the delegation is accepted; skip pending/declined.
+          // 2. Despawn a walker once its delegation reaches a terminal failure.
+          if (TERMINAL_FAIL.has(rec.status)) {
+            removeWalker(id);
+            continue;
+          }
+          // 3. Spawn a walker once the delegation is accepted; skip pending.
           if (walkerByDelegation.has(id)) continue;
           if (rec.status !== 'accepted' && rec.status !== 'succeeded') continue;
           const target = pickPedestalForBoard(pedestalLayouts, rec.toBoardId, id);
@@ -496,6 +591,7 @@ export default function SceneRoot() {
           });
           walkerSpecs.set(spec.id, spec);
           walkerByDelegation.set(id, spec.id);
+          walkerPedestal.set(spec.id, target.id);
           // Mark the target pedestal as shrouded — agent has touched it.
           useFogStore
             .getState()
@@ -524,17 +620,35 @@ export default function SceneRoot() {
         // "explored map at boot," and a sprinkling of files as bright so the
         // user sees the gradient. Phase 3's memory pipeline replaces this
         // deterministic seed with real "agent saw / agent edited" events.
+        //
+        // Build the whole regions record in ONE pass and commit it with a
+        // single `setState`. The old per-pedestal `markBright`/`markSeen` loop
+        // fired N Zustand sets — each one a whole-record spread AND a full
+        // `applyFogToPedestals` pass through the fog subscriber — for O(N^2)
+        // boot work (review §4). We mirror the store's transition rules here
+        // (markBright forces 'bright'; markSeen sets 'shrouded' but never
+        // downgrades an existing 'bright') so the batched result is identical.
         const now = new Date().toISOString();
-        const fog = useFogStore.getState();
-        for (let i = 0; i < pedestalLayouts.length; i++) {
-          const l = pedestalLayouts[i];
-          if (!l) continue;
-          if (i % 7 === 0) {
-            fog.markBright(l.id, now);
-          } else {
-            fog.markSeen(l.id, SKIPPY_ID, now);
+        useFogStore.setState((s) => {
+          const regions: Record<string, FogRegion> = { ...s.regions };
+          for (let i = 0; i < pedestalLayouts.length; i++) {
+            const l = pedestalLayouts[i];
+            if (!l) continue;
+            const existing = regions[l.id];
+            if (i % 7 === 0) {
+              regions[l.id] = { ...(existing ?? { regionId: l.id }), regionId: l.id, state: 'bright', lastSeenAt: now };
+            } else if (existing && existing.state === 'bright') {
+              // Don't downgrade an already-bright region to shrouded.
+              regions[l.id] = { ...existing, lastSeenBy: SKIPPY_ID, lastSeenAt: now };
+            } else {
+              regions[l.id] = { ...(existing ?? { regionId: l.id }), regionId: l.id, state: 'shrouded', lastSeenBy: SKIPPY_ID, lastSeenAt: now };
+            }
           }
-        }
+          return { regions };
+        });
+        // The fog subscriber runs `applyFogNow` exactly once for this single
+        // set; calling it directly here covers the case where `pedestalField`
+        // wasn't yet assigned when the subscriber fired.
         applyFogNow();
         setMinimapLayouts(pedestalLayouts);
         // Once layouts exist, re-run the delegation glue in case some arrived
@@ -580,13 +694,15 @@ export default function SceneRoot() {
       cleanupRO?.();
       sceneRefStore.clear();
       // Drain any walkers still around so the destroy chain finds clean state.
-      // Walker container destruction is also reached via app.destroy below; the
-      // explicit despawn keeps WALKER_REF_STORE consistent across HMR reloads.
-      // (`despawnWalker` is idempotent for unknown ids — safe even if the map
-      // is already empty.)
+      // `app.destroy` below would tear down the walker containers as part of
+      // the stage subtree, but it would NOT drop their WALKER_REF_STORE entries
+      // — that module-scope Map outlives this Pixi instance, so a remount would
+      // start with stale, destroyed refs (review §4: Pixi container leak +
+      // unbounded tick cost). Draining keeps WALKER_REF_STORE consistent across
+      // unmount / HMR reloads. (`despawnWalker` is idempotent for unknown ids.)
       // We intentionally don't call `useQueueStore` from cleanup; the queue is
       // session-scoped and outlives this Pixi instance.
-      void despawnWalker;
+      drainWalkers?.();
       if (initialized) {
         app.destroy(true, { children: true, texture: true });
       }
