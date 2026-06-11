@@ -24,6 +24,13 @@ services:
     restart: unless-stopped
     profiles: ['otel']
     command: ['--config=/etc/otelcol-contrib/config.yaml']
+    # The config references ${env:LANGFUSE_OTEL_AUTH_BASIC} for the Langfuse
+    # exporter's `Authorization: Basic …` header. The OTel Collector resolves
+    # ${env:…} from THIS CONTAINER's environment, so it must be injected here
+    # (sourced from the host/.env) — otherwise the header resolves empty and
+    # spans 401 instead of landing in Langfuse (review §infra reconciliation).
+    environment:
+      - LANGFUSE_OTEL_AUTH_BASIC=${LANGFUSE_OTEL_AUTH_BASIC:-}
     volumes:
       - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
     ports:

@@ -3,14 +3,30 @@
 // Goal: let the assistant (and CI) verify that the renderer actually paints
 // what it should — gallery tiles, HUD layout, animation transitions — without
 // requiring a human eyeball on every change. Tests live in `tests/visual/`
-// and emit screenshots that future regression tests can diff against.
+// and compare against committed baselines under `tests/visual/__snapshots__/`,
+// so a visual regression FAILS the run instead of silently overwriting the
+// baseline.
+//
+// Baselines are regenerated only on an explicit `--update-snapshots` run
+// (`updateSnapshots: 'missing'` below means a normal run never rewrites an
+// existing baseline — it only fills in a baseline that doesn't exist yet, then
+// fails so the new image gets reviewed before it's trusted).
 
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/visual',
+  // Commit baselines next to the specs, OS-suffixed by Playwright so a Linux CI
+  // baseline and a local Windows baseline can coexist instead of clobbering.
+  snapshotPathTemplate: '{testDir}/__snapshots__/{testFilePath}/{arg}-{platform}{ext}',
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
+  // Default to 'missing': a normal run compares against the committed baseline
+  // and never rewrites it; a baseline that is genuinely absent is generated
+  // once (and the test still fails so a human/assistant signs off on the new
+  // image). `npx playwright test --update-snapshots` overrides this to refresh
+  // baselines on purpose. We never silently overwrite on every run.
+  updateSnapshots: 'missing',
   // 1 retry locally absorbs the transient flake we see when the validator runs
   // gallery → HUD back-to-back: 9 Pixi apps churning mount/destroy can starve
   // the next test's first paint past the default toBeVisible timeout.
@@ -23,6 +39,22 @@ export default defineConfig({
   timeout: 120_000,
   expect: {
     timeout: 15_000,
+    // Visual-comparison tolerances. WebGL/Pixi output carries a little
+    // anti-aliasing and sub-pixel rounding noise between runs even with no real
+    // change, so we allow a tiny diff budget. `maxDiffPixelRatio` is the
+    // fraction of differing pixels we tolerate; keep it small enough that a
+    // real regression (a missing tile, blank canvas, broken layout) blows past
+    // it. `threshold` is the per-pixel colour-distance below which two pixels
+    // count as equal (0–1; lower = stricter).
+    toHaveScreenshot: {
+      maxDiffPixelRatio: 0.02,
+      threshold: 0.2,
+      // Pixi animates continuously (idle bob, blink); freeze CSS animations and
+      // let Playwright retry the capture until two consecutive frames match so
+      // the comparison isn't racing the ticker.
+      animations: 'disabled',
+      caret: 'hide',
+    },
   },
   use: {
     baseURL: 'http://localhost:5173',

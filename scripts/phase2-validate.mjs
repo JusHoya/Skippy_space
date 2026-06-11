@@ -10,9 +10,11 @@
 //   - Phase 0/1 stack staples (repo typecheck, sidecar build, cargo check).
 //   - File-presence checks for every Phase 2 module across UI + sprite-kit +
 //     shared + Rust shell.
-//   - In-process behavior smoke tests (via @skippy/ui's tsx) for the four
-//     pure modules (projectTree, walkers, Camera, FogOfWar) + the four new
-//     Zustand stores (selection, camera, queue, fog).
+//   - In-process behavior smoke tests via each module's host package's tsx:
+//     the pure scene modules Camera + FogOfWar (through @skippy/agent-runtime)
+//     and the four new Zustand stores selection/camera/queue/fog (through
+//     @skippy/ui, where `zustand` resolves). walkers + projectTree pull the
+//     Pixi runtime, so their export surface is asserted by grep below instead.
 //   - Playwright HUD render to refresh `tests/visual/screenshots/hud-overview.png`.
 //
 // Usage:
@@ -292,14 +294,16 @@ console.log(`\n${DIM}store action surfaces${RESET}`);
   }
 }
 
-// Store probe: exercise the four new Zustand stores via in-memory creates.
-// SKIPPED — agent-runtime's tsx can't resolve `zustand` from outside UI.
-// The grep surface above + the repo-wide `pnpm typecheck` cover the same
-// territory by construction.
-const _DISABLED_storesProbeBody = `
+// Store probe: exercise the four new Zustand stores via their imperative
+// getState()/action API. This runs headless through @skippy/ui's tsx (where
+// `zustand` resolves). We touch the stores' STATE, never the React-hook
+// selectors (`useLod()`, `useQueueCount()` call `useCallback` and throw outside
+// a render) — the behavior under test is the store logic, not the hook wiring,
+// so we read `getState().lod` / `getState().queued.length` directly instead.
+const storesProbeBody = `
 import { useSelectionStore } from '../apps/ui/src/stores/selectionStore.ts';
-import { useCameraStore, useLod } from '../apps/ui/src/stores/cameraStore.ts';
-import { useQueueStore, useQueueCount } from '../apps/ui/src/stores/queueStore.ts';
+import { useCameraStore } from '../apps/ui/src/stores/cameraStore.ts';
+import { useQueueStore } from '../apps/ui/src/stores/queueStore.ts';
 import { useFogStore } from '../apps/ui/src/stores/fogStore.ts';
 
 let failures = [];
@@ -333,20 +337,29 @@ check('clearMulti empties', useSelectionStore.getState().multiSelected.length ==
 const cam = useCameraStore.getState();
 cam.resetView();
 check('cameraStore default scale 1.0', useCameraStore.getState().view.scale === 1, null);
-check('useLod default = sprite', useLod() === 'sprite', null);
+check('lod default = sprite', useCameraStore.getState().lod === 'sprite', null);
 cam.setScale(100); // far past maxScale 2.5
 check('setScale clamps to max', useCameraStore.getState().view.scale === useCameraStore.getState().view.maxScale, null);
 cam.setScale(0); // way under min
 check('setScale clamps to min', useCameraStore.getState().view.scale === useCameraStore.getState().view.minScale, null);
 cam.resetView();
 const before = { ...useCameraStore.getState().view };
-cam.zoomBy(2, 100, 50);
+const FOCUS_X = 100, FOCUS_Y = 50;
+cam.zoomBy(2, FOCUS_X, FOCUS_Y);
 const after = useCameraStore.getState().view;
 check('zoomBy doubles scale', after.scale === before.scale * 2, \`\${before.scale}→\${after.scale}\`);
-// Pin invariant: at focus point, world coord remains stable after zoom.
-//   newPan = focus - (focus - oldPan)*ratio  with ratio=2
-const expectPanX = 100 - (100 - 0) * 2; // = -100
-check('zoomBy pins focus.x', Math.abs(after.panX - expectPanX) < 1e-9, \`got panX=\${after.panX}\`);
+// Pin invariant — asserted via the camera's OWN forward transform, not a
+// re-derived pan formula (which would just mirror the implementation). The
+// world-space transform is  host = hostW/2 + (world + pan) * scale; the
+// constant hostW/2 cancels, so the world point under the cursor stays put iff
+//   (focus + pan) * scale  is unchanged across the zoom. (Worked: 0+100=100 at
+//   scale 1 must equal panAfter+100 at scale 2 ⇒ panAfter=-50.)
+const projBeforeX = (FOCUS_X + before.panX) * before.scale;
+const projAfterX = (FOCUS_X + after.panX) * after.scale;
+const projBeforeY = (FOCUS_Y + before.panY) * before.scale;
+const projAfterY = (FOCUS_Y + after.panY) * after.scale;
+check('zoomBy pins focus.x (world point stays under cursor)', Math.abs(projBeforeX - projAfterX) < 1e-9, \`\${projBeforeX} vs \${projAfterX} (panX=\${after.panX})\`);
+check('zoomBy pins focus.y (world point stays under cursor)', Math.abs(projBeforeY - projAfterY) < 1e-9, \`\${projBeforeY} vs \${projAfterY} (panY=\${after.panY})\`);
 cam.resetView();
 cam.setScale(0.1);
 check('lod recomputes to org at low scale', useCameraStore.getState().lod === 'org', \`got \${useCameraStore.getState().lod}\`);
@@ -358,11 +371,11 @@ q.clearQueue();
 const first = q.enqueue({ targetAgentId: 'board.engineering', label: 'design', hotkey: 'A' });
 const second = q.enqueue({ targetAgentId: 'board.coding', label: 'implement', hotkey: 'S' });
 check('enqueue assigns id (ULID-ish)', typeof first.id === 'string' && first.id.length >= 16, null);
-check('useQueueCount = 2', useQueueCount() === 2, null);
+check('queued length = 2', useQueueStore.getState().queued.length === 2, null);
 check('isQueueing latched true', useQueueStore.getState().isQueueing === true, null);
 const released = q.releaseAll();
 check('releaseAll FIFO order', released[0].id === first.id && released[1].id === second.id, null);
-check('queue cleared', useQueueCount() === 0, null);
+check('queue cleared', useQueueStore.getState().queued.length === 0, null);
 check('isQueueing lowered', useQueueStore.getState().isQueueing === false, null);
 
 // fogStore: markSeen doesn't downgrade bright; toggleLayer idempotency
@@ -389,12 +402,16 @@ if (failures.length > 0) {
 console.log('OK');
 `;
 
-async function runProbe(name, body) {
+// Probes run through a chosen workspace package's tsx so the import graph
+// resolves against that package's node_modules: the pure scene modules resolve
+// fine through agent-runtime, but the Zustand stores need @skippy/ui (where
+// `zustand` lives), so each probe declares its host package.
+async function runProbe(name, body, pkg = '@skippy/agent-runtime') {
   const probe = writeProbe(name, body);
   try {
-    runStep(`probe.${name} (tsx)`, PNPM, [
+    runStep(`probe.${name} (tsx via ${pkg})`, PNPM, [
       '--filter',
-      '@skippy/agent-runtime',
+      pkg,
       'exec',
       'tsx',
       probe,
@@ -405,7 +422,7 @@ async function runProbe(name, body) {
 }
 
 await runProbe('pure-modules', moduleProbeBody);
-// stores probe is skipped (see _DISABLED_storesProbeBody above for context).
+await runProbe('stores', storesProbeBody, '@skippy/ui');
 
 // ── visual smoke (refreshes the HUD baseline) ─────────────────────────────
 console.log(`\n${DIM}visual${RESET}`);

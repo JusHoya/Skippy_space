@@ -56,6 +56,19 @@ pub enum Envelope {
         ts: String,
     },
 
+    /// Shell → renderer: agent-runtime child-process lifecycle, emitted by the
+    /// sidecar supervisor in `sidecar.rs`. `event` is one of `crashed` (child
+    /// exited), `restarted` (a fresh child is up + boards re-announced), or
+    /// `ready` (clean cold boot). The renderer releases agents stuck in
+    /// `thinking`/`speaking` on `crashed`/`restarted` so Skippy doesn't hang
+    /// forever on a turn the dead child can never finish (REVIEW §5 critic).
+    SidecarStatus {
+        event: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        ts: String,
+    },
+
     // ── Phase 1: Board lifecycle ───────────────────────────────────────────
     BoardSpawned {
         #[serde(rename = "boardId")]
@@ -255,6 +268,17 @@ impl Envelope {
             ts: chrono::Utc::now().to_rfc3339(),
         }
     }
+
+    /// Convenience constructor for a sidecar-lifecycle pulse. `event` is
+    /// `crashed` | `restarted` | `ready`; `detail` carries the exit info /
+    /// human-readable context (e.g. `"exit status ExitStatus(...)"`).
+    pub fn sidecar_status(event: impl Into<String>, detail: Option<String>) -> Self {
+        Envelope::SidecarStatus {
+            event: event.into(),
+            detail,
+            ts: chrono::Utc::now().to_rfc3339(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -279,6 +303,7 @@ mod tests {
             Envelope::ErrorSpan { .. } => "error_span",
             Envelope::MemoryJob { .. } => "memory_job",
             Envelope::ReplaySession { .. } => "replay_session",
+            Envelope::SidecarStatus { .. } => "sidecar_status",
             Envelope::Log { .. } => "log",
             _ => "other",
         };
@@ -343,6 +368,44 @@ mod tests {
         assert_variant(
             r#"{"type":"replay_session","sessionId":"sess-1","event":"ended","ts":"2026-06-10T12:00:08Z"}"#,
             "replay_session",
+        );
+    }
+
+    #[test]
+    fn sidecar_status_round_trips_onto_its_variant() {
+        // crashed pulse with the exit detail attached.
+        assert_variant(
+            r#"{"type":"sidecar_status","event":"crashed","detail":"sidecar exited with status ExitStatus(unix_wait_status(139))","ts":"2026-06-10T12:00:10Z"}"#,
+            "sidecar_status",
+        );
+        // restarted pulse, detail omitted (optional on the wire).
+        assert_variant(
+            r#"{"type":"sidecar_status","event":"restarted","ts":"2026-06-10T12:00:11Z"}"#,
+            "sidecar_status",
+        );
+        // ready pulse on a clean cold boot.
+        assert_variant(
+            r#"{"type":"sidecar_status","event":"ready","ts":"2026-06-10T12:00:12Z"}"#,
+            "sidecar_status",
+        );
+    }
+
+    #[test]
+    fn sidecar_status_serializes_with_camelcase_tag_and_drops_absent_detail() {
+        // The renderer consumes the wire JSON verbatim: tag is snake_case
+        // `sidecar_status`, `detail` is omitted entirely when None (matching the
+        // Zod `.optional()` on the TS side), and present when Some.
+        let crashed = Envelope::sidecar_status("crashed", Some("boom".into()));
+        let json = serde_json::to_string(&crashed).unwrap();
+        assert!(json.contains(r#""type":"sidecar_status""#), "tag must be snake_case: {json}");
+        assert!(json.contains(r#""event":"crashed""#), "event field present: {json}");
+        assert!(json.contains(r#""detail":"boom""#), "detail present when Some: {json}");
+
+        let restarted = Envelope::sidecar_status("restarted", None);
+        let json = serde_json::to_string(&restarted).unwrap();
+        assert!(
+            !json.contains("detail"),
+            "absent detail must be skipped, not emitted as null: {json}"
         );
     }
 

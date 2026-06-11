@@ -407,7 +407,7 @@ title: "Karpathy AI wiki — atomic note pattern"
 created_at: 2026-04-29T14:32:11Z
 updated_at: 2026-04-29T14:32:11Z
 type: concept                          # see §8.4
-status: draft                          # draft | active | distilled | canonical | archived
+status: draft                          # draft | active | distilled | canonical | archived | deprecated
 tags: [memory, wiki, agents]
 source: https://gist.github.com/...    # or file:// or conv:// or ref:#id
 authored_by: skippy.research.web      # board.task or "human"
@@ -419,6 +419,16 @@ contradicts: []
 ```
 
 ULID generation via `obsidian-ulid-plugin`; agents use the `ulid` npm pkg in the sidecar.
+
+The `status` enum is the **closed set of six** values shown above — `draft`,
+`active`, `distilled`, `canonical`, `archived`, `deprecated`. Earlier drafts of
+this schema listed only the first five while §8.2 and §8.6 referenced
+`status: deprecated` as the terminal state a *superseded* note enters before it
+migrates to `90_Archive/`; that contradiction is resolved in favour of including
+`deprecated`. The implemented validator is the source of truth here:
+`packages/memory/src/frontmatter.ts` `NOTE_STATUSES` enumerates exactly these
+six values and `NoteFrontmatterSchema` enforces them (plus the §8.10
+`atomic_fact`-requires-`source`-unless-`draft` guard).
 
 ### 8.4 Note types (closed set)
 
@@ -592,6 +602,7 @@ Skippy_space/
 ├── docs/
 │   ├── PRD.md                     # this document
 │   ├── architecture.md
+│   ├── changelog.md               # phase + Hoya_Box sync log (R-11)
 │   ├── roadmap.md
 │   └── research/
 │       ├── 01_hoyabox_recon.md
@@ -802,6 +813,47 @@ Total ~280 frames × 8 board costumes + 1 Skippy = manageable single-artist scop
 
 **Exit criterion:** dropping a paper into `00_Inbox/` produces a richly-linked set of atomic notes within 5 minutes.
 
+### 14.45 Phase 3.5 — Obsidian + Letta tools (interstitial, 2026-06-03)
+
+**Goal:** give the gated SDK Boards real, in-process memory tools — surgical
+Obsidian vault edits (D1) and Letta long-term memory with a durable
+vault mirror (D4) — without taking the SDK off the default-off boot path.
+
+This phase was inserted between Phase 3 and Phase 4 to land the
+`obsidian_*` / `letta_*` MCP tool surface that Phase 4 polish depends on. It
+is **gated behind `PHASE3_AGENTS_ENABLED`** like the rest of the SDK Board
+path; with the gate off, none of it touches the boot path.
+
+- [x] In-process Obsidian MCP server (`apps/agent-runtime/src/mcp-handlers.ts`
+      + `mcp-registry.ts`): `obsidian_read_note`, `obsidian_search`,
+      `obsidian_patch_frontmatter`, `obsidian_append_block`,
+      `obsidian_write_note`. Backed by the WS2 `ObsidianRestClient` with an
+      atomic-fs fallback so writes survive Obsidian being closed. Our
+      in-process equivalents of the §8.9 `cyanheads/obsidian-mcp-server` +
+      `jacksteamdev/obsidian-mcp-tools`.
+- [x] Graceful Letta client (`packages/memory/src/letta-client.ts`) +
+      `letta_search_archival`, `letta_append_archival`, `letta_edit_core`,
+      each bound per-board to the charter's `memory.letta_agent_id`.
+- [x] **Archival → vault mirror:** `letta_append_archival` also appends to
+      `vault/50_Agents/<board>/agent_log.md` so the durable record survives
+      Letta being down. Every tool degrades to an `isError` text result when
+      its backing service is offline rather than crashing the board.
+- [x] Charters declare servers via `mcp_servers:`; `buildMcpServers(charter,
+      vaultRoot)` builds one in-process SDK MCP server per declared name and
+      passes them into the board's gated `query()`. `github` / `playwright`
+      are declared-but-not-yet-implemented (skipped with a warn).
+- [x] zod scoped: the SDK's `tool()` requires zod v4, so `zod@4` is scoped to
+      `apps/agent-runtime` only; `@skippy/shared` + `@skippy/memory` stay on
+      zod@3.
+
+**Exit criterion:** `pnpm validate:phase3.5` is green (20/20) and re-running
+`pnpm validate:phase3` proves the off-by-default gated path caused no
+regression. See §16 OQ-D4-01..04 for the provisional Letta REST surface and the
+missing agent-bootstrap job carried forward from this phase.
+
+**Open Questions raised:** OQ-D4-01..04 (Letta REST endpoint paths /
+bootstrap), tracked in §16.
+
 ### 14.5 Phase 4 — Polish + Ship (week 11–13)
 
 - [ ] EV code-signing pipeline (Azure Key Vault).
@@ -837,7 +889,7 @@ Total ~280 frames × 8 board costumes + 1 Skippy = manageable single-artist scop
 | **R-08** | Skippy persona drifts toward generic-helpful under model updates. | Medium | Pin charter; lint pass that grep's for "monkey" / "magnificent" / "asshole setting" frequency in transcripts; alert if below threshold. |
 | **R-09** | LLM API cost runaway from a stuck agent. | High | Per-board $/hour budget cap; auto-pause on breach; weekly cost report. |
 | **R-10** | The user gets bored of the RTS aesthetic in a month and wants pure productivity mode. | Low | Provide a "command-line-only" toggle that keeps the orchestration but hides the map. The map is the joy, not the lock-in. |
-| **R-11** | Hoya_Box concept drift — we change agent definitions in Skippy_space without updating Hoya_Box. | Medium | Establish Hoya_Box as upstream; Skippy_space ports periodically; document the sync ritual in `docs/architecture.md`. |
+| **R-11** | Hoya_Box concept drift — we change agent definitions in Skippy_space without updating Hoya_Box. | Medium | Establish Hoya_Box as upstream; Skippy_space ports periodically; document the sync ritual in `docs/architecture.md` (§6) and **log each port in `docs/changelog.md`** (Hoya_Box sync log). Both files now exist as the operational substrate. |
 | **R-12** | Single-machine memory limits — Langfuse, Letta, Obsidian, Tauri, Node, all running. | Low | Tauri footprint is tiny (~30–40MB); Langfuse + Letta in Docker can pause when not actively used. |
 
 ---
@@ -860,6 +912,11 @@ Total ~280 frames × 8 board costumes + 1 Skippy = manageable single-artist scop
 | **OQ-12** | Telemetry retention: how long do we keep `.replay` files? | 30 days hot, then compressed to `90_Archive/replays/`. 
 | **OQ-13** | What's the smallest possible v0 demo to validate the RTS-feel hypothesis with the user? | Phase 0 + a single board with a two sprites walking to a seperate file pedestals. Aim for end-of-week-2.
 | **OQ-14** | Should the app's window title use Skippy-voice ("Skippy is, in fact, magnificent")? | Yes. Default on; toggle off in settings. 
+| **OQ-18** | How / how often do we refresh the pinned per-model pricing + context-window tables the cost meter and pressure bar bill against? | **Pinned 2026-06-03; refresh quarterly with R-02.** The figures live wrapped in DTOs (`packages/shared/src/pricing.ts` `MODEL_PRICING`, `packages/shared/src/model-limits.ts` `MODEL_CONTEXT_LIMITS`) so a bump is a one-file edit and never leaks model-specific arithmetic into call sites. Refresh both together whenever Anthropic changes list pricing or window sizes. (OQ ids 15–17 were never assigned; this id is referenced from the pricing/limits source comments.)
+| **OQ-D4-01** | Are the Letta REST endpoint **paths** for archival *insert* correct against the pinned Letta image? | **Provisional — verify live (Phase 3.5 carryover).** Implemented in `packages/memory/src/letta-client.ts`; confirm against the pinned `letta/letta` image during the §14.45 manual live-validation pass. The board never hard-fails on a wrong path — the archival→vault mirror keeps the durable record (`scripts/README.md`).
+| **OQ-D4-02** | Are the Letta REST endpoint **paths** for archival *search* correct against the pinned Letta image? | **Provisional — verify live (Phase 3.5 carryover).** Same as OQ-D4-01: `letta_search_archival` round-trips are checked during the §14.45 live pass; degrades to `isError` when Letta is down.
+| **OQ-D4-03** | Are the Letta REST endpoint **paths** for *core-memory* edits correct against the pinned Letta image? | **Provisional — verify live (Phase 3.5 carryover).** Same as OQ-D4-01/02 for `letta_edit_core`.
+| **OQ-D4-04** | Who bootstraps the per-board Letta agents (`bd_research_v1`, …)? Is there an automated provisioning job? | **No bootstrap job yet (Phase 3.5 carryover).** Today each board agent is pre-created by hand before a live run (`scripts/README.md` step 1). A `letta-bootstrap` job that provisions agents from charter `memory.letta_agent_id` is deferred to a Phase 3.x / Phase 4 follow-up.
 
 ---
 

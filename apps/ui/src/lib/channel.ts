@@ -250,6 +250,27 @@ export function dispatchEnvelope(raw: unknown): void {
       fn.call(console, `[${env.source}] ${env.message}`);
       break;
     }
+    case 'sidecar_status': {
+      // The agent-runtime child process died and/or came back. Without this,
+      // a crash mid-turn left Skippy (and any board) stuck in 'thinking'/
+      // 'speaking' forever — the dead child can never emit the agent_complete
+      // that would idle them, and the only signal was a console-bound Log
+      // (REVIEW §5 critic, sidecar.rs). On a crash the WHOLE runtime is gone,
+      // so every board's query() process died with it: reset the roster back to
+      // a lone idle Skippy. The restarted runtime re-announces its boards via
+      // its own board_spawned/board_ready envelopes, so the roster rebuilds.
+      if (env.event === 'crashed' || env.event === 'restarted') {
+        // Drain any tokens buffered for a turn the dead child can't finish, so a
+        // stale run can't flush onto the fresh generation after the reset.
+        flushTokenBatch();
+        useAgentStore.getState().reset();
+      }
+      const detail = env.detail ? ` — ${env.detail}` : '';
+      const note = `[skippy/ui] sidecar ${env.event}${detail}`;
+      if (env.event === 'crashed') console.warn(note);
+      else console.info(note);
+      break;
+    }
     case 'user_prompt':
       // We mirror these into the prompt store so the side panel shows the
       // outgoing prompt before any tokens come back.

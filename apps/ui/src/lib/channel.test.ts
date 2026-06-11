@@ -268,6 +268,67 @@ test('agent_complete flushes buffered tokens before finalizing', async () => {
   cleanup();
 });
 
+// ── sidecar-crash recovery (REVIEW §5 critic, sidecar.rs) ───────────────────
+//
+// A sidecar (agent-runtime child) crash used to be invisible to the renderer:
+// only a console-bound Log signalled it, so an in-flight Skippy turn stayed in
+// 'thinking'/'speaking' forever — the dead child can never emit the
+// agent_complete that would idle it. The fix adds a `sidecar_status` envelope
+// that, on 'crashed'/'restarted', resets the agent roster so nothing hangs.
+
+test('sidecar_status:crashed resets a stuck thinking/speaking agent to idle', async () => {
+  const { dispatchEnvelope } = currentMod;
+  const { useAgentStore } = (await import(
+    '../stores/agentStore.js'
+  )) as typeof import('../stores/agentStore.js');
+
+  // Skippy is mid-turn (speaking) and a board is mid-task (thinking) when the
+  // runtime dies — exactly the state that used to hang forever.
+  useAgentStore.getState().setAgent('skippy', { state: 'speaking' });
+  useAgentStore.getState().setAgent('board.coding' as never, { state: 'thinking' });
+  assert.equal(useAgentStore.getState().agents.skippy?.state, 'speaking');
+
+  dispatchEnvelope({
+    type: 'sidecar_status',
+    event: 'crashed',
+    detail: 'sidecar exited with status ExitStatus(...)',
+    ts: new Date().toISOString(),
+  });
+
+  // The whole runtime is gone, so the roster collapses back to a lone idle
+  // Skippy — no agent is left stranded mid-turn.
+  const agents = useAgentStore.getState().agents;
+  assert.equal(agents.skippy?.state, 'idle', 'Skippy must un-stick to idle after a crash');
+  assert.equal(
+    agents['board.coding'],
+    undefined,
+    'the dead board sprite is cleared; it re-announces on restart',
+  );
+});
+
+test('sidecar_status:ready (clean cold boot) does NOT wipe the roster', async () => {
+  const { dispatchEnvelope } = currentMod;
+  const { useAgentStore } = (await import(
+    '../stores/agentStore.js'
+  )) as typeof import('../stores/agentStore.js');
+
+  useAgentStore.getState().setAgent('board.research' as never, { state: 'working' });
+
+  dispatchEnvelope({
+    type: 'sidecar_status',
+    event: 'ready',
+    ts: new Date().toISOString(),
+  });
+
+  // A first clean boot is informational only — it must not reset live agents
+  // (there's been no crash to recover from).
+  assert.equal(
+    useAgentStore.getState().agents['board.research']?.state,
+    'working',
+    'a ready pulse must not disturb the existing roster',
+  );
+});
+
 // ── memory_job is no longer dropped (REVIEW-2026-06-10 §4) ──────────────────
 
 test('memory_job envelopes are published, not dropped', () => {

@@ -50,6 +50,23 @@ export const LogEnvelope = z.object({
 });
 
 /**
+ * Shell → renderer: the agent-runtime child process lifecycle, emitted by the
+ * Rust sidecar supervisor (NOT the Node runtime — it's the Node process that
+ * dies). A `crashed` pulse fires the moment the child exits; once a fresh child
+ * is up and the boards have been re-announced, a `restarted` (and, on a clean
+ * cold boot, `ready`) pulse fires. The renderer uses `crashed`/`restarted` to
+ * release agents stuck in `thinking`/`speaking` on an in-flight turn the dead
+ * child can no longer finish — without it Skippy hangs forever (REVIEW
+ * §5 critic, `sidecar.rs`).
+ */
+export const SidecarStatusEnvelope = z.object({
+  type: z.literal('sidecar_status'),
+  event: z.enum(['crashed', 'restarted', 'ready']),
+  detail: z.string().optional(),
+  ts: Iso,
+});
+
+/**
  * Emitted by the sidecar when a Board captain's query() process starts.
  * The board sprite should become present at idle/spawning state.
  */
@@ -154,6 +171,7 @@ export const Envelope = z.discriminatedUnion('type', [
   AgentTokenEnvelope,
   AgentCompleteEnvelope,
   LogEnvelope,
+  SidecarStatusEnvelope,
   BoardSpawnedEnvelope,
   BoardReadyEnvelope,
   BoardStateEnvelope,
@@ -175,6 +193,7 @@ export type AgentStateEnvelope = z.infer<typeof AgentStateEnvelope>;
 export type AgentTokenEnvelope = z.infer<typeof AgentTokenEnvelope>;
 export type AgentCompleteEnvelope = z.infer<typeof AgentCompleteEnvelope>;
 export type LogEnvelope = z.infer<typeof LogEnvelope>;
+export type SidecarStatusEnvelope = z.infer<typeof SidecarStatusEnvelope>;
 export type BoardSpawnedEnvelope = z.infer<typeof BoardSpawnedEnvelope>;
 export type BoardReadyEnvelope = z.infer<typeof BoardReadyEnvelope>;
 export type BoardStateEnvelope = z.infer<typeof BoardStateEnvelope>;

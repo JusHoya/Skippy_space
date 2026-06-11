@@ -11,15 +11,18 @@
 #                                                  │
 #                                                  ├──► Langfuse OTLP at
 #                                                  │     http://langfuse-server:3000
-#                                                  │     /api/public/otel/v1/traces
+#                                                  │     /api/public/otel  (+ /v1/traces)
 #                                                  │
 #                                                  └──► stdout (debug)
 #
 # Why HTTP on :4319 and not the canonical :4318:
-#   Langfuse's own server already binds :4318 (its OTLP ingest path). To run
-#   both on one host we shift this collector's HTTP receiver to :4319. The
-#   agent-runtime's OTEL_EXPORTER_OTLP_ENDPOINT env var must point here, not
-#   directly at Langfuse, so we can fan out to multiple exporters.
+#   We keep this collector's HTTP receiver off the canonical :4318 so it can
+#   coexist with any other local OTLP listener on the host without a port
+#   clash. The agent-runtime's OTEL_EXPORTER_OTLP_ENDPOINT env var must point
+#   here (see .env.example), not directly at Langfuse, so we can fan out to
+#   multiple exporters. NOTE: Langfuse v3's OTLP ingest is on :3000 at the
+#   path below — it does NOT listen on :4318 (an earlier comment claimed it
+#   did; that was wrong and is corrected here).
 
 receivers:
   otlp:
@@ -49,13 +52,23 @@ exporters:
   # Primary persistence: Langfuse's OTLP ingest path. The hostname
   # `langfuse-server` resolves via the shared docker network — see
   # infra/otel-collector/docker-compose.yml.
+  #
+  # Langfuse's OTLP endpoint (introduced in Langfuse v3) lives at
+  # `/api/public/otel`; the otlphttp exporter appends the signal suffix, so
+  # traces are POSTed to `/api/public/otel/v1/traces`. It REQUIRES HTTP Basic
+  # auth built from a project's API keys:
+  #     Authorization: Basic base64("<public_key>:<secret_key>")
+  # We read the pre-computed base64 blob from the environment so no secret is
+  # baked into this file. The container gets LANGFUSE_OTEL_AUTH_BASIC from the
+  # compose env (which sources `.env`); see .env.example for how to compute it.
+  # Without this header every span is rejected with 401 and nothing lands.
   otlphttp/langfuse:
     endpoint: http://langfuse-server:3000/api/public/otel
-    # Langfuse OTLP is HTTP, gen_ai semconv-aware. Headers carry auth in
-    # production; for hobby/local we rely on the Langfuse server's own
-    # default project. Override here (or via env) when multi-tenant.
-    # headers:
-    #   Authorization: 'Basic <base64(public:secret)>'
+    headers:
+      Authorization: 'Basic ${env:LANGFUSE_OTEL_AUTH_BASIC}'
+    # In-cluster plain HTTP to a sibling container on the shared docker
+    # network — no TLS to verify. (External/HTTPS deployments would drop this
+    # and use a real cert.)
     tls:
       insecure: true
 

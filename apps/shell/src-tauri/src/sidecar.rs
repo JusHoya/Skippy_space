@@ -253,6 +253,14 @@ fn locate_sidecar_entry(app: &AppHandle) -> Option<PathBuf> {
 pub async fn spawn_supervisor(app: AppHandle, handle: SidecarHandle) {
     let no_restart = std::env::var("SKIPPY_NO_RESTART").is_ok();
 
+    // Did the *previous* generation actually get a live child? Drives the
+    // sidecar_status semantics: a successful spawn after a death is a
+    // `restarted` pulse (the renderer already saw `crashed`), whereas the very
+    // first successful spawn is a clean `ready` cold boot. A spawn that never
+    // produced a child (entry missing, node spawn error) is NOT a death, so it
+    // doesn't set this flag and doesn't emit a spurious `crashed`.
+    let mut child_was_live = false;
+
     loop {
         let entry = match locate_sidecar_entry(&app) {
             Some(p) => p,
@@ -278,16 +286,35 @@ pub async fn spawn_supervisor(app: AppHandle, handle: SidecarHandle) {
             format!("spawning node {}", entry.display()),
         ));
 
-        match spawn_once(&entry, &handle).await {
+        // `spawn_once` emits the up-pulse (`ready` cold boot / `restarted` after
+        // a death) itself, once the child is confirmed alive and its stdio is
+        // wired — that's the earliest moment the runtime can receive the replayed
+        // backlog and re-announce its boards. Tell it which one to send.
+        let restart = child_was_live;
+        match spawn_once(&entry, &handle, restart).await {
             Ok(status) => {
+                // The child ran and then exited: this is a crash/restart event,
+                // not a never-started one. Tell the renderer so it can release
+                // any agent stuck mid-turn ('thinking'/'speaking') on a reply the
+                // dead child can never deliver — otherwise Skippy hangs forever.
+                child_was_live = true;
                 let msg = format!("sidecar exited with status {status:?}");
                 warn!("{msg}");
-                handle.bus.publish(Envelope::log("warn", "sidecar", msg));
+                handle.bus.publish(Envelope::log("warn", "sidecar", msg.clone()));
+                handle.bus.publish(Envelope::sidecar_status("crashed", Some(msg)));
             }
             Err(e) => {
+                // The process refused to start (node missing, no stdio). No live
+                // child existed this generation, so the next successful spawn is
+                // still a cold `ready`, not a `restarted`. We do emit a `crashed`
+                // pulse so a renderer that was mid-turn still un-sticks.
                 let msg = format!("sidecar spawn error: {e}");
                 error!("{msg}");
-                handle.bus.publish(Envelope::log("error", "sidecar", msg));
+                handle.bus.publish(Envelope::log("error", "sidecar", msg.clone()));
+                if child_was_live {
+                    handle.bus.publish(Envelope::sidecar_status("crashed", Some(msg)));
+                }
+                child_was_live = false;
             }
         }
 
@@ -307,7 +334,17 @@ pub async fn spawn_supervisor(app: AppHandle, handle: SidecarHandle) {
 
 /// One spawn + watch cycle. Returns the exit status (or an error if the
 /// process refused to start at all).
-async fn spawn_once(entry: &Path, handle: &SidecarHandle) -> Result<std::process::ExitStatus> {
+///
+/// `restart` distinguishes the sidecar_status up-pulse: `true` emits
+/// `restarted` (the renderer already saw a `crashed` for the prior generation),
+/// `false` emits `ready` (clean cold boot). The pulse fires once the child is
+/// confirmed alive and its stdin writer is wired + the backlog replayed — i.e.
+/// the earliest point the fresh runtime can re-announce its boards.
+async fn spawn_once(
+    entry: &Path,
+    handle: &SidecarHandle,
+    restart: bool,
+) -> Result<std::process::ExitStatus> {
     let mut cmd = Command::new("node");
     cmd.arg(entry);
     cmd.stdin(Stdio::piped());
@@ -343,6 +380,15 @@ async fn spawn_once(entry: &Path, handle: &SidecarHandle) -> Result<std::process
     // undrained when the previous child died) as one critical section, so a
     // concurrent write_line can't jump a fresh prompt ahead of the backlog.
     handle.publish_tx_and_replay(tx.clone());
+
+    // The child is alive and its stdin is wired: announce the new generation so
+    // the renderer can resync. `restarted` clears any agents left stuck mid-turn
+    // by the previous death; the runtime itself re-announces its boards via its
+    // own startup envelopes (board_spawned/board_ready) right after this.
+    handle.bus.publish(Envelope::sidecar_status(
+        if restart { "restarted" } else { "ready" },
+        Some(format!("agent-runtime up: node {}", entry.display())),
+    ));
 
     // Writer task: drain rx and write `line + "\n"`. On exit it returns any
     // lines it could not write (because the child's stdin broke mid-stream, or

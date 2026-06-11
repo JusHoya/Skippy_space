@@ -82,20 +82,73 @@ runStep('typecheck (pnpm -r typecheck)', PNPM, ['-r', 'typecheck']);
 runStep('agent-runtime build (tsup)', PNPM, ['--filter', '@skippy/agent-runtime', 'build']);
 
 // ── zod scoping (the load-bearing invariant) ───────────────────────────────
+// The invariant is NOT "zod is pinned to majors {3,4}" — that pin would fail the
+// day someone legitimately bumps a major. The invariant is: agent-runtime runs
+// its OWN zod major, distinct from the shared/memory major, and the resolved
+// tree never silently drifts to a major NONE of the packages declared. We
+// therefore derive the expected majors from the package.json ranges themselves
+// and assert the resolved tree is a SUBSET of those — robust to a future bump.
 console.log(`\n${DIM}zod scoping${RESET}`);
 {
-  const ar = readIf('apps/agent-runtime/package.json') ?? '';
-  const sh = readIf('packages/shared/package.json') ?? '';
-  const mem = readIf('packages/memory/package.json') ?? '';
-  record('agent-runtime declares zod@^4', /"zod":\s*"\^?4/.test(ar), null);
-  record('shared stays on zod@^3', /"zod":\s*"\^?3/.test(sh), null);
-  record('memory stays on zod@^3', /"zod":\s*"\^?3/.test(mem), null);
-  // Exactly the two expected majors present in the tree (a third would mean drift).
-  const ls = spawnSync(PNPM, ['ls', 'zod', '-r'], { cwd: root, stdio: 'pipe', shell: false });
-  const majors = new Set(
-    [...(ls.stdout?.toString() ?? '').matchAll(/zod\s+(\d+)\.\d+\.\d+/g)].map((m) => m[1]),
+  // Read the declared zod major from a package.json's dependency range (the
+  // first integer of the range, e.g. "^4.4.3" -> 4). Returns null if absent.
+  function declaredZodMajor(rel) {
+    const src = readIf(rel);
+    if (!src) return null;
+    try {
+      const json = JSON.parse(src);
+      const range =
+        json.dependencies?.zod ?? json.devDependencies?.zod ?? json.peerDependencies?.zod;
+      if (typeof range !== 'string') return null;
+      const m = /(\d+)/.exec(range);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+  const arMajor = declaredZodMajor('apps/agent-runtime/package.json');
+  const shMajor = declaredZodMajor('packages/shared/package.json');
+  const memMajor = declaredZodMajor('packages/memory/package.json');
+  record('agent-runtime declares a zod major', arMajor !== null, `zod@^${arMajor ?? '?'}`);
+  record('shared declares a zod major', shMajor !== null, `zod@^${shMajor ?? '?'}`);
+  record('memory declares a zod major', memMajor !== null, `zod@^${memMajor ?? '?'}`);
+  // The real coexistence split: shared + memory agree, and agent-runtime diverges.
+  record('shared + memory share one zod major', shMajor !== null && shMajor === memMajor, `shared=${shMajor} memory=${memMajor}`);
+  record(
+    'agent-runtime zod major diverges from shared/memory',
+    arMajor !== null && arMajor !== shMajor,
+    `agent-runtime=${arMajor} vs shared/memory=${shMajor}`,
   );
-  record('zod tree has exactly majors {3,4}', majors.size === 2 && majors.has('3') && majors.has('4'), `found {${[...majors].sort().join(',')}}`);
+
+  // Resolved-tree containment: parse `pnpm ls --json` (structured, not freeform
+  // text) and assert every resolved zod major is one a package actually declared
+  // — i.e. no surprise third major crept in transitively. Subset, not exact set.
+  const expected = new Set([arMajor, shMajor, memMajor].filter((x) => x !== null));
+  const ls = spawnSync(PNPM, ['ls', 'zod', '-r', '--json'], { cwd: root, stdio: 'pipe', shell: false });
+  const resolved = new Set();
+  try {
+    const tree = JSON.parse(ls.stdout?.toString() ?? '[]');
+    for (const pkg of Array.isArray(tree) ? tree : []) {
+      for (const group of ['dependencies', 'devDependencies']) {
+        const v = pkg?.[group]?.zod?.version;
+        if (typeof v === 'string') {
+          const m = /^(\d+)\./.exec(v);
+          if (m) resolved.add(m[1]);
+        }
+      }
+    }
+  } catch {
+    // leave `resolved` empty → the check below records the parse failure
+  }
+  const unexpected = [...resolved].filter((maj) => !expected.has(maj));
+  record(
+    'resolved zod majors are all declared (no surprise drift)',
+    resolved.size > 0 && unexpected.length === 0,
+    resolved.size === 0
+      ? 'could not read pnpm ls --json'
+      : `resolved {${[...resolved].sort().join(',')}} ⊆ declared {${[...expected].sort().join(',')}}`,
+  );
+
   // Coexistence guard: the registry must construct zod schemas from agent-runtime's
   // own zod, never import a schema object from @skippy/*.
   const reg = readIf('apps/agent-runtime/src/mcp-registry.ts') ?? '';

@@ -208,8 +208,45 @@ console.log(`\n${DIM}rust wiring${RESET}`);
 }
 
 // ── WS3 SDK adoption (gated) ───────────────────────────────────────────────
+// The gated SDK board is the intended production path AND the one place the
+// charter safety rails (`permission_mode` / `tools` / `disallowed_tools`) get
+// mapped onto the SDK's permission model. A source-string grep proves nothing
+// about that mapping, so the DECISIVE check here actually RUNS the committed
+// behavioral suites — sdk-board.test.ts (charter `ask` never silently becomes
+// `bypassPermissions`; bypass needs the explicit opt-in; MCP tools stay
+// auto-approved) + charter.test.ts (the runtime parser keeps nested charter
+// fields, and an unknown model never mis-binds). If either regresses, the gate
+// fails instead of staying green-but-blind.
 console.log(`\n${DIM}sdk adoption (gated)${RESET}`);
 {
+  // The behavioral suites must exist on disk before we can claim coverage.
+  const SDK_TESTS = [
+    'apps/agent-runtime/src/sdk-board.test.ts',
+    'apps/agent-runtime/src/charter.test.ts',
+  ];
+  let testsPresent = true;
+  for (const rel of SDK_TESTS) {
+    const present = existsSync(resolve(root, rel));
+    if (!present) testsPresent = false;
+    record(`${rel} present`, present, present ? null : 'missing — gated SDK board has no behavioral coverage');
+  }
+  if (testsPresent) {
+    // Run them through agent-runtime's own tsx (the sidecar's resolution chain).
+    runStep('sdk-board + charter permission tests (charter rails enforced)', PNPM, [
+      '--filter',
+      '@skippy/agent-runtime',
+      'exec',
+      'node',
+      '--import',
+      'tsx',
+      '--test',
+      'src/sdk-board.test.ts',
+      'src/charter.test.ts',
+    ]);
+  }
+
+  // Structural greps remain as cheap documentation of the gating wiring, but the
+  // run above — not these strings — is what proves the rails actually hold.
   const board = readIf('apps/agent-runtime/src/board.ts') ?? '';
   record('board.ts routes through the gated SDK path', /sdkBoardsEnabled\(\)/.test(board), null);
   const sdkBoard = readIf('apps/agent-runtime/src/sdk-board.ts') ?? '';
@@ -260,7 +297,21 @@ check('sonnet 1M in = $3', Math.abs(getCost('claude-sonnet-4-6', 1_000_000, 0) -
 check('unknown model not NaN', Number.isFinite(getCost('mystery', 1000, 1000)), null);
 // contextPct clamps 0..1.
 check('contextPct clamps to 1', contextPct('claude-haiku-4-5-20251001', 999_999_999) === 1, null);
-check('pricing table has 3 models', Object.keys(MODEL_PRICING).length === 3, null);
+// Pricing table: assert the PROPERTY we care about, not an exact row count (a
+// count pin would fail the day a legitimate 4th model is priced). Every entry
+// must be well-formed (finite, positive, output >= input), and the canonical
+// models the cost meter bills against must be present and priced.
+const entries = Object.entries(MODEL_PRICING);
+check('pricing table is non-empty', entries.length >= 1, \`got \${entries.length} entries\`);
+for (const [id, p] of entries) {
+  const wellFormed =
+    p && Number.isFinite(p.input) && Number.isFinite(p.output) &&
+    p.input > 0 && p.output > 0 && p.output >= p.input;
+  check(\`pricing[\${id}] well-formed\`, wellFormed, JSON.stringify(p));
+}
+for (const id of ['claude-sonnet-4-6', 'claude-haiku-4-5-20251001']) {
+  check(\`pricing has \${id}\`, Object.prototype.hasOwnProperty.call(MODEL_PRICING, id), null);
+}
 if (failures.length > 0) { console.error('FAIL\\n' + failures.map((f) => '  - ' + f).join('\\n')); process.exit(1); }
 console.log('OK');
 `;
