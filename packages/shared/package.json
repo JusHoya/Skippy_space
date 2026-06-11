@@ -13,13 +13,15 @@
     "./palette": "./src/palette.ts"
   },
   "scripts": {
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "zod": "^3.23",
     "ulid": "^2.3"
   },
   "devDependencies": {
+    "tsx": "^4",
     "typescript": "^5.7"
   }
 }

@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "react": "^19",
@@ -27,8 +28,10 @@
   "devDependencies": {
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/node": "^22",
     "@vitejs/plugin-react": "^4",
     "vite": "^6",
+    "tsx": "^4",
     "typescript": "^5.7"
   }
 }

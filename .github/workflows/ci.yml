@@ -1,6 +1,6 @@
 name: ci
 on:
-  push: { branches: [main] }
+  push:
   pull_request:
 jobs:
   ts:
@@ -13,11 +13,22 @@ jobs:
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r typecheck
-      - run: pnpm -r lint
+      - run: pnpm lint
+      - run: pnpm -r test
+      # The boot smoke spawns the BUILT sidecar and asserts all 8 boards come up.
+      # No ANTHROPIC_API_KEY needed (charter loading is offline). This is the gate
+      # that catches the dead-on-arrival regression class string-greps cannot see.
+      - run: pnpm build:runtime
+      - run: pnpm validate:boot
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Tauri 2 build deps for the linux runner (webkit2gtk etc.).
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf
+      - run: cargo test --manifest-path apps/shell/src-tauri/Cargo.toml
       - run: cargo check --manifest-path apps/shell/src-tauri/Cargo.toml
-        if: false   # disabled until Tauri 2 + native deps install in CI
