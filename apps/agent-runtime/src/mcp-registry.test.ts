@@ -63,7 +63,7 @@ test('obsidian tools degrade to isError when the vault is offline', async () => 
 
 test('obsidian_write_note writes via fs + enforces wikilinks', async () => {
   const vault = await tmpVault();
-  const good = await handleObsidianWriteNote(vault, {
+  const good = await handleObsidianWriteNote(vault, 'research', {
     path: '20_Topics/alpha.md',
     title: 'Alpha',
     body: 'A concept linking to [[beta]].',
@@ -76,14 +76,89 @@ test('obsidian_write_note writes via fs + enforces wikilinks', async () => {
       .then(() => true)
       .catch(() => false),
   );
+  // Provenance: the note must be stamped with the real board id, not 'board.sdk'.
+  const written = await fs.readFile(path.join(vault, '20_Topics/alpha.md'), 'utf8');
+  assert.match(written, /authored_by:\s*board\.research/);
   // Relative .md link is rejected by the wikilink guard -> isError, no throw.
-  const bad = await handleObsidianWriteNote(vault, {
+  const bad = await handleObsidianWriteNote(vault, 'research', {
     path: '20_Topics/bad.md',
     title: 'Bad',
     body: 'links to [other](./other.md)',
     source: 'ref://test',
   });
   assert.equal(bad.isError, true);
+});
+
+test('obsidian_write_note rejects path traversal + absolute paths + append-only targets', async () => {
+  const vault = await tmpVault();
+  // (1) Traversal escape — must be refused, nothing written outside the vault.
+  const traversal = await handleObsidianWriteNote(vault, 'research', {
+    path: '../escape.md',
+    title: 'Escape',
+    body: 'pwned',
+    source: 'ref://test',
+  });
+  assert.equal(traversal.isError, true);
+  assert.match(textOf(traversal), /escapes the vault/);
+  assert.equal(
+    await fs
+      .access(path.join(vault, '..', 'escape.md'))
+      .then(() => true)
+      .catch(() => false),
+    false,
+    'no file should have escaped the vault',
+  );
+
+  // (2) Absolute path — also refused (path.resolve would otherwise discard root).
+  const abs = await handleObsidianWriteNote(vault, 'research', {
+    path: path.join(os.tmpdir(), 'skippy-abs-escape.md'),
+    title: 'Abs',
+    body: 'pwned',
+    source: 'ref://test',
+  });
+  assert.equal(abs.isError, true);
+  assert.match(textOf(abs), /escapes the vault/);
+
+  // (3) Append-only agent_log.md — refused, directed to the append tools.
+  const log = await handleObsidianWriteNote(vault, 'research', {
+    path: '50_Agents/research/agent_log.md',
+    title: 'Clobber',
+    body: 'overwrite the audit log',
+    source: 'ref://test',
+  });
+  assert.equal(log.isError, true);
+  assert.match(textOf(log), /append-only/);
+
+  // (4) Append-only 40_Daily/ tree — refused.
+  const daily = await handleObsidianWriteNote(vault, 'research', {
+    path: '40_Daily/2026-06-10.md',
+    title: 'Daily',
+    body: 'clobber the daily note',
+    source: 'ref://test',
+  });
+  assert.equal(daily.isError, true);
+  assert.match(textOf(daily), /append-only/);
+
+  // (5) Append-only guard must check the RESOLVED path, not the raw arg — a
+  // traversal-laced target like `x/../40_Daily/note.md` passes containment
+  // (resolves inside the vault) and must STILL be refused as append-only.
+  const sneaky = await handleObsidianWriteNote(vault, 'research', {
+    path: 'x/../40_Daily/2026-06-10.md',
+    title: 'Sneaky daily clobber',
+    body: 'evade the append-only guard via traversal',
+    source: 'ref://test',
+  });
+  assert.equal(sneaky.isError, true);
+  assert.match(textOf(sneaky), /append-only/);
+
+  // (6) A normal relative path under the vault is still accepted.
+  const okWrite = await handleObsidianWriteNote(vault, 'research', {
+    path: '10_Atomic/fact.md',
+    title: 'Fact',
+    body: 'A contained note with a [[link]].',
+    source: 'ref://test',
+  });
+  assert.notEqual(okWrite.isError, true, textOf(okWrite));
 });
 
 test('letta tools degrade when Letta is disabled; append still mirrors to vault', async () => {

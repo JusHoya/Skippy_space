@@ -44,6 +44,16 @@ function client(): Anthropic {
   return _client;
 }
 
+/**
+ * Test-only seam. Inject a fake Anthropic-shaped client (just `messages.stream`)
+ * so the conversation-memory + tool-loop behavior can be exercised without a
+ * network call or API key. Pass `null` to reset to the real lazily-built client.
+ * Not used in production code.
+ */
+export function __setClientForTest(fake: Anthropic | null): void {
+  _client = fake;
+}
+
 // Phase 3-prep: model selection is dynamic. The boot-time `SKIPPY_MODEL` env
 // var still wins as the registry's initial value (modelRegistry.ts) but every
 // call below resolves through `getModelFor('skippy')` so a renderer-side
@@ -116,15 +126,24 @@ export type SkippyChunk =
  *
  * Caller is responsible for the `agent_state` lifecycle around this generator
  * (thinking → speaking → working → speaking → idle).
+ *
+ * Conversation memory (PRD §5.2): Skippy is one long-running session, so the
+ * caller owns a persistent `messages` tail and hands it in here. We require it
+ * to already end with the new `user` turn (skippy.ts appends + trims it before
+ * calling). We MUTATE it in place — appending the assistant turn and the
+ * tool_result `user` turn for every tool-loop iteration — so that when this
+ * generator returns, the tail the caller holds includes Skippy's full reply
+ * (text + any tool-use/tool-result rounds). The next prompt then continues the
+ * same thread instead of hitting a fresh, amnesiac model. The Anthropic
+ * Messages API is stateless: we send the whole tail every turn (history + the
+ * single tools array + system), exactly as the manual tool-loop pattern
+ * prescribes.
  */
 export async function* streamSkippyWithTools(
   system: string,
-  userText: string,
+  messages: Anthropic.Messages.MessageParam[],
 ): AsyncGenerator<SkippyChunk> {
   const c = client();
-  const messages: Anthropic.Messages.MessageParam[] = [
-    { role: 'user', content: userText },
-  ];
 
   // WS6 telemetry accumulators: sum tokens across the tool loop for cost;
   // track the last turn's input count for context-window pressure.
@@ -169,6 +188,12 @@ export async function* streamSkippyWithTools(
     usedModel = resp.model ?? usedModel;
 
     if (resp.stop_reason !== 'tool_use') {
+      // Final turn — no more tools. Persist the assistant reply into the
+      // caller's tail so the next prompt continues the thread with Skippy's
+      // last answer in view (PRD §5.2). This is the same in-place append the
+      // tool-use branch below does; doing it here too means every terminal path
+      // leaves `messages` ending on a coherent assistant turn.
+      messages.push({ role: 'assistant', content: resp.content });
       yield {
         kind: 'usage',
         inputTokens: totalInput,
@@ -211,11 +236,13 @@ export async function* streamSkippyWithTools(
   }
 
   // If we hit the iteration cap, the model is in a loop. Yield a narrated
-  // bail-out so the user sees it and the loop terminates cleanly.
-  yield {
-    kind: 'text',
-    text: `\n\n[SKIPPY] My tool-use loop reached the iteration cap (${MAX_TOOL_ITERATIONS}). Stepping back to replan. The monkeys should ask again with a tighter scope.`,
-  };
+  // bail-out so the user sees it and the loop terminates cleanly. Record it as
+  // the assistant turn too, so the caller's persisted conversation tail closes
+  // the final tool round with a coherent reply instead of dangling on a
+  // tool_result the model never answered.
+  const bailText = `\n\n[SKIPPY] My tool-use loop reached the iteration cap (${MAX_TOOL_ITERATIONS}). Stepping back to replan. The monkeys should ask again with a tighter scope.`;
+  messages.push({ role: 'assistant', content: bailText });
+  yield { kind: 'text', text: bailText };
   yield {
     kind: 'usage',
     inputTokens: totalInput,

@@ -13,7 +13,9 @@ import {
   writeNoteIfAbsent,
   appendSection,
   assertNoRelativeMdLinks,
+  resolveInVault,
   WikilinkViolationError,
+  PathEscapesVaultError,
 } from './atomic.js';
 import { makeFrontmatter, parseNote, validateFrontmatter } from './frontmatter.js';
 
@@ -98,6 +100,44 @@ test('writeNoteIfAbsent is idempotent (no clobber)', async () => {
   if (!second.written) assert.equal(second.reason, 'exists');
   // original content preserved
   assert.match(await fs.readFile(target, 'utf8'), /first body/);
+});
+
+test('resolveInVault rejects traversal + absolute paths, accepts relative', async () => {
+  const vault = await tmpDir();
+  // Traversal escape.
+  assert.throws(() => resolveInVault(vault, '../x.md'), PathEscapesVaultError);
+  assert.throws(() => resolveInVault(vault, '..\\..\\x.md'), PathEscapesVaultError);
+  // Absolute path (would make path.resolve discard the vault root).
+  assert.throws(
+    () => resolveInVault(vault, path.join(os.tmpdir(), 'abs.md')),
+    PathEscapesVaultError,
+  );
+  // A normal relative path is accepted and resolves inside the vault.
+  const target = resolveInVault(vault, '10_Atomic/fact.md');
+  assert.ok(target.startsWith(path.resolve(vault) + path.sep));
+});
+
+test('writeNote with a vaultRoot option contains the target (defense-in-depth)', async () => {
+  const vault = await tmpDir();
+  const { fm, body } = note('Escape', 'pwned');
+  // A target that resolves OUTSIDE the vault is rejected before any disk I/O.
+  const escape = path.join(vault, '..', 'escape.md');
+  await assert.rejects(
+    () => writeNote(escape, fm, body, { vaultRoot: vault }),
+    PathEscapesVaultError,
+  );
+  assert.equal(
+    await fs
+      .access(escape)
+      .then(() => true)
+      .catch(() => false),
+    false,
+    'no file should have escaped the vault',
+  );
+  // A contained target still writes normally with the guard on.
+  const inside = path.join(vault, '10_Atomic', 'fact.md');
+  const r = await writeNote(inside, fm, 'A contained [[note]].', { vaultRoot: vault });
+  assert.equal(r.written, true);
 });
 
 test('appendSection is append-only (preserves prior content)', async () => {

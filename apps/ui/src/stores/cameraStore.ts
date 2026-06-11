@@ -36,9 +36,14 @@ export interface CameraStore {
   resetView: () => void;
   /**
    * Zoom around a focus point (world-space). When `focusX/focusY` are given,
-   * we adjust pan so the focus point remains under the cursor after the zoom
-   * (per the spec):
-   *   newPan = focus - (focus - oldPan) * (newScale / oldScale)
+   * we adjust pan so the world point under the cursor stays under the cursor
+   * after the zoom.
+   *
+   * The camera transform is `host = hostW/2 + (world + pan) * scale` (see
+   * `applyCameraToWorld` in `scene/Camera.ts`), so pan lives in WORLD space —
+   * NOT screen space. Inverting that transform to hold the focus host pixel
+   * fixed across a scale change gives:
+   *   panNew = panOld + (focus + panOld) * (oldScale / newScale - 1)
    */
   zoomBy: (factor: number, focusX?: number, focusY?: number) => void;
 }
@@ -86,13 +91,15 @@ export const useCameraStore = create<CameraStore>((set) => ({
       // No-op when the clamp pinned us to the current value — avoids a churn
       // update that would still trigger subscribers.
       if (newScale === oldScale) return s;
-      const ratio = newScale / oldScale;
       let panX = s.view.panX;
       let panY = s.view.panY;
       if (typeof focusX === 'number' && typeof focusY === 'number') {
-        // Keep the focus point pinned: newPan = focus - (focus - oldPan)*ratio
-        panX = focusX - (focusX - panX) * ratio;
-        panY = focusY - (focusY - panY) * ratio;
+        // Invert the world-space camera transform so the world point under the
+        // cursor stays under the cursor (pan is world-space, not screen-space):
+        //   panNew = panOld + (focus + panOld) * (oldScale/newScale - 1)
+        const scaleRatio = oldScale / newScale;
+        panX = panX + (focusX + panX) * (scaleRatio - 1);
+        panY = panY + (focusY + panY) * (scaleRatio - 1);
       }
       return {
         view: { ...s.view, scale: newScale, panX, panY },

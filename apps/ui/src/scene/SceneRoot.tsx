@@ -317,9 +317,12 @@ export default function SceneRoot() {
         const box = useSelectionStore.getState().endDragBox();
         if (!box) return;
         // Project every captain to host-pixel coords, hit-test against the box.
+        // Pixi v8 `renderer.width/height` are already logical (CSS) px — the
+        // resolution/autoDensity handling lives below the renderer — so we use
+        // them raw here, matching the `applyCamera` call's dims.
         const view = useCameraStore.getState().view;
-        const w = app.renderer.width / (window.devicePixelRatio || 1);
-        const h = app.renderer.height / (window.devicePixelRatio || 1);
+        const w = app.renderer.width;
+        const h = app.renderer.height;
         const hits: AgentId[] = [];
         for (const boardId of BOARD_IDS) {
           const cap = captains[boardId];
@@ -362,8 +365,11 @@ export default function SceneRoot() {
       detachWheel = attachWheelZoom(host, {
         onZoom: (factor, hostX, hostY) => {
           const view = useCameraStore.getState().view;
-          const w = app.renderer.width / (window.devicePixelRatio || 1);
-          const h = app.renderer.height / (window.devicePixelRatio || 1);
+          // Pixi v8 `renderer.width/height` are already logical (CSS) px, so
+          // they pair directly with the host-relative cursor coords — match the
+          // dims `applyCamera` feeds `applyCameraToWorld`.
+          const w = app.renderer.width;
+          const h = app.renderer.height;
           const world = worldSpaceFromHostPoint(hostX, hostY, view, w, h);
           useCameraStore.getState().zoomBy(factor, world.x, world.y);
         },

@@ -43,6 +43,50 @@ export function assertNoRelativeMdLinks(body: string, target = '<note>'): void {
   if (RELATIVE_MD_LINK_RE.test(body)) throw new WikilinkViolationError(target);
 }
 
+/**
+ * Non-throwing form of the guard — the single source of truth other modules use
+ * to verify their own neutralization actually satisfies the writer (e.g. the
+ * ingest/archival neutralizer re-asserts against this so external drops can never
+ * hard-fail). `RELATIVE_MD_LINK_RE` is stateless (no /g flag), so `.test` is safe.
+ */
+export function hasRelativeMdLink(body: string): boolean {
+  return RELATIVE_MD_LINK_RE.test(body);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Vault containment guard (PRD §8.6 — model-controlled paths must stay in-vault)
+// ──────────────────────────────────────────────────────────────────────────────
+
+export class PathEscapesVaultError extends Error {
+  constructor(target: string, vaultRoot: string) {
+    super(
+      `Vault write to "${target}" escapes the vault root "${vaultRoot}"; ` +
+        `paths must resolve inside the vault (PRD §8.6).`,
+    );
+    this.name = 'PathEscapesVaultError';
+  }
+}
+
+/**
+ * Defense-in-depth containment: resolve `relPath` against `vaultRoot` and assert
+ * the result stays inside the vault. Rejects `..` traversal AND absolute paths
+ * (an absolute `relPath` would make `path.resolve` discard `vaultRoot` entirely).
+ * Returns the resolved, contained absolute target. Every model-driven writer
+ * runs this so a traversal string can never become a write-anywhere primitive.
+ */
+export function resolveInVault(vaultRoot: string, relPath: string): string {
+  if (path.isAbsolute(relPath)) throw new PathEscapesVaultError(relPath, vaultRoot);
+  const resolvedRoot = path.resolve(vaultRoot);
+  const target = path.resolve(resolvedRoot, relPath);
+  // Reject both an escape (outside the root) AND a target that IS the root itself
+  // (an empty / `.` relPath names the vault dir, not a note — a confusing write
+  // failure rather than a clean rejection otherwise).
+  if (target === resolvedRoot || !target.startsWith(resolvedRoot + path.sep)) {
+    throw new PathEscapesVaultError(relPath, vaultRoot);
+  }
+  return target;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Low-level primitives
 // ──────────────────────────────────────────────────────────────────────────────
@@ -109,6 +153,31 @@ export type WriteResult =
   | { written: false; path: string; reason: 'locked' | 'exists' };
 
 /**
+ * Optional write options shared by the note writers. `vaultRoot`, when supplied,
+ * turns on the §8.6 containment guard: `target` must resolve inside `vaultRoot`
+ * or the write throws `PathEscapesVaultError` before any disk I/O. Internal
+ * callers that build `target` from trusted joins can omit it; model-driven
+ * callers (the MCP handlers) MUST pass it so a traversal string is rejected even
+ * if the handler's own guard is ever bypassed (defense-in-depth).
+ */
+export interface WriteOptions {
+  vaultRoot?: string;
+}
+
+/** Throw `PathEscapesVaultError` if `target` falls outside `opts.vaultRoot`. */
+function assertContained(target: string, opts?: WriteOptions): void {
+  if (opts?.vaultRoot === undefined) return;
+  const resolvedRoot = path.resolve(opts.vaultRoot);
+  const resolvedTarget = path.resolve(target);
+  if (
+    resolvedTarget !== resolvedRoot &&
+    !resolvedTarget.startsWith(resolvedRoot + path.sep)
+  ) {
+    throw new PathEscapesVaultError(target, opts.vaultRoot);
+  }
+}
+
+/**
  * Write a note (frontmatter + body) atomically under a per-file lock. Validates
  * §8.3 frontmatter and enforces the wikilink-only rule before any disk I/O.
  * Returns `{ written: false, reason: 'locked' }` on contention rather than
@@ -118,7 +187,9 @@ export async function writeNote(
   target: string,
   frontmatter: NoteFrontmatterInput,
   body: string,
+  opts?: WriteOptions,
 ): Promise<WriteResult> {
+  assertContained(target, opts);
   assertNoRelativeMdLinks(body, target);
   const contents = serializeNote(frontmatter, body); // throws on invalid fm
   try {
@@ -139,7 +210,9 @@ export async function writeNoteIfAbsent(
   target: string,
   frontmatter: NoteFrontmatterInput,
   body: string,
+  opts?: WriteOptions,
 ): Promise<WriteResult> {
+  assertContained(target, opts);
   if (await exists(target)) return { written: false, path: target, reason: 'exists' };
   assertNoRelativeMdLinks(body, target);
   const contents = serializeNote(frontmatter, body);
@@ -162,7 +235,12 @@ export async function writeNoteIfAbsent(
  * existing content (PRD §8.5). Creates the file if absent. The appended text is
  * wikilink-guarded and a single trailing newline is normalized.
  */
-export async function appendSection(target: string, text: string): Promise<WriteResult> {
+export async function appendSection(
+  target: string,
+  text: string,
+  opts?: WriteOptions,
+): Promise<WriteResult> {
+  assertContained(target, opts);
   assertNoRelativeMdLinks(text, target);
   const chunk = `\n${text.replace(/\s+$/, '')}\n`;
   try {

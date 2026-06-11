@@ -21,6 +21,7 @@ import { ulid } from 'ulid';
 
 import { writeNote } from '../atomic.js';
 import { makeFrontmatter } from '../frontmatter.js';
+import { neutralizeRelativeMdLinks } from './archival-mirror.js';
 import type { JobEvent } from './types.js';
 
 export interface RunIngestOptions {
@@ -81,8 +82,14 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
       source: `file://${path.basename(sourcePath)}`,
     });
 
-    // The body is copied verbatim — ingest normalizes form, never substance.
-    const body = raw;
+    // The body is copied verbatim — ingest normalizes form, never substance — EXCEPT
+    // that external drops (scraped/exported content) routinely carry relative `.md`
+    // links like `[x](./README.md)`, which atomic.ts's wikilink guard hard-rejects
+    // (PRD §8.2). Throwing here would abort the whole pipeline at job 1 and strand the
+    // drop in `00_Inbox/` forever. External content isn't agent-authored, so we
+    // neutralize those links (keep the label, drop the relative target) so the source
+    // archives losslessly. The hard-throwing guard is reserved for agent-authored notes.
+    const body = neutralizeRelativeMdLinks(raw);
     const res = await writeNote(sourceNotePath, fm, body);
     if (!res.written) {
       throw new Error(

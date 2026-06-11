@@ -22,6 +22,7 @@ import * as path from 'node:path';
 import {
   appendSection,
   writeNoteIfAbsent,
+  hasRelativeMdLink,
   WikilinkViolationError,
   type WriteResult,
 } from '../atomic.js';
@@ -147,23 +148,50 @@ async function tryAppend(target: string, text: string): Promise<AppendOutcome> {
   }
 }
 
-// Matches a markdown link whose target is a relative `.md` path — the same family
-// atomic.ts's guard rejects: `](./foo.md)`, `](../bar.md#h)`, `](notes/baz.md)`.
-// Permits absolute http(s) links. We capture the visible label so we can keep it.
+// Matches a markdown link whose target is a relative `.md` path — a STRICT mirror
+// of atomic.ts's guard (`[^)]*\.md(?:[)#?]|\s)`), so anything the writer would
+// reject, this strips. Key points:
+//   - the URL class is `[^)]*` (spaces ALLOWED): Obsidian/Windows filenames have
+//     spaces (`[x](./My Project.md)`), and the guard accepts them, so we must too;
+//   - a lookahead pins `.md` to the guard's exact terminators (`)`, `#`, `?`, or
+//     whitespace), so we don't over-strip non-links like `[d](./a.md.html)`;
+//   - the trailing `[^)]*\)` can't cross a `)`, so adjacent links don't merge
+//     (`[a](./a.md) and [b](./b.md)` -> `a and b`, not `a`).
 const RELATIVE_MD_LINK_G =
-  /\[([^\]]*)\]\(\s*(?!https?:\/\/)[^)]*\.md(?:[)#?][^)]*)?\)/gi;
+  /\[([^\]]*)\]\(\s*(?!https?:\/\/)[^)]*?\.md(?=[)#?\s])[^)]*\)/gi;
+
+// Fallback for MALFORMED links the guard still flags but that lack a clean close
+// paren (e.g. `[x](./foo.md and text` with no `)`): strip from the label through
+// the `.md`-plus-trailing-token. Only used by the defensive loop below.
+const RELATIVE_MD_LINK_LOOSE_G =
+  /\[([^\]]*)\]\(\s*(?!https?:\/\/)[^)\n]*?\.md(?=[)#?\s]|$)[^)\n]*\)?/gi;
 
 /**
- * Neutralize relative `.md` markdown links so appendSection's guard passes. We keep
- * the human-readable label and drop the link target, turning `[see](./foo.md)` into
- * `see` (a bare wikilink would mis-target, so we don't fabricate one). Absolute
+ * Neutralize relative `.md` markdown links so the wikilink guard (atomic.ts) passes.
+ * We keep the human-readable label and drop the link target, turning `[see](./foo.md)`
+ * into `see` (a bare wikilink would mis-target, so we don't fabricate one). Absolute
  * http(s) links are untouched.
+ *
+ * Exported because Job 1 (ingest) reuses it: external/scraped drops routinely carry
+ * relative `.md` links that would otherwise hard-fail the verbatim source-note write
+ * (PRD §8.2). Agent-authored notes keep the hard-throwing guard; lossy external
+ * content is neutralized so it archives instead of stranding in `00_Inbox/`.
  */
-function neutralizeRelativeMdLinks(text: string): string {
-  return text.replace(RELATIVE_MD_LINK_G, (_match, label: string) => {
+export function neutralizeRelativeMdLinks(text: string): string {
+  const keep = (label: string): string => {
     const visible = label.trim();
     return visible.length > 0 ? visible : '(link removed)';
-  });
+  };
+  let out = text.replace(RELATIVE_MD_LINK_G, (_m, label: string) => keep(label));
+  // Defense-in-depth: GUARANTEE the result satisfies atomic.ts's guard so an
+  // external drop can never hard-fail ingest. The primary pass mirrors the guard
+  // for well-formed links; any residual (malformed/abruptly-closed link, exotic
+  // spacing) is stripped by the broader fallback, bounded to avoid pathological
+  // loops. `hasRelativeMdLink` is the writer's own predicate, so this can't drift.
+  for (let i = 0; i < 5 && hasRelativeMdLink(out); i++) {
+    out = out.replace(RELATIVE_MD_LINK_LOOSE_G, (_m, label: string) => keep(label));
+  }
+  return out;
 }
 
 /** Extract a human-readable message from an unknown thrown value. */

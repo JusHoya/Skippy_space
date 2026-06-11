@@ -10,12 +10,21 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::channel::EventBus;
 use crate::envelope::Envelope;
 
 const INTERVAL_SECS: u64 = 300; // 5 minutes per PRD §8.2
+
+/// Serializes every commit attempt across the whole process. The 5-minute
+/// interval loop and the on-demand `vault_autocommit_now` command both reach
+/// `try_commit`; without this gate they can fire `git add`/`git commit`
+/// concurrently and collide on `.git/index.lock` (git aborts with
+/// "Another git process seems to be running"). Holding it for the duration of
+/// one commit attempt makes the two paths mutually exclusive.
+static COMMIT_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Find the workspace root by walking up from cwd looking for `.git/`. Returns
 /// `None` if not in a git repo.
@@ -85,7 +94,16 @@ pub fn spawn_autocommit(bus: Arc<EventBus>) {
 }
 
 /// One commit attempt. Returns Ok(true) if a commit was created.
+///
+/// Serialized process-wide via [`COMMIT_LOCK`] so the interval loop and the
+/// on-demand `vault_autocommit_now` command can never race on `.git/index.lock`.
 pub async fn try_commit(root: &Path, bus: &Arc<EventBus>) -> Result<bool> {
+    let _guard = COMMIT_LOCK.lock().await;
+    commit_locked(root, bus).await
+}
+
+/// The actual commit attempt. Callers must already hold [`COMMIT_LOCK`].
+async fn commit_locked(root: &Path, bus: &Arc<EventBus>) -> Result<bool> {
     let porcelain = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -129,12 +147,19 @@ pub async fn try_commit(root: &Path, bus: &Arc<EventBus>) -> Result<bool> {
     let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let message = format!("chore(vault): auto-commit {stamp}");
 
+    // Scope the commit to `vault/` with an explicit pathspec. A bare
+    // `git commit -m <msg>` would sweep ANY entry the user already staged
+    // outside vault/ into our auto-commit — violating this module's
+    // "never commits anything outside vault/" contract and PRD §8.2. The
+    // `-- vault/` pathspec commits only matching entries and ignores the rest.
     let commit = Command::new("git")
         .arg("-C")
         .arg(root)
         .arg("commit")
         .arg("-m")
         .arg(&message)
+        .arg("--")
+        .arg("vault/")
         .output()
         .await?;
     if !commit.status.success() {

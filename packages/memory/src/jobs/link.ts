@@ -69,6 +69,23 @@ function keywordSet(...parts: string[]): Set<string> {
   return out;
 }
 
+/**
+ * Select the per-run atomic working set, newest-first, capped at the node budget.
+ *
+ * Note ids are ULIDs, which sort lexicographically by creation time, so the raw
+ * `readdir` order is OLDEST-first. Slicing that order would permanently freeze the
+ * link job on the first 50 notes ever distilled and make every newer fact invisible
+ * to linking forever (the §8.10 "≤ N notes" bound is a per-run *work cap*, not a
+ * data exclusion). We therefore sort DESCENDING by id (newest ULID first) and take
+ * the budget off the top, so freshly-distilled facts are always in-scope and the
+ * cap only ever sheds the *oldest* (already long-since linked) tail.
+ */
+function selectRecent(notes: LoadedNote[], budget: number): LoadedNote[] {
+  return [...notes]
+    .sort((a, b) => (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
+    .slice(0, budget);
+}
+
 /** Load + validate every `.md` note under a vault subdir. Skips invalid notes. */
 async function loadDir(dir: string): Promise<LoadedNote[]> {
   let entries: string[];
@@ -134,8 +151,10 @@ export async function runLink(opts: RunLinkOptions): Promise<LinkResult> {
   onJob?.({ job: 'link', phase: 'start' });
 
   try {
-    const atomic = (await loadDir(path.join(vaultRoot, '10_Atomic'))).slice(
-      0,
+    // Newest-first working set (NEVER the oldest 50): the budget caps work per run,
+    // it must not exclude freshly-distilled facts. See selectRecent for the why.
+    const atomic = selectRecent(
+      await loadDir(path.join(vaultRoot, '10_Atomic')),
       NODE_BUDGET,
     );
     const topics = await loadDir(path.join(vaultRoot, '20_Topics'));

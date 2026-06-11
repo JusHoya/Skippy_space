@@ -26,6 +26,7 @@
 //   6. agent_complete
 //   7. agent_state: idle (or 'error' if the call failed)
 
+import type Anthropic from '@anthropic-ai/sdk';
 import { SpanStatusCode, trace } from '@opentelemetry/api';
 
 import type { UserPromptEnvelope } from '@skippy/shared';
@@ -38,6 +39,91 @@ import { writeEnvelope } from './protocol.js';
 
 const SKIPPY_ID = 'skippy';
 const tracer = trace.getTracer('skippy-orchestrator');
+
+// ── Conversation memory (PRD §5.2) ──────────────────────────────────────────
+// Skippy is a single long-running session for the life of the sidecar, so his
+// conversation tail lives here at module scope. Each `handleUserPrompt` appends
+// the new user turn, then `streamSkippyWithTools` mutates this same array in
+// place — adding the assistant turn and any tool_use/tool_result rounds — so a
+// follow-up ("yes, do that", "what did Engineering report?") reaches the model
+// with the full prior thread instead of a fresh, amnesiac array.
+//
+// Rehydration from the SQLite conversation-tail checkpoint after a sidecar
+// crash (PRD §5.3) is out of scope here; this tail is in-memory only and starts
+// empty on each boot.
+const conversationTail: Anthropic.Messages.MessageParam[] = [];
+
+// Trim budget. The tail is sent in full every turn (the Messages API is
+// stateless), so it must not grow without bound. We cap by message count and by
+// total character size, and tighten the message cap when the model last
+// reported the prompt eating a large fraction of its context window. Trimming
+// always drops whole leading rounds so the tail never starts with an
+// `assistant` turn and never splits a tool_use from its tool_result — either of
+// which the API rejects with a 400.
+const MAX_TAIL_MESSAGES = 40; // ~20 user/assistant exchanges before tool rounds.
+const MAX_TAIL_CHARS = 200_000; // Coarse stand-in for a token budget (~4 chars/token).
+// Once the model reports the prompt consuming this fraction of its window, halve
+// the message cap so the tail sheds history before it pins the context bar.
+const CONTEXT_PRESSURE_FRACTION = 0.6;
+
+// Last turn's reported input-token count and the model that served it, used to
+// gauge context-window pressure for the next trim (WS6 telemetry, reused here).
+let lastContextTokens = 0;
+let lastContextModel = '';
+
+/**
+ * The first turn in `messages` must be a `user` turn — the API 400s on a leading
+ * `assistant` turn — and a `user` turn carrying tool_result blocks is only valid
+ * immediately after the `assistant` turn that issued the matching tool_use. So
+ * we only ever consider a `user` turn a safe new front when it is a plain text
+ * turn, not a tool_result carrier.
+ */
+function isPlainUserTurn(m: Anthropic.Messages.MessageParam): boolean {
+  if (m.role !== 'user') return false;
+  if (typeof m.content === 'string') return true;
+  // Block content: a tool_result block means this turn belongs to a prior
+  // tool round and can't lead the conversation on its own.
+  return !m.content.some((b) => b.type === 'tool_result');
+}
+
+/** Total character size of a tail, summed over text + serialized block content. */
+function tailChars(messages: Anthropic.Messages.MessageParam[]): number {
+  let chars = 0;
+  for (const m of messages) {
+    chars +=
+      typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length;
+  }
+  return chars;
+}
+
+/**
+ * Trim `conversationTail` from the front, in place, to stay within budget.
+ * Drops whole leading rounds (advancing only to the next plain `user` turn) so
+ * the result is always a valid conversation start and never orphans a
+ * tool_result. Called before each send.
+ */
+function trimTail(): void {
+  // Under context-window pressure, shed history more aggressively.
+  const pressured =
+    lastContextModel !== '' &&
+    lastContextTokens / contextLimitFor(lastContextModel) >= CONTEXT_PRESSURE_FRACTION;
+  const maxMessages = pressured ? Math.floor(MAX_TAIL_MESSAGES / 2) : MAX_TAIL_MESSAGES;
+
+  const overBudget = (): boolean =>
+    conversationTail.length > maxMessages || tailChars(conversationTail) > MAX_TAIL_CHARS;
+
+  while (overBudget() && conversationTail.length > 1) {
+    // Drop the current front, then keep dropping until the new front is a plain
+    // user turn (a safe conversation start). Never drop the final message — the
+    // just-appended prompt we're about to answer.
+    conversationTail.shift();
+    let front = conversationTail[0];
+    while (conversationTail.length > 1 && front !== undefined && !isPlainUserTurn(front)) {
+      conversationTail.shift();
+      front = conversationTail[0];
+    }
+  }
+}
 
 /**
  * Phase 0 fallback system prompt. Used when the charter file is missing AND
@@ -79,12 +165,31 @@ async function getSystemPrompt(): Promise<string> {
 
 const DELEGATE_OFF = process.env.SKIPPY_DELEGATE_OFF === '1';
 
+// index.ts dispatches user_prompt envelopes fire-and-forget, so two prompts can
+// be in flight at once. Both mutate the shared `conversationTail`; interleaving
+// their appends would corrupt the thread (e.g. an assistant turn landing before
+// its own user turn). We serialize handling through a single promise chain so
+// each prompt sees a consistent tail. Cheap and sufficient at one-orchestrator
+// scale; it does NOT cancel an in-flight prompt, only queues the next one.
+let _promptQueue: Promise<void> = Promise.resolve();
+
 /**
  * Handle a single `user_prompt` envelope: emit lifecycle states, stream tokens,
  * and surface telemetry. Errors are caught, turned into an `agent_state: error`
  * envelope, then rethrown so the caller's logger sees them.
+ *
+ * Serialized against other in-flight prompts so the shared conversation tail
+ * (PRD §5.2) is never mutated by two handlers at once.
  */
-export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
+export function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
+  const run = _promptQueue.then(() => handleUserPromptInner(env));
+  // Keep the queue chained even if this prompt rejects, but don't let one
+  // failed prompt reject the chain for the next one.
+  _promptQueue = run.catch(() => undefined);
+  return run;
+}
+
+function handleUserPromptInner(env: UserPromptEnvelope): Promise<void> {
   return tracer.startActiveSpan(
     'skippy.handle_user_prompt',
     {
@@ -102,6 +207,10 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
       let usage:
         | { inputTokens: number; outputTokens: number; contextTokens: number; model: string }
         | null = null;
+      // Length of `conversationTail` before this turn's user prompt was appended
+      // (post-trim). -1 means we never touched the tail (DELEGATE_OFF path), so
+      // the catch handler leaves it alone. See the delegate path below.
+      let tailLenBefore = -1;
       try {
         writeEnvelope({
           type: 'agent_state',
@@ -148,9 +257,23 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
           // Phase 1+ path. Yields a discriminated union so we can flip the
           // agent_state envelope between speaking and working as the
           // tool-use loop progresses.
+          //
+          // Conversation memory (PRD §5.2): append this prompt to the persistent
+          // tail, trim to budget, then hand the whole tail to the model.
+          // `streamSkippyWithTools` mutates `conversationTail` in place with
+          // Skippy's assistant turn (+ any tool rounds), so the next prompt
+          // continues the same thread. We snapshot the length first so a failed
+          // turn can roll the half-written exchange back out (see catch below).
+          tailLenBefore = conversationTail.length;
+          conversationTail.push({ role: 'user', content: env.text });
+          trimTail();
+          // trimTail may have dropped messages from the front; re-derive the
+          // pre-turn length so rollback truncates to the right point.
+          tailLenBefore = conversationTail.length - 1;
+
           const stream: AsyncGenerator<SkippyChunk> = streamSkippyWithTools(
             system,
-            env.text,
+            conversationTail,
           );
           for await (const chunk of stream) {
             switch (chunk.kind) {
@@ -225,6 +348,13 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
           span.setAttribute('gen_ai.usage.output_tokens', usage.outputTokens);
           span.setAttribute('gen_ai.response.model', usage.model);
           span.setAttribute('skippy.cost_usd', costUsd);
+
+          // Feed the context-window pressure into the next trim: contextTokens is
+          // the last turn's input size (history + tools + system), so if it's a
+          // large fraction of the window, trimTail() will shed more history
+          // before the following prompt.
+          lastContextTokens = usage.contextTokens;
+          lastContextModel = usage.model;
         }
 
         writeEnvelope({
@@ -248,6 +378,14 @@ export async function handleUserPrompt(env: UserPromptEnvelope): Promise<void> {
         span.recordException(err as Error);
         span.setStatus({ code: SpanStatusCode.ERROR });
         const e = err as Error;
+        // Roll the failed turn back out of the conversation tail. The model may
+        // have failed mid-tool-loop, leaving a dangling user turn or an
+        // assistant turn with an unanswered tool_use — replaying that on the
+        // next prompt would 400. Truncating to the pre-turn length restores a
+        // clean, valid thread. (-1 = we never touched the tail this turn.)
+        if (tailLenBefore >= 0) {
+          conversationTail.length = tailLenBefore;
+        }
         // WS6/D5 — surface the failure to the telemetry error feed (§9.4).
         writeEnvelope({
           type: 'error_span',

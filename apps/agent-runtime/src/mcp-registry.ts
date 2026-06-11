@@ -36,12 +36,23 @@ export function requestedMcpServers(charter: Charter): string[] {
   return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : [];
 }
 
+/** The short board id (e.g. `research`) used to stamp note provenance
+ * (`authored_by: board.<id>`). Strips the `board.` / `staff.` agent-id prefix. */
+function boardIdOf(charter: Charter): string {
+  const id = charter.agentId;
+  if (id.startsWith('board.')) return id.slice('board.'.length);
+  if (id.startsWith('staff.')) return id.slice('staff.'.length);
+  return id;
+}
+
 /**
  * Build the in-process Obsidian MCP server: surgical edits + search backed by the
  * WS2 ObsidianRestClient (live index) and atomic fs writes. Every tool degrades
- * to isError text when Obsidian/the vault is offline.
+ * to isError text when Obsidian/the vault is offline. `boardId` is threaded into
+ * `obsidian_write_note` so notes are stamped `authored_by: board.<id>` (real
+ * provenance, not a generic `board.sdk`).
  */
-export function buildObsidianServer(vaultRoot: string): McpServerConfig {
+export function buildObsidianServer(vaultRoot: string, boardId: string): McpServerConfig {
   const client = new ObsidianRestClient();
   return createSdkMcpServer({
     name: 'obsidian',
@@ -81,7 +92,7 @@ export function buildObsidianServer(vaultRoot: string): McpServerConfig {
           type: z.string().optional(),
           source: z.string().optional(),
         },
-        (args) => handleObsidianWriteNote(vaultRoot, args),
+        (args) => handleObsidianWriteNote(vaultRoot, boardId, args),
       ),
     ],
   });
@@ -157,7 +168,7 @@ export async function buildMcpServers(
   for (const name of requested) {
     switch (name) {
       case 'obsidian':
-        servers.obsidian = buildObsidianServer(vaultRoot);
+        servers.obsidian = buildObsidianServer(vaultRoot, boardIdOf(charter));
         break;
       case 'letta': {
         const letta = buildLettaServer(charter, vaultRoot);

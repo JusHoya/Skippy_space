@@ -153,6 +153,96 @@ pub enum Envelope {
         exit_code: Option<i32>,
         ts: String,
     },
+
+    // ── Phase 3: Telemetry / memory / replay HUD ───────────────────────────
+    // Hand-mirrored from `packages/shared/src/phase3.ts`. The shell only
+    // forwards these to the renderer; the parity test below guards the tag +
+    // field shape so a drift in the TS union can't silently demote them to Log.
+    /// Sidecar → renderer: one billable LLM turn (tokens + cost + latency). [WS6/D5]
+    TelemetrySpan {
+        #[serde(rename = "spanId")]
+        span_id: String,
+        #[serde(rename = "traceId", skip_serializing_if = "Option::is_none")]
+        trace_id: Option<String>,
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        #[serde(rename = "boardId", skip_serializing_if = "Option::is_none")]
+        board_id: Option<String>,
+        #[serde(rename = "promptId", skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
+        model: String,
+        #[serde(rename = "inputTokens")]
+        input_tokens: u32,
+        #[serde(rename = "outputTokens")]
+        output_tokens: u32,
+        #[serde(rename = "costUsd")]
+        cost_usd: f64,
+        #[serde(rename = "durationMs")]
+        duration_ms: f64,
+        ts: String,
+    },
+    /// Sidecar → renderer: per-agent context-window pressure snapshot. [WS6/D5]
+    ContextWindow {
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        #[serde(rename = "boardId", skip_serializing_if = "Option::is_none")]
+        board_id: Option<String>,
+        model: String,
+        #[serde(rename = "usedTokens")]
+        used_tokens: u32,
+        #[serde(rename = "limitTokens")]
+        limit_tokens: u32,
+        ts: String,
+    },
+    /// Sidecar → renderer: an errored span for the telemetry error feed. [WS6/D5]
+    ErrorSpan {
+        #[serde(rename = "spanId", skip_serializing_if = "Option::is_none")]
+        span_id: Option<String>,
+        #[serde(rename = "agentId")]
+        agent_id: String,
+        #[serde(rename = "boardId", skip_serializing_if = "Option::is_none")]
+        board_id: Option<String>,
+        #[serde(rename = "errorKind")]
+        error_kind: String,
+        message: String,
+        ts: String,
+    },
+    /// Sidecar → renderer: ingest/distill/link/lint pipeline progress. [WS5/D3]
+    MemoryJob {
+        job: String,
+        phase: String,
+        #[serde(rename = "sourcePath", skip_serializing_if = "Option::is_none")]
+        source_path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        counts: Option<MemoryJobCounts>,
+        ts: String,
+    },
+    /// Sidecar → renderer: a `.replay` file opened/closed. [WS8/D5]
+    ReplaySession {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        event: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        ts: String,
+    },
+}
+
+/// Accumulated counts carried by a [`Envelope::MemoryJob`] pulse. Mirrors the
+/// optional `counts` object in `phase3.ts`; every field is optional because a
+/// job only reports what it produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryJobCounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomic: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub links: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposals: Option<u32>,
 }
 
 impl Envelope {
@@ -164,5 +254,107 @@ impl Envelope {
             message: message.into(),
             ts: chrono::Utc::now().to_rfc3339(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Cross-language parity guard. This Rust enum is a hand-mirror of the Zod
+    // discriminated union in `packages/shared/src/phase3.ts`; if the two drift,
+    // `serde_json::from_str::<Envelope>` returns Err and `sidecar.rs` silently
+    // demotes the Phase 3 line to a `debug` Log — killing the telemetry/memory/
+    // replay HUD at the shell boundary. These samples assert each Phase 3
+    // variant deserializes onto its *specific* arm, not the Err/Log path.
+
+    /// Parse `json`, asserting it lands on the expected variant rather than
+    /// falling through to a parse error (which the sidecar demotes to Log).
+    fn assert_variant(json: &str, expect: &str) {
+        let env: Envelope = serde_json::from_str(json)
+            .unwrap_or_else(|e| panic!("Phase 3 sample failed to deserialize as Envelope ({e}): {json}"));
+        let got = match &env {
+            Envelope::TelemetrySpan { .. } => "telemetry_span",
+            Envelope::ContextWindow { .. } => "context_window",
+            Envelope::ErrorSpan { .. } => "error_span",
+            Envelope::MemoryJob { .. } => "memory_job",
+            Envelope::ReplaySession { .. } => "replay_session",
+            Envelope::Log { .. } => "log",
+            _ => "other",
+        };
+        assert_eq!(got, expect, "sample landed on the wrong variant: {json}");
+    }
+
+    #[test]
+    fn telemetry_span_round_trips_onto_its_variant() {
+        // All fields populated, including the optional trace/board/prompt ids.
+        assert_variant(
+            r#"{"type":"telemetry_span","spanId":"sp-1","traceId":"tr-1","agentId":"research.distiller","boardId":"research","promptId":"p-1","model":"claude-sonnet-4-6","inputTokens":1200,"outputTokens":340,"costUsd":0.0123,"durationMs":842.5,"ts":"2026-06-10T12:00:00Z"}"#,
+            "telemetry_span",
+        );
+        // Minimal: optional fields omitted entirely.
+        assert_variant(
+            r#"{"type":"telemetry_span","spanId":"sp-2","agentId":"skippy","model":"claude-opus-4-8","inputTokens":0,"outputTokens":0,"costUsd":0,"durationMs":0,"ts":"2026-06-10T12:00:01Z"}"#,
+            "telemetry_span",
+        );
+    }
+
+    #[test]
+    fn context_window_round_trips_onto_its_variant() {
+        assert_variant(
+            r#"{"type":"context_window","agentId":"coding.captain","boardId":"coding","model":"claude-sonnet-4-6","usedTokens":98000,"limitTokens":200000,"ts":"2026-06-10T12:00:02Z"}"#,
+            "context_window",
+        );
+    }
+
+    #[test]
+    fn error_span_round_trips_onto_its_variant() {
+        assert_variant(
+            r#"{"type":"error_span","spanId":"sp-3","agentId":"staff.lint","boardId":"engineering","errorKind":"RateLimit","message":"429 from provider","ts":"2026-06-10T12:00:03Z"}"#,
+            "error_span",
+        );
+        // spanId + boardId omitted (both optional on the wire).
+        assert_variant(
+            r#"{"type":"error_span","agentId":"skippy","errorKind":"Timeout","message":"no response","ts":"2026-06-10T12:00:04Z"}"#,
+            "error_span",
+        );
+    }
+
+    #[test]
+    fn memory_job_round_trips_onto_its_variant() {
+        // With the nested counts object.
+        assert_variant(
+            r#"{"type":"memory_job","job":"distill","phase":"complete","sourcePath":"vault/inbox/x.md","detail":"3 atomic notes","counts":{"sources":1,"atomic":3,"links":5,"proposals":2},"ts":"2026-06-10T12:00:05Z"}"#,
+            "memory_job",
+        );
+        // Bare pulse: only the required fields.
+        assert_variant(
+            r#"{"type":"memory_job","job":"ingest","phase":"start","ts":"2026-06-10T12:00:06Z"}"#,
+            "memory_job",
+        );
+    }
+
+    #[test]
+    fn replay_session_round_trips_onto_its_variant() {
+        assert_variant(
+            r#"{"type":"replay_session","sessionId":"sess-1","event":"started","path":"replays/sess-1.replay","ts":"2026-06-10T12:00:07Z"}"#,
+            "replay_session",
+        );
+        assert_variant(
+            r#"{"type":"replay_session","sessionId":"sess-1","event":"ended","ts":"2026-06-10T12:00:08Z"}"#,
+            "replay_session",
+        );
+    }
+
+    #[test]
+    fn unknown_type_does_not_silently_masquerade_as_a_phase3_variant() {
+        // The enum has no `#[serde(other)]` catch-all, so an unknown tag must
+        // fail to parse — this is exactly the path the sidecar demotes to a
+        // debug Log. The guard above is meaningful precisely because a genuine
+        // miss surfaces as Err, never as a wrong variant.
+        let err = serde_json::from_str::<Envelope>(
+            r#"{"type":"telemetry_spanX","spanId":"sp","agentId":"a","model":"m","inputTokens":0,"outputTokens":0,"costUsd":0,"durationMs":0,"ts":"2026-06-10T12:00:09Z"}"#,
+        );
+        assert!(err.is_err(), "unknown type should fail to parse, not map to a Phase 3 variant");
     }
 }

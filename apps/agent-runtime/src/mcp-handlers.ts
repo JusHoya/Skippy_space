@@ -17,6 +17,8 @@ import {
   mirrorArchivalToVault,
   makeFrontmatter,
   writeNote,
+  resolveInVault,
+  PathEscapesVaultError,
   type NoteType,
 } from '@skippy/memory';
 
@@ -75,13 +77,38 @@ export async function handleObsidianAppendBlock(
 }
 
 /**
+ * Append-only files this tool must never clobber (CLAUDE.md #5 / PRD §8.6):
+ *   - any note named `agent_log.md` (board audit logs),
+ *   - anything under the `40_Daily/` daily-notes tree.
+ * Both have dedicated append paths (`obsidian_append_block` / `letta_append_archival`
+ * for the agent log; the daily-note writer for 40_Daily). A normalized,
+ * forward-slashed, vault-relative path is checked so `40_Daily\x` and
+ * `./40_Daily/x` are both caught.
+ */
+function isAppendOnlyTarget(relPath: string): boolean {
+  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+  const base = norm.split('/').pop() ?? '';
+  if (base === 'agent_log.md') return true;
+  return norm === '40_Daily' || norm.startsWith('40_Daily/');
+}
+
+/**
  * Create/overwrite a vault note atomically via the filesystem (works even when
  * the Obsidian app is closed — the fs is the source of truth, PRD §8.9). The
  * §8.3 frontmatter is built + validated and the wikilink-only guard runs inside
  * `writeNote`, so a relative `.md` link in the body is rejected.
+ *
+ * Three safety rails wrap the write, since `args.path` is fully model-controlled:
+ *   1. CONTAINMENT — the resolved target must stay inside `vaultRoot`; a `..`
+ *      traversal or absolute path is rejected (no write-anywhere primitive).
+ *   2. APPEND-ONLY — `agent_log.md` / `40_Daily/` targets are refused (those
+ *      files are append-only; the model is pointed at the append tools).
+ *   3. PROVENANCE — the note is stamped `authored_by: board.<boardId>` so the
+ *      audit trail records which board wrote it, not a generic `board.sdk`.
  */
 export async function handleObsidianWriteNote(
   vaultRoot: string,
+  boardId: string,
   args: {
     path: string;
     title: string;
@@ -90,15 +117,39 @@ export async function handleObsidianWriteNote(
     source?: string | undefined;
   },
 ): Promise<McpToolResult> {
+  // (1) Containment — reject traversal / absolute paths before anything else.
+  let target: string;
   try {
+    target = resolveInVault(vaultRoot, args.path);
+  } catch (err) {
+    if (err instanceof PathEscapesVaultError) {
+      return fail(`obsidian_write_note rejected: path escapes the vault ("${args.path}").`);
+    }
+    return fail(`obsidian_write_note failed: ${String(err)}`);
+  }
+
+  // (2) Append-only guard — never overwrite agent_log.md or a 40_Daily/ note.
+  // Check the RESOLVED, vault-relative target, not the raw arg: a model could
+  // otherwise slip past with `x/../40_Daily/note.md`, which passes containment
+  // (resolves inside the vault) yet evades a raw-string prefix check.
+  const relTarget = path.relative(path.resolve(vaultRoot), target);
+  if (isAppendOnlyTarget(relTarget)) {
+    return fail(
+      `obsidian_write_note rejected: "${args.path}" is append-only. ` +
+        `Use obsidian_append_block (or letta_append_archival for the agent log) instead.`,
+    );
+  }
+
+  try {
+    // (3) Provenance — stamp the real board id, not a generic 'board.sdk'.
     const fm = makeFrontmatter({
       title: args.title,
       type: (args.type ?? 'concept') as NoteType,
-      authored_by: 'board.sdk',
+      authored_by: `board.${boardId}`,
       source: args.source ?? null,
     });
-    const target = path.join(vaultRoot, args.path);
-    const r = await writeNote(target, fm, args.body);
+    // Pass vaultRoot so the writer re-validates containment (defense-in-depth).
+    const r = await writeNote(target, fm, args.body, { vaultRoot });
     return r.written
       ? ok(`Wrote ${args.path}.`)
       : fail(`obsidian_write_note not completed (${r.reason}).`);

@@ -17,8 +17,9 @@
 // the headless, no-key exit gate.
 
 import type { ModelId } from '@skippy/shared';
-import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import type { McpServerConfig, PermissionMode } from '@anthropic-ai/claude-agent-sdk';
 
+import type { CharterPermissions } from './charter.js';
 import { logger } from './logger.js';
 
 export interface SdkBoardResult {
@@ -44,8 +45,71 @@ export interface ExecuteBoardMissionParams {
   missionBrief: string;
   /** Per-board MCP servers (obsidian/letta) from the charter, wired into query(). */
   mcpServers?: Record<string, McpServerConfig>;
+  /** The charter's permission contract (permission_mode / tools / disallowed_tools).
+   * Honored verbatim — `ask` is the safe default; bypass requires an env opt-in. */
+  permissions?: CharterPermissions;
   /** Tool-loop ceiling (R-01 cost guard). */
   maxTurns?: number;
+}
+
+/**
+ * Resolve the SDK `permissionMode` from the charter's `permission_mode`.
+ *
+ * The charter author's `ask` has no direct headless equivalent — the SDK's
+ * prompting mode (`default`) cannot prompt a human in this non-interactive
+ * sidecar, so an `ask` board would hang on the first tool call. We therefore
+ * downgrade `ask` to the *narrowest* automatic mode, `acceptEdits` (edits +
+ * MCP tools auto-approved, but NOT the full unattended Bash/file surface that
+ * `bypassPermissions` grants). `bypassPermissions` is NEVER reached from a
+ * charter value alone: it requires the explicit `SKIPPY_BYPASS_PERMISSIONS=1`
+ * env opt-in, and we log loudly when it is honored (agent_space/CLAUDE.md's
+ * "safety rails are welded shut" doctrine).
+ */
+export function resolvePermissionMode(
+  boardId: string,
+  charterMode: CharterPermissions['permissionMode'],
+): PermissionMode {
+  const bypassOptIn = process.env.SKIPPY_BYPASS_PERMISSIONS === '1';
+
+  if (charterMode === 'bypassPermissions') {
+    if (bypassOptIn) {
+      logger.warn({
+        msg: 'HONORING permission_mode=bypassPermissions (SKIPPY_BYPASS_PERMISSIONS=1) — safety rails OFF',
+        boardId,
+      });
+      return 'bypassPermissions';
+    }
+    // Charter asks for bypass but the operator has not opted in: refuse to
+    // widen, fall back to the narrowest automatic mode instead.
+    logger.warn({
+      msg: 'charter permission_mode=bypassPermissions ignored; set SKIPPY_BYPASS_PERMISSIONS=1 to honor it. Falling back to acceptEdits.',
+      boardId,
+    });
+    return 'acceptEdits';
+  }
+
+  if (charterMode === 'plan') return 'plan';
+  if (charterMode === 'acceptEdits') return 'acceptEdits';
+  // `ask` (the default): downgrade to acceptEdits for the headless run — never
+  // bypass — so MCP tools work without a prompt nobody can answer.
+  return 'acceptEdits';
+}
+
+/**
+ * Build the `allowedTools` auto-approve list. Even under `acceptEdits` the SDK
+ * may prompt for non-edit tool calls; in a headless sidecar there is no one to
+ * answer, so the board's charter-declared `tools:` AND its MCP server tools must
+ * be explicitly auto-approved. The `mcp__<server>` wildcards keep the D1/D4
+ * Obsidian + Letta tools available (the assignment's hard requirement) without
+ * granting anything the charter did not declare.
+ */
+export function buildAllowedTools(
+  charterTools: string[] | undefined,
+  mcpServerNames: string[],
+): string[] | undefined {
+  const mcpWildcards = mcpServerNames.map((name) => `mcp__${name}`);
+  const merged = [...(charterTools ?? []), ...mcpWildcards];
+  return merged.length > 0 ? merged : undefined;
 }
 
 /**
@@ -58,13 +122,40 @@ export async function executeBoardMissionViaSdk(
 ): Promise<SdkBoardResult> {
   try {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
+
+    // Charter-driven permissions (PRD §6.1) — NOT a hardcoded bypass. The
+    // charter's `permission_mode` is honored (with `ask` downgraded to the
+    // narrowest automatic mode for this headless run), and its `tools` /
+    // `disallowed_tools` become the allow/deny lists.
+    const permissions = params.permissions ?? { permissionMode: 'ask' as const };
+    const permissionMode = resolvePermissionMode(params.boardId, permissions.permissionMode);
+    const mcpServerNames = params.mcpServers ? Object.keys(params.mcpServers) : [];
+    const allowedTools = buildAllowedTools(permissions.allowedTools, mcpServerNames);
+
+    // Operator visibility: `allowedTools` are auto-approved WITHOUT prompting, so
+    // if the charter lists Bash/Write they still run unattended even though we no
+    // longer use bypassPermissions. Log the effective surface so this isn't a
+    // silent trust grant (see docs/REVIEW-2026-06-10.md §2).
+    logger.info(
+      { boardId: params.boardId, permissionMode, autoApprovedTools: allowedTools ?? [] },
+      'sdk board permission surface',
+    );
+
     const q = sdk.query({
       prompt: params.missionBrief,
       options: {
         model: params.model,
         systemPrompt: params.systemPrompt,
         maxTurns: params.maxTurns ?? 8,
-        permissionMode: 'bypassPermissions',
+        permissionMode,
+        // bypassPermissions is a guarded path: it can only be reached via the
+        // SKIPPY_BYPASS_PERMISSIONS opt-in (resolvePermissionMode), and the SDK
+        // further requires this explicit flag — set it only when we truly bypass.
+        ...(permissionMode === 'bypassPermissions'
+          ? { allowDangerouslySkipPermissions: true }
+          : {}),
+        ...(allowedTools ? { allowedTools } : {}),
+        ...(permissions.disallowedTools ? { disallowedTools: permissions.disallowedTools } : {}),
         ...(params.mcpServers ? { mcpServers: params.mcpServers } : {}),
       },
     });

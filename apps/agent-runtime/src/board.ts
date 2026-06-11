@@ -32,7 +32,7 @@ import { SpanStatusCode, trace } from '@opentelemetry/api';
 
 import { BOARD_META, type BoardId } from '@skippy/shared';
 
-import type { Charter } from './charter.js';
+import { charterPermissions, type Charter } from './charter.js';
 import { logger } from './logger.js';
 import { buildMcpServers } from './mcp-registry.js';
 import { getModelFor } from './modelRegistry.js';
@@ -290,12 +290,16 @@ export class Board {
       // memory. Only happens on the gated path — never when the flag is off.
       const vaultRoot = resolveVaultRoot();
       const mcpServers = await buildMcpServers(this.charter, vaultRoot);
+      // Honor the charter's permission_mode / tools / disallowed_tools (PRD §6.1)
+      // instead of the old hardcoded bypassPermissions.
+      const permissions = charterPermissions(this.charter);
       const sdk = await executeBoardMissionViaSdk({
         boardId: this.boardId,
         systemPrompt: this.charter.body,
         model: getModelFor(this.agentId),
         missionBrief: env.missionBrief,
         mcpServers,
+        permissions,
       });
       summary = sdk.ok
         ? sdk.summary

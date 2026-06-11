@@ -294,3 +294,56 @@ function friendlyName(agentId: CharterAgentId): string {
 export function clearCharterCache(): void {
   cache.clear();
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Charter-driven permissions (PRD §6.1 — permission_mode / tools / disallowed_tools)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The charter `permission_mode:` values (PRD §6.1 / agent_space/CLAUDE.md). These
+ * are the charter-author's vocabulary; `sdk-board.ts` maps them onto the SDK's
+ * own `PermissionMode` (notably `ask` → the SDK's prompting mode). `ask` is the
+ * default every board declares — the safety rail must survive even if the field
+ * is missing or malformed.
+ */
+export const CHARTER_PERMISSION_MODES = ['ask', 'acceptEdits', 'bypassPermissions', 'plan'] as const;
+export type CharterPermissionMode = (typeof CHARTER_PERMISSION_MODES)[number];
+
+/** The charter's tool-permission surface, defaulted to the safe `ask` mode. */
+export interface CharterPermissions {
+  /** `permission_mode:` — defaults to `'ask'` when absent/unrecognized. */
+  permissionMode: CharterPermissionMode;
+  /** `tools:` allowlist — undefined when the charter declares none. */
+  allowedTools?: string[];
+  /** `disallowed_tools:` denylist — undefined when the charter declares none. */
+  disallowedTools?: string[];
+}
+
+/** Coerce a frontmatter value to a string[] (filtering non-strings), or
+ * undefined when the field is absent / not an array. */
+function stringArrayField(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value.filter((x): x is string => typeof x === 'string');
+  return out.length > 0 ? out : undefined;
+}
+
+/**
+ * Read the charter's permission contract. The default is intentionally the
+ * SAFEST option (`ask`): a missing or unrecognized `permission_mode` never
+ * silently widens to a more permissive mode. Boards declare `permission_mode: ask`
+ * in PRD §6.1, and the runtime must honor it rather than the old hardcoded
+ * `bypassPermissions`.
+ */
+export function charterPermissions(charter: Charter): CharterPermissions {
+  const raw = charter.frontmatter['permission_mode'];
+  const permissionMode: CharterPermissionMode =
+    typeof raw === 'string' && (CHARTER_PERMISSION_MODES as readonly string[]).includes(raw)
+      ? (raw as CharterPermissionMode)
+      : 'ask';
+  const allowedTools = stringArrayField(charter.frontmatter['tools']);
+  const disallowedTools = stringArrayField(charter.frontmatter['disallowed_tools']);
+  const out: CharterPermissions = { permissionMode };
+  if (allowedTools) out.allowedTools = allowedTools;
+  if (disallowedTools) out.disallowedTools = disallowedTools;
+  return out;
+}
