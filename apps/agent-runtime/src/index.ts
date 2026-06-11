@@ -48,7 +48,6 @@ function resolveVaultRoot(): string {
 
 async function main(): Promise<void> {
   await initOtel();
-  setupGracefulShutdown();
 
   logger.info({ msg: 'agent-runtime starting', node: process.version });
   writeEnvelope({
@@ -103,6 +102,32 @@ async function main(): Promise<void> {
     logger.info({ msg: 'replay writer disabled via SKIPPY_REPLAY=0' });
   }
 
+  // The single, ordered drain. This is the ONLY shutdown path — both the
+  // signal handlers (SIGTERM/SIGINT) and the stdin-EOF fall-through below run
+  // exactly this sequence, exactly once (setupGracefulShutdown enforces the
+  // idempotency). Order matters: emit the replay `ended` boundary and flush the
+  // replay file first so it lands inside the file itself, then quiesce the
+  // memory jobs, then the boards, and drain OTel last so any span emitted by
+  // the teardown above still gets exported.
+  const drain = async (): Promise<void> => {
+    if (replaySessionId !== null) {
+      writeEnvelope({
+        type: 'replay_session',
+        sessionId: replaySessionId,
+        event: 'ended',
+        ts: new Date().toISOString(),
+      });
+      await closeReplayWriter();
+    }
+    await memoryJobs.stop();
+    await supervisor.shutdown();
+    await shutdownOtel();
+  };
+
+  // Wire SIGTERM/SIGINT to `drain`; keep the returned trigger so the stdin-EOF
+  // path runs the SAME drain instead of a competing copy.
+  const { triggerShutdown } = setupGracefulShutdown(drain);
+
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
   for await (const line of rl) {
     if (!line.trim()) continue;
@@ -137,21 +162,11 @@ async function main(): Promise<void> {
     }
   }
 
-  // stdin EOF -> graceful drain.
-  // Emit the `replay_session: ended` boundary *before* closing the writer so the
-  // boundary lands inside the replay file itself, then flush + close it.
-  if (replaySessionId !== null) {
-    writeEnvelope({
-      type: 'replay_session',
-      sessionId: replaySessionId,
-      event: 'ended',
-      ts: new Date().toISOString(),
-    });
-    await closeReplayWriter();
-  }
-  await memoryJobs.stop();
-  await supervisor.shutdown();
-  await shutdownOtel();
+  // stdin EOF: the shell closed our input, so the readline loop above ended.
+  // Drive the same single drain the signal handlers use — `triggerShutdown`
+  // coalesces with any signal that may have fired concurrently (e.g. SIGTERM +
+  // EOF on app close), so the teardown runs exactly once and then exits.
+  await triggerShutdown('stdin-eof');
 }
 
 main().catch((err: unknown) => {

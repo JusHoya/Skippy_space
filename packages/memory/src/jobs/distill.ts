@@ -21,11 +21,19 @@ import * as path from 'node:path';
 
 import { ulid } from 'ulid';
 
-import { writeNote } from '../atomic.js';
+import {
+  assertNoRelativeMdLinks,
+  atomicWrite,
+  isLocked,
+  withFileLock,
+  writeNote,
+} from '../atomic.js';
 import {
   makeFrontmatter,
   parseNote,
+  serializeNote,
   validateFrontmatter,
+  type NoteFrontmatter,
 } from '../frontmatter.js';
 import type { JobEvent } from './types.js';
 
@@ -278,19 +286,36 @@ function renderTopicBody(name: string, atomicIds: string[]): string {
   return lines.join('\n');
 }
 
+// Mirror the §8.3 schema's own validators (NoteFrontmatterSchema in frontmatter.ts:
+// `id` = 26-char ULID charset, `created_at` = offset datetime) so we only PRESERVE a
+// pre-existing id/created_at when it is actually schema-valid — a malformed one mints
+// fresh rather than being carried back out of the degraded-page fallback.
+const ULID_RE = /^[0-9A-Za-z]{26}$/;
+const OFFSET_DATETIME_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+function isOffsetDateTime(s: string): boolean {
+  return OFFSET_DATETIME_RE.test(s) && !Number.isNaN(Date.parse(s));
+}
+
 /**
- * Append new atomic [[id]] links to an EXISTING topic page without clobbering its
- * body (topics are by-name and accumulate facts across distills). Re-validates the
- * existing frontmatter and bumps `updated_at`. Returns the merged note pieces.
+ * Merge the already-read text of an EXISTING topic page with new atomic [[id]]
+ * links, bumping `updated_at` without clobbering identity. Topics are by-name and
+ * accumulate facts across distills, so this is a read-modify-write — the CALLER
+ * holds the per-file lock across the read + this merge + the write so concurrent
+ * pipeline runs can't lose links or stomp each other's pages (review §3).
+ *
+ * Identity is preserved verbatim: the original `created_at` and `id` are carried
+ * through (never re-stamped to now / re-minted), and unknown passthrough
+ * frontmatter fields (schema_version, rollup pointers, …) round-trip losslessly.
+ * Only `updated_at` (and required-field backfill on a degraded page) changes.
  */
-async function mergeTopicPage(
-  topicPath: string,
+function mergeTopicPage(
+  raw: string,
   name: string,
   atomicIds: string[],
-): Promise<{ fm: ReturnType<typeof makeFrontmatter>; body: string }> {
-  const raw = await fs.readFile(topicPath, 'utf8');
+  now: Date,
+): { fm: NoteFrontmatter; body: string } {
   const parsed = parseNote(raw);
-  const v = validateFrontmatter(parsed.frontmatter);
 
   // Append only the ids not already present as [[id]] wikilinks.
   const missing = atomicIds.filter((id) => !parsed.body.includes(`[[${id}]]`));
@@ -300,32 +325,62 @@ async function mergeTopicPage(
       ? `${parsed.body.replace(/\s+$/, '')}\n${additions}\n`
       : parsed.body;
 
-  if (v.ok) {
-    // Re-stamp via makeFrontmatter to bump updated_at while preserving identity.
-    const fm = makeFrontmatter({
-      id: v.value.id,
-      title: v.value.title,
-      type: 'concept',
-      status: v.value.status,
-      authored_by: v.value.authored_by,
-      source: v.value.source,
-      tags: v.value.tags,
-      confidence: v.value.confidence,
-      distilled_from: v.value.distilled_from,
-      supersedes: v.value.supersedes,
-      contradicts: v.value.contradicts,
-    });
-    return { fm, body };
-  }
+  // Start from the RAW frontmatter so every field — including unknown passthrough
+  // keys the §8.3 schema doesn't name — survives the round-trip untouched.
+  const existing = parsed.frontmatter;
+  const nowIso = now.toISOString();
 
-  // Existing frontmatter was invalid — rebuild a fresh valid one (best effort).
+  // Preserve the existing id verbatim — but only if it is a VALID §8.3 ULID. A
+  // non-empty-but-malformed id (a hand-broken page) must mint a fresh valid one,
+  // else both the merge below AND the degraded fallback would carry an invalid id
+  // straight back out, never re-validating (review §3 reconciliation). Same for
+  // created_at: reuse a valid offset-datetime, otherwise synthesize `now`.
+  const existingId =
+    typeof existing.id === 'string' && ULID_RE.test(existing.id) ? existing.id : ulid();
+  const createdAt =
+    typeof existing.created_at === 'string' && isOffsetDateTime(existing.created_at)
+      ? existing.created_at
+      : nowIso;
+
+  const merged: Record<string, unknown> = {
+    ...existing,
+    id: existingId,
+    // Backfill the §8.3 core only where the existing page is missing/blank it, so a
+    // page authored by another tool (or a slightly degraded one) re-validates
+    // without losing whatever it already carried.
+    title: typeof existing.title === 'string' && existing.title.length > 0
+      ? existing.title
+      : name,
+    type: 'concept',
+    status: typeof existing.status === 'string' && existing.status.length > 0
+      ? existing.status
+      : 'active',
+    authored_by:
+      typeof existing.authored_by === 'string' && existing.authored_by.length > 0
+        ? existing.authored_by
+        : 'research.distiller',
+    source:
+      'source' in existing ? existing.source : 'gen://distill',
+    created_at: createdAt,
+    updated_at: nowIso,
+  };
+
+  const v = validateFrontmatter(merged);
+  if (v.ok) return { fm: v.value, body };
+
+  // Still invalid after backfill (e.g. a malformed status/source the schema rejects)
+  // — fall back to a clean, valid frontmatter but KEEP the original id + created_at
+  // so identity is never lost (review §3: never re-mint an id for an existing page).
   const fm = makeFrontmatter({
+    id: existingId,
     title: name,
     type: 'concept',
     status: 'active',
     authored_by: 'research.distiller',
     source: 'gen://distill',
+    now,
   });
+  fm.created_at = createdAt;
   return { fm, body };
 }
 
@@ -402,24 +457,46 @@ export async function runDistill(opts: RunDistillOptions): Promise<DistillResult
       const byName = written.filter((w) => w.text.includes(needle)).map((w) => w.id);
       const seedIds = byName.length > 0 ? byName : atomicIds;
 
-      let fm: ReturnType<typeof makeFrontmatter>;
-      let body: string;
-      const existing = await fileExists(topicPath);
-      if (existing) {
-        ({ fm, body } = await mergeTopicPage(topicPath, name, seedIds));
-      } else {
-        fm = makeFrontmatter({
-          title: name,
-          type: 'concept',
-          status: 'active',
-          authored_by: 'research.distiller',
-          source: 'gen://distill',
+      // Hold the per-file lock across the ENTIRE read-modify-write. The topic page
+      // is by-name and accumulates links across distills, so a bare read-then-write
+      // (the old `fileExists` → `mergeTopicPage` → `writeNote` sequence, with the
+      // read OUTSIDE writeNote's lock) let a concurrent pipeline run clobber the
+      // page and drop links between our read and our write (review §3). We mirror
+      // writeNote's guard + validation here so nothing is skipped by going direct.
+      try {
+        const wrote = await withFileLock(topicPath, async () => {
+          let fm: NoteFrontmatter;
+          let body: string;
+          // Re-check existence INSIDE the lock so an interleaved create can't be lost.
+          let raw: string | null = null;
+          try {
+            raw = await fs.readFile(topicPath, 'utf8');
+          } catch {
+            raw = null;
+          }
+          if (raw !== null) {
+            ({ fm, body } = mergeTopicPage(raw, name, seedIds, new Date()));
+          } else {
+            fm = makeFrontmatter({
+              title: name,
+              type: 'concept',
+              status: 'active',
+              authored_by: 'research.distiller',
+              source: 'gen://distill',
+            });
+            body = renderTopicBody(name, seedIds);
+          }
+          assertNoRelativeMdLinks(body, topicPath);
+          await atomicWrite(topicPath, serializeNote(fm, body));
+          return true;
         });
-        body = renderTopicBody(name, seedIds);
+        if (wrote) topicPaths.push(topicPath);
+      } catch (err) {
+        // On lock contention, skip this topic — the next distill pass re-seeds it
+        // (matches writeNote's soft-skip-on-`locked` contract; nothing is lost since
+        // the by-name links are re-derived deterministically each run).
+        if (!isLocked(err)) throw err;
       }
-
-      const res = await writeNote(topicPath, fm, body);
-      if (res.written) topicPaths.push(topicPath);
     }
 
     onJob?.({
@@ -437,15 +514,5 @@ export async function runDistill(opts: RunDistillOptions): Promise<DistillResult
       detail: err instanceof Error ? err.message : String(err),
     });
     throw err;
-  }
-}
-
-/** True if a path exists. */
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
   }
 }

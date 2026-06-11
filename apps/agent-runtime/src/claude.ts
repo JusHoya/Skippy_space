@@ -20,9 +20,11 @@
 // `node_modules/.../@anthropic-ai/sdk/lib/MessageStream.d.ts`.
 //
 // We pick the Messages-API tool-use path because `@anthropic-ai/claude-agent-sdk`
-// is not yet a dependency in `apps/agent-runtime/package.json`. The SDK can be
-// substituted later by replacing this file alone — the tool definition in
-// `mcp-delegate.ts` is identical in shape.
+// is not yet a dependency in `apps/agent-runtime/package.json`. (The gated SDK
+// path that DOES take the dependency lives in `sdk-board.ts`, behind
+// `PHASE3_AGENTS_ENABLED`; this file is the always-on Messages-API fallback.)
+// The SDK can be substituted later by replacing this file alone — the tool
+// definition in `mcp-delegate.ts` is identical in shape.
 
 import Anthropic from '@anthropic-ai/sdk';
 
@@ -60,6 +62,17 @@ export function __setClientForTest(fake: Anthropic | null): void {
 // `set_model` envelope takes effect on the very next request.
 const MAX_TOOL_ITERATIONS = 6; // Generous; Skippy rarely cascades > 2 boards in one turn.
 
+// Output budget per API call. 1024 silently truncated Skippy's longer turns
+// (the API returns `stop_reason: 'max_tokens'` and the stream just stops
+// mid-sentence). 4096 comfortably covers a narrated orchestration turn plus a
+// delegate_to_board tool call; truncation past it is now handled explicitly
+// (see the `max_tokens` branch in the tool loop) rather than ending silently.
+// Sized to comfortably cover a full narrated Skippy orchestration turn plus a
+// delegate_to_board tool call, so hitting it (and the truncation path below) is
+// rare. These are streamed messages.stream() calls with no timeout pressure, so
+// a generous budget costs nothing when unused.
+const MAX_OUTPUT_TOKENS = 8192;
+
 /**
  * Phase 0 streaming path — single turn, no tools. Kept verbatim so the
  * Phase 0 exit gate keeps passing if the tool-use path errors at runtime.
@@ -70,7 +83,7 @@ export async function* streamSkippy(
 ): AsyncGenerator<string> {
   const stream = client().messages.stream({
     model: getModelFor('skippy'),
-    max_tokens: 1024,
+    max_tokens: MAX_OUTPUT_TOKENS,
     system,
     messages: [{ role: 'user', content: userText }],
   });
@@ -82,6 +95,14 @@ export async function* streamSkippy(
     ) {
       yield event.delta.text;
     }
+  }
+
+  // Don't let a hit on the output budget end the turn silently. This hello-world
+  // path has no tool loop to continue into, so surface the truncation inline so
+  // the user knows Skippy's reply was cut off rather than simply finished.
+  const final = await stream.finalMessage();
+  if (final.stop_reason === 'max_tokens') {
+    yield '\n\n[SKIPPY truncated: hit the output budget — ask me to continue.]';
   }
 }
 
@@ -99,6 +120,11 @@ export type SkippyChunk =
   | { kind: 'tool_use_started'; toolName: string; iteration: number }
   | { kind: 'tool_use_done'; toolName: string; iteration: number }
   | { kind: 'bail'; iteration: number }
+  // Emitted when a turn hit the `max_tokens` output budget. `continued` is
+  // always false now (we don't auto-continue — that corrupts role alternation);
+  // the caller uses it to flag a genuinely incomplete reply so the user knows to
+  // ask Skippy to continue.
+  | { kind: 'truncated'; continued: boolean }
   // Emitted exactly once at the end of the turn (WS6 / D5). `inputTokens` +
   // `outputTokens` are summed across all tool-loop iterations for cost;
   // `contextTokens` is the LAST turn's input count (the conversation-tail size)
@@ -155,7 +181,7 @@ export async function* streamSkippyWithTools(
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
     const stream = c.messages.stream({
       model: getModelFor('skippy'),
-      max_tokens: 1024,
+      max_tokens: MAX_OUTPUT_TOKENS,
       system,
       tools: [DELEGATE_TO_BOARD_TOOL],
       messages,
@@ -186,6 +212,28 @@ export async function* streamSkippyWithTools(
     totalOutput += resp.usage.output_tokens ?? 0;
     lastInput = resp.usage.input_tokens ?? lastInput;
     usedModel = resp.model ?? usedModel;
+
+    // Output budget hit mid-turn. Don't end silently (the original 1024 bug),
+    // but don't try to auto-continue either: re-prompting from a trailing
+    // assistant turn produces consecutive assistant messages (invalid role
+    // alternation) once a second truncation or the persisted tail is involved.
+    // With MAX_OUTPUT_TOKENS sized for a full narrated orchestration turn this
+    // is rare; when it does happen we persist the partial assistant turn (so the
+    // tail stays coherent and alternating) and surface the truncation as a
+    // terminal signal — the caller flags the reply as genuinely incomplete and
+    // the user can ask Skippy to continue with a fresh prompt.
+    if (resp.stop_reason === 'max_tokens') {
+      messages.push({ role: 'assistant', content: resp.content });
+      yield { kind: 'truncated', continued: false };
+      yield {
+        kind: 'usage',
+        inputTokens: totalInput,
+        outputTokens: totalOutput,
+        contextTokens: lastInput,
+        model: usedModel,
+      };
+      return;
+    }
 
     if (resp.stop_reason !== 'tool_use') {
       // Final turn — no more tools. Persist the assistant reply into the

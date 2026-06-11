@@ -17,6 +17,8 @@ import { promises as fs, constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import { ulid } from 'ulid';
 
+import { makeFrontmatter, serializeNote } from './frontmatter.js';
+
 const BOARDS = [
   'engineering',
   'coding',
@@ -50,41 +52,48 @@ function formatDate(date: Date): string {
   return `${y}-${m}-${d}`;
 }
 
-/** ISO-8601 timestamp at the start of the local-time day, in UTC. */
-function isoForDate(date: Date): string {
+/** The instant at the start of the local-time day, snapped to midnight UTC. */
+function instantForDate(date: Date): Date {
   // Snap to midnight UTC for the note's logical timestamp. The whole-day
   // semantics matches the file naming better than the call-time instant.
-  const utc = new Date(
+  return new Date(
     Date.UTC(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0),
   );
-  return utc.toISOString();
 }
 
 export function dailyNotePath(vaultRoot: string, date: Date): string {
   return path.join(vaultRoot, '40_Daily', `${formatDate(date)}.md`);
 }
 
+/**
+ * Render the canonical daily-note markdown.
+ *
+ * Frontmatter is built + serialized through the §8.3 validated writer
+ * (`makeFrontmatter` + `serializeNote`) rather than hand-templated, so the daily
+ * note is held to the SAME schema as every other vault note and the YAML is emitted
+ * by js-yaml — which quotes the ISO timestamps so they round-trip back as STRINGS
+ * (a hand-written `created_at: 2026-…Z` re-parses as a `Date` and fails the §8.3
+ * validator; review §3). `serializeNote` throws on invalid frontmatter, so a daily
+ * note can never reach disk in a shape the validator would later reject.
+ */
 function renderDailyBody(date: Date, id: string): string {
   const ymd = formatDate(date);
-  const iso = isoForDate(date);
+  const instant = instantForDate(date);
   const boardList = BOARDS.map((b) => `- [[board-${b}]]`).join('\n');
-  return `---
-id: ${id}
-title: "Daily — ${ymd}"
-created_at: ${iso}
-updated_at: ${iso}
-type: daily
-status: active
-tags: [daily]
-source: gen://skippy.staff.memory_manager
-authored_by: skippy.staff.memory_manager
-confidence: 1.0
-distilled_from: []
-supersedes: null
-contradicts: []
----
 
-# ${ymd}
+  const fm = makeFrontmatter({
+    id,
+    title: `Daily — ${ymd}`,
+    type: 'daily',
+    status: 'active',
+    source: 'gen://skippy.staff.memory_manager',
+    authored_by: 'skippy.staff.memory_manager',
+    tags: ['daily'],
+    confidence: 1.0,
+    now: instant,
+  });
+
+  const body = `# ${ymd}
 
 ## Active boards
 ${boardList}
@@ -98,6 +107,8 @@ ${boardList}
 ## Notes
 (human freeform)
 `;
+
+  return serializeNote(fm, body);
 }
 
 /**

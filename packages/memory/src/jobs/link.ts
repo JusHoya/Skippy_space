@@ -16,6 +16,7 @@ import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { writeNote } from '../atomic.js';
+import { cosineSimilarity } from '../embeddings.js';
 import {
   makeFrontmatter,
   parseNote,
@@ -142,6 +143,67 @@ async function tryVectorStore(vaultRoot: string): Promise<VectorStore | null> {
 }
 
 /**
+ * Embed every atomic note's text ONCE per run, returning an id→vector cache.
+ *
+ * Previously each topic called `store.search(topic.text, corpus, …)`, and `search`
+ * re-embeds the WHOLE corpus on every call (one transformer forward pass per note per
+ * topic). That is O(topics × notes) forward passes — the dominant cost of the run. The
+ * corpus vectors are topic-independent, so we embed each note exactly once here and
+ * reuse the cache across all topics, collapsing the cost to O(topics + notes) passes.
+ *
+ * An item that can't be embedded (→ null) is simply omitted from the cache, so a
+ * partial failure degrades gracefully exactly as `search` did (it skipped null vectors).
+ *
+ * Uses `vectorForItem` (NOT `embed(text)`) so a precomputed Smart Connections vector is
+ * preferred per note, matching what the old per-topic `store.search` did — otherwise the
+ * SC cache would be bypassed and every note re-embedded live (review §3 reconciliation).
+ *
+ * @internal Exported only so the regression test can assert the "embed each note once
+ * per run" invariant against a fake store; not part of the package's public surface.
+ */
+export async function embedCorpusOnce(
+  store: VectorStore,
+  atomic: LoadedNote[],
+): Promise<Map<string, number[]>> {
+  const cache = new Map<string, number[]>();
+  for (const note of atomic) {
+    const vec = await store.vectorForItem({ id: note.id, text: note.text });
+    if (vec !== null) cache.set(note.id, vec);
+  }
+  return cache;
+}
+
+/**
+ * Rank the cached corpus vectors against ONE topic, returning the ids whose cosine
+ * similarity clears the threshold, newest/highest-first, capped at `topK`.
+ *
+ * This mirrors `VectorStore.search` exactly — same cosine metric, same `> 0.2` cutoff
+ * applied by the caller, same descending sort + `topK` slice — but consumes the
+ * per-run corpus cache instead of re-embedding, so results are identical to the old
+ * per-topic `search` whenever corpus vectors come from the live embedder (the headless
+ * path the link job uses). Only the topic query is embedded live, once per topic.
+ *
+ * @internal Exported for the regression test (see embedCorpusOnce); not public API.
+ */
+export async function semanticNeighbors(
+  store: VectorStore,
+  topicText: string,
+  corpusVectors: Map<string, number[]>,
+  topK: number,
+): Promise<{ id: string; score: number }[]> {
+  if (topK <= 0 || corpusVectors.size === 0) return [];
+  const queryVec = await store.embed(topicText);
+  if (queryVec === null) return [];
+
+  const hits: { id: string; score: number }[] = [];
+  for (const [id, vec] of corpusVectors) {
+    hits.push({ id, score: cosineSimilarity(queryVec, vec) });
+  }
+  hits.sort((a, b) => b.score - a.score);
+  return hits.slice(0, topK);
+}
+
+/**
  * Run Job 3 (Link). For each `20_Topics/` page, find related `10_Atomic/` notes by
  * keyword overlap (refined by vector similarity when a store is available) and add
  * any missing `[[<id>]]` wikilinks into the topic page body. Bounded per §8.10.
@@ -161,7 +223,12 @@ export async function runLink(opts: RunLinkOptions): Promise<LinkResult> {
 
     // Optional semantic refinement — degrade silently when unavailable.
     const store = await tryVectorStore(vaultRoot);
-    const corpus = atomic.map((n) => ({ id: n.id, text: n.text }));
+
+    // Embed the atomic corpus ONCE for the whole run (not once per topic). The old
+    // per-topic `store.search` re-embedded every note for every topic — O(topics ×
+    // notes) forward passes; this caches each note's vector and reuses it, so the
+    // run does O(topics + notes) passes with identical ranking. See embedCorpusOnce.
+    const corpusVectors = store ? await embedCorpusOnce(store, atomic) : null;
 
     let linksAdded = 0;
 
@@ -175,11 +242,17 @@ export async function runLink(opts: RunLinkOptions): Promise<LinkResult> {
       let candidateIds = scored.map((c) => c.note.id);
 
       // Vector refinement (optional): if a store is available, re-rank the topic's
-      // neighbors by cosine similarity and merge those ids in. Bounded by depth as
-      // a topK so a runaway corpus can't blow the node budget.
-      if (store) {
+      // neighbors by cosine similarity against the CACHED corpus vectors and merge
+      // those ids in. Bounded by depth as a topK so a runaway corpus can't blow the
+      // node budget. Only the topic query is embedded live (once per topic).
+      if (store && corpusVectors) {
         try {
-          const hits = await store.search(topic.text, corpus, MAX_DEPTH * 4);
+          const hits = await semanticNeighbors(
+            store,
+            topic.text,
+            corpusVectors,
+            MAX_DEPTH * 4,
+          );
           const semanticIds = hits.filter((h) => h.score > 0.2).map((h) => h.id);
           // Keyword hits first (precision), then any new semantic neighbors.
           const merged = [...candidateIds];

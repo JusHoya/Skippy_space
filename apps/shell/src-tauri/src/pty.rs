@@ -17,15 +17,22 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tauri::ipc::Channel;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Upper bound on chunks buffered before a subscriber attaches. Shell banners
+/// and `claude --print` preamble fit comfortably; past this we drop the oldest
+/// chunks so a never-subscribed PTY can't grow without bound (PRD §5 review:
+/// subscribe()'s flush contract must be honored *and* memory-safe).
+const MAX_EARLY_CHUNKS: usize = 256;
 
 use crate::channel::EventBus;
 use crate::envelope::Envelope;
@@ -35,13 +42,27 @@ use crate::envelope::Envelope;
 /// handlers. The reader thread holds its own clone of the reader half.
 pub struct PtyEntry {
     /// Lock around the master half. `Box<dyn MasterPty + Send>` is portable-pty's owning handle.
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    /// Taken (`Option::take`) on `pty_close` so dropping it sends EOF to the
+    /// reader thread and tears down the ConPTY master.
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
     /// Writer half of the master, kept separately so we can take a writer at
     /// `pty_open` time and hold it for the lifetime of the PTY.
     writer: Mutex<Box<dyn Write + Send>>,
+    /// Killer split out from the spawned child. Holding it lets `pty_close`
+    /// terminate the user-shell (or claude-code) process — previously the
+    /// child handle was discarded at spawn, so closed tabs leaked processes.
+    /// `Option` because `kill()` consumes the ability after the first call.
+    child_killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     /// Channel the subscriber registered via `pty_subscribe` writes into.
     /// `Mutex<Option<...>>` because subscription happens after open.
     sink: Mutex<Option<Channel<String>>>,
+    /// Bounded buffer of decoded chunks produced before any subscriber
+    /// attached. Flushed in order to the first subscriber by `subscribe`,
+    /// honoring its "queued output can be flushed" contract.
+    early_buf: Mutex<Vec<String>>,
+    /// Set true on `pty_close` so the reader thread exits promptly even if the
+    /// `read` it's parked on hasn't yet returned EOF.
+    shutdown: Arc<AtomicBool>,
     /// Notifies the reader task that the subscriber is ready or has changed.
     subscribe_tx: mpsc::UnboundedSender<Channel<String>>,
     /// If this PTY is hosting a claude-code subprocess, the spawnId is stored
@@ -73,10 +94,16 @@ impl PtyManager {
 
         // Pick a shell: prefer pwsh in PATH, fall back to powershell.
         let cmd = build_shell_command();
-        // Spawn the child; we don't keep the child handle around in this
-        // scaffold (PRD §10). The PTY pair holds the slave end alive; when we
-        // drop the master, the child is reaped by Windows on stream close.
-        let _child = pair.slave.spawn_command(cmd)?;
+        // Spawn the child and split out a killer so `pty_close` can terminate
+        // it. Dropping the master alone is not enough on Windows: ConPTY keeps
+        // the child alive until it notices the broken pipe, which can leave a
+        // long-lived shell running after the tab is closed.
+        let child = pair.slave.spawn_command(cmd)?;
+        let child_killer = child.clone_killer();
+        // The `Child` itself isn't needed past this point for the user shell —
+        // we only need to kill it on close and we've cloned the killer. Drop it
+        // to release the extra handle.
+        drop(child);
         // Drop the slave so we don't keep an extra handle on it.
         drop(pair.slave);
 
@@ -85,17 +112,21 @@ impl PtyManager {
 
         let id = Uuid::new_v4().to_string();
         let (sub_tx, sub_rx) = mpsc::unbounded_channel::<Channel<String>>();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let entry = Arc::new(PtyEntry {
-            master: Mutex::new(pair.master),
+            master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(writer),
+            child_killer: Mutex::new(Some(child_killer)),
             sink: Mutex::new(None),
+            early_buf: Mutex::new(Vec::new()),
+            shutdown: shutdown.clone(),
             subscribe_tx: sub_tx,
             spawn_id: Mutex::new(None),
         });
 
         // Spawn the reader thread (blocking I/O, so a dedicated OS thread).
-        spawn_reader_thread(id.clone(), entry.clone(), reader, sub_rx);
+        spawn_reader_thread(id.clone(), entry.clone(), reader, sub_rx, shutdown);
 
         self.inner.lock().insert(id.clone(), entry);
         info!("opened pty {id} ({cols}x{rows})");
@@ -164,6 +195,10 @@ impl PtyManager {
             .slave
             .spawn_command(cb)
             .map_err(|e| anyhow!("spawn `{program}` failed: {e}"))?;
+        // Split out a killer before the child is moved into the exit-watcher
+        // task below, so `pty_close` can terminate it independently of the
+        // thread parked in `Child::wait`.
+        let child_killer = child.clone_killer();
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
@@ -171,16 +206,20 @@ impl PtyManager {
 
         let id = Uuid::new_v4().to_string();
         let (sub_tx, sub_rx) = mpsc::unbounded_channel::<Channel<String>>();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         let entry = Arc::new(PtyEntry {
-            master: Mutex::new(pair.master),
+            master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(writer),
+            child_killer: Mutex::new(Some(child_killer)),
             sink: Mutex::new(None),
+            early_buf: Mutex::new(Vec::new()),
+            shutdown: shutdown.clone(),
             subscribe_tx: sub_tx,
             spawn_id: Mutex::new(Some(spawn_id.clone())),
         });
 
-        spawn_reader_thread(id.clone(), entry.clone(), reader, sub_rx);
+        spawn_reader_thread(id.clone(), entry.clone(), reader, sub_rx, shutdown);
 
         // Wait for the child on a dedicated tokio task. portable-pty's
         // `Child` is `Send` but not `Sync`; ownership transfers cleanly.
@@ -240,13 +279,20 @@ impl PtyManager {
     pub fn resize(&self, pty_id: &str, cols: u16, rows: u16) -> Result<()> {
         let entry = self.get(pty_id)?;
         let master = entry.master.lock();
-        master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        Ok(())
+        match master.as_ref() {
+            Some(m) => {
+                m.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })?;
+                Ok(())
+            }
+            // Master already taken by a concurrent `pty_close`; the PTY is on
+            // its way out, so a resize is a harmless no-op.
+            None => Err(anyhow!("pty {pty_id} is closing")),
+        }
     }
 
     pub fn close(&self, pty_id: &str) -> Result<()> {
@@ -256,10 +302,29 @@ impl PtyManager {
             // is on the entry — preserve it in the log so the renderer's
             // tab-close event can be correlated against the spawn record.
             let spawn_id = entry.spawn_id.lock().clone();
-            // Drop the entry; the reader thread will see EOF and exit. The
-            // exit-watcher task will then observe the child's exit code and
-            // publish the matching `claude_code_exited` envelope.
-            drop(entry);
+
+            // 1. Tell the reader thread to stop looping (it re-checks this flag
+            //    after every read and before sleeping).
+            entry.shutdown.store(true, Ordering::SeqCst);
+
+            // 2. Kill the child process. Dropping the master alone does not
+            //    reliably reap the child on Windows/ConPTY, so we terminate it
+            //    explicitly. `kill` is idempotent-ish here: if the child has
+            //    already exited the OS returns an error we can safely ignore.
+            if let Some(mut killer) = entry.child_killer.lock().take() {
+                if let Err(e) = killer.kill() {
+                    debug!("pty {pty_id} child kill returned {e} (likely already exited)");
+                }
+            }
+
+            // 3. Drop the ConPTY master. This closes the read side, so the
+            //    reader thread's blocking `read` returns EOF and the thread
+            //    exits even if it was parked when we set the shutdown flag.
+            let _ = entry.master.lock().take();
+
+            // The exit-watcher task (claude-code PTYs only) will observe the
+            // child's exit and publish the matching `claude_code_exited`
+            // envelope.
             match spawn_id {
                 Some(sid) => info!("closed pty {pty_id} (claude_code spawn_id={sid})"),
                 None => info!("closed pty {pty_id}"),
@@ -272,9 +337,26 @@ impl PtyManager {
 
     pub fn subscribe(&self, pty_id: &str, channel: Channel<String>) -> Result<()> {
         let entry = self.get(pty_id)?;
-        // Replace the sink and tell the reader thread about the new channel so
-        // any queued output can be flushed to it.
-        *entry.sink.lock() = Some(channel.clone());
+
+        // Hold the sink lock across the whole flush+register so the reader
+        // thread (which takes the same lock to decide "route to sink vs.
+        // buffer") cannot interleave a fresh chunk between the flush and the
+        // registration — that would reorder output. Drain the buffer, send it,
+        // then publish the sink, all under one lock.
+        let mut sink = entry.sink.lock();
+        let queued: Vec<String> = std::mem::take(&mut *entry.early_buf.lock());
+        for chunk in queued {
+            if let Err(e) = channel.send(chunk) {
+                warn!("pty {pty_id} early-flush send failed: {e}");
+                return Err(anyhow!("subscriber channel closed during flush: {e}"));
+            }
+        }
+        *sink = Some(channel.clone());
+        drop(sink);
+
+        // Tell the reader thread about the new channel as well so its cached
+        // sink (refreshed via the mpsc, independent of the Mutex) stays in
+        // sync for resubscription.
         entry
             .subscribe_tx
             .send(channel)
@@ -351,18 +433,92 @@ fn is_on_path(program: &str) -> bool {
     false
 }
 
+/// Decode the next chunk of PTY bytes into a UTF-8 `String`, carrying any
+/// trailing incomplete multibyte sequence forward via `carry`.
+///
+/// ConPTY emits raw UTF-8; a fixed-size `read` can land mid-codepoint, so
+/// decoding each read independently (as the old code did with
+/// `from_utf8_lossy`) turned every split character into a U+FFFD replacement —
+/// mojibake in the terminal. Here we:
+///
+/// 1. prepend any bytes carried over from the previous read to `bytes`,
+/// 2. find the longest valid UTF-8 prefix,
+/// 3. emit that prefix as a `String`,
+/// 4. stash the remaining (incomplete) tail back into `carry` for next time.
+///
+/// Genuinely invalid bytes (not just a truncated tail) are replaced lossily so
+/// a single bad byte can't wedge the stream. On EOF the caller flushes any
+/// residual `carry` (see [`flush_carry`]).
+fn decode_with_carry(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
+    // Combine the carried tail with the freshly-read bytes.
+    let mut combined: Vec<u8> = Vec::with_capacity(carry.len() + bytes.len());
+    combined.append(carry); // moves carry's contents out, leaving it empty
+    combined.extend_from_slice(bytes);
+
+    match std::str::from_utf8(&combined) {
+        Ok(s) => s.to_owned(),
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            // SAFETY: `valid_up_to` is, by definition, a valid UTF-8 boundary.
+            let good = unsafe { std::str::from_utf8_unchecked(&combined[..valid_up_to]) }.to_owned();
+            let rest = &combined[valid_up_to..];
+            match e.error_len() {
+                // `None` => the tail is a *truncated* (but so-far-valid) multibyte
+                // sequence. Carry it forward to be completed by the next read.
+                None => {
+                    carry.extend_from_slice(rest);
+                    good
+                }
+                // `Some(len)` => `rest` starts with genuinely invalid bytes.
+                // Emit a replacement char for them and decode whatever follows
+                // lossily so we don't lose the rest of the chunk.
+                Some(len) => {
+                    let mut out = good;
+                    out.push('\u{FFFD}');
+                    let tail = &rest[len..];
+                    // Recurse on the remainder: it may itself end in a
+                    // truncated sequence we need to carry.
+                    out.push_str(&decode_with_carry(carry, tail));
+                    out
+                }
+            }
+        }
+    }
+}
+
+/// Flush any bytes left in `carry` at EOF as a lossy string. A well-behaved
+/// stream ends on a codepoint boundary so this is usually empty, but a process
+/// killed mid-write can leave a dangling partial sequence.
+fn flush_carry(carry: &mut Vec<u8>) -> Option<String> {
+    if carry.is_empty() {
+        return None;
+    }
+    let tail = std::mem::take(carry);
+    Some(String::from_utf8_lossy(&tail).into_owned())
+}
+
 /// Dedicated OS thread that owns the reader half of a PTY and forwards bytes
-/// to whichever `Channel<String>` is currently subscribed. Lives until EOF.
+/// to whichever `Channel<String>` is currently subscribed. Before a subscriber
+/// attaches, decoded chunks are parked in a bounded buffer and flushed by
+/// [`PtyManager::subscribe`]. Lives until EOF or until `pty_close` signals
+/// `shutdown` and drops the master (which forces the blocking read to EOF).
 fn spawn_reader_thread(
     id: String,
     entry: Arc<PtyEntry>,
     mut reader: Box<dyn Read + Send>,
     mut subscribe_rx: mpsc::UnboundedReceiver<Channel<String>>,
+    shutdown: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        // Trailing bytes of an incomplete UTF-8 sequence, carried between reads.
+        let mut carry: Vec<u8> = Vec::new();
         loop {
-            // Try to refresh the channel without blocking.
+            if shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            // Try to refresh the channel without blocking. Done under the sink
+            // lock so it stays consistent with the routing decision below.
             while let Ok(ch) = subscribe_rx.try_recv() {
                 *entry.sink.lock() = Some(ch);
             }
@@ -370,27 +526,135 @@ fn spawn_reader_thread(
             match reader.read(&mut buf) {
                 Ok(0) => {
                     debug!("pty {id} EOF");
+                    if let Some(tail) = flush_carry(&mut carry) {
+                        route_chunk(&id, &entry, tail);
+                    }
                     break;
                 }
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    let sink = entry.sink.lock().clone();
-                    if let Some(ch) = sink {
-                        if let Err(e) = ch.send(chunk) {
-                            warn!("pty {id} channel send failed: {e}");
-                            // Subscriber went away; clear so we don't keep trying.
-                            *entry.sink.lock() = None;
-                        }
+                    let chunk = decode_with_carry(&mut carry, &buf[..n]);
+                    if !chunk.is_empty() {
+                        route_chunk(&id, &entry, chunk);
                     }
-                    // If no subscriber yet, the bytes are dropped. xterm
-                    // typically subscribes before sending input so this is
-                    // only a concern for cold-start lag.
                 }
                 Err(e) => {
-                    warn!("pty {id} read error: {e}");
+                    // A dropped master (on close) surfaces here as an error on
+                    // some platforms rather than a clean EOF; treat shutdown as
+                    // expected and stay quiet.
+                    if shutdown.load(Ordering::SeqCst) {
+                        debug!("pty {id} read ended after close: {e}");
+                    } else {
+                        warn!("pty {id} read error: {e}");
+                    }
                     break;
                 }
             }
         }
     });
+}
+
+/// Route one decoded chunk to the live subscriber, or buffer it (bounded) if
+/// none has attached yet. Holding the `sink` lock for the whole decision keeps
+/// this mutually exclusive with [`PtyManager::subscribe`]'s flush, so output
+/// can never be reordered across the subscribe boundary.
+fn route_chunk(id: &str, entry: &PtyEntry, chunk: String) {
+    let mut sink = entry.sink.lock();
+    match sink.as_ref() {
+        Some(ch) => {
+            if let Err(e) = ch.send(chunk) {
+                warn!("pty {id} channel send failed: {e}");
+                // Subscriber went away; clear so we don't keep trying.
+                *sink = None;
+            }
+        }
+        None => {
+            // No subscriber yet — park the chunk for the first subscriber to
+            // flush. Bound the buffer so a never-subscribed PTY can't grow
+            // without limit; drop the oldest chunk on overflow.
+            let mut early = entry.early_buf.lock();
+            if early.len() >= MAX_EARLY_CHUNKS {
+                early.remove(0);
+            }
+            early.push(chunk);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A multibyte UTF-8 codepoint split across two reads must decode intact,
+    /// not as mojibake. Uses U+1F37A BEER MUG (🍺, 4 bytes: F0 9F 8D BA) — apt
+    /// for a fleet of beercan sprites — split after the second byte.
+    #[test]
+    fn multibyte_codepoint_split_across_chunks_decodes_intact() {
+        let beer = "🍺";
+        let bytes = beer.as_bytes();
+        assert_eq!(bytes.len(), 4, "🍺 should be 4 UTF-8 bytes");
+
+        let (first, second) = bytes.split_at(2);
+
+        let mut carry: Vec<u8> = Vec::new();
+
+        // First read ends mid-codepoint: no complete char yet, tail carried.
+        let out1 = decode_with_carry(&mut carry, first);
+        assert_eq!(out1, "", "no complete codepoint should be emitted yet");
+        assert_eq!(carry, first, "the incomplete tail must be carried forward");
+
+        // Second read completes the codepoint.
+        let out2 = decode_with_carry(&mut carry, second);
+        assert_eq!(out2, beer, "the split codepoint should decode intact");
+        assert!(carry.is_empty(), "carry should be drained once complete");
+    }
+
+    /// A three-way split (one byte per read) of the same 4-byte codepoint also
+    /// reassembles correctly, exercising repeated carry accumulation.
+    #[test]
+    fn multibyte_codepoint_split_byte_by_byte_decodes_intact() {
+        let snowman = "☃"; // U+2603, 3 bytes: E2 98 83
+        let bytes = snowman.as_bytes();
+        assert_eq!(bytes.len(), 3);
+
+        let mut carry: Vec<u8> = Vec::new();
+        let mut assembled = String::new();
+        for b in bytes {
+            assembled.push_str(&decode_with_carry(&mut carry, &[*b]));
+        }
+        assembled.push_str(&flush_carry(&mut carry).unwrap_or_default());
+        assert_eq!(assembled, snowman);
+        assert!(carry.is_empty());
+    }
+
+    /// ASCII plus a clean trailing codepoint decodes in one shot with no carry.
+    #[test]
+    fn complete_chunk_leaves_no_carry() {
+        let mut carry: Vec<u8> = Vec::new();
+        let out = decode_with_carry(&mut carry, "monkey ☕".as_bytes());
+        assert_eq!(out, "monkey ☕");
+        assert!(carry.is_empty());
+    }
+
+    /// Genuinely invalid bytes (not a truncated tail) become a replacement
+    /// char and don't wedge the stream or get stuck in the carry.
+    #[test]
+    fn invalid_bytes_become_replacement_and_clear_carry() {
+        let mut carry: Vec<u8> = Vec::new();
+        // 0xFF is never valid UTF-8; surround it with ASCII.
+        let out = decode_with_carry(&mut carry, &[b'a', 0xFF, b'b']);
+        assert_eq!(out, "a\u{FFFD}b");
+        assert!(carry.is_empty());
+    }
+
+    /// EOF flush surfaces a dangling partial sequence lossily rather than
+    /// silently swallowing it.
+    #[test]
+    fn flush_carry_emits_residual_partial_sequence() {
+        let mut carry: Vec<u8> = vec![0xF0, 0x9F]; // first half of 🍺
+        let flushed = flush_carry(&mut carry);
+        assert!(flushed.is_some());
+        assert!(carry.is_empty());
+        // Empty carry flushes to None.
+        assert!(flush_carry(&mut carry).is_none());
+    }
 }

@@ -248,19 +248,29 @@ fn navigate_mut<'a>(root: &'a mut ProjectTreeNode, indices: &[usize]) -> &'a mut
 
 /// Tauri command: scan the project tree once. When `root` is `None`, walk up
 /// from the current working directory until a `.git/` is found.
+///
+/// The walk is synchronous, recursive filesystem I/O (`read_dir` + `metadata`
+/// per node) which can stall for tens of milliseconds on a cold cache or a
+/// network drive. Running it inline on a Tauri async-runtime worker would block
+/// that worker for the whole scan, starving every other command sharing it, so
+/// we hand the blocking work to `spawn_blocking` and `await` the result.
 #[tauri::command]
 pub async fn project_tree_scan(root: Option<String>) -> Result<ProjectTree, String> {
-    let root_path = match root {
-        Some(s) => PathBuf::from(s),
-        None => {
-            let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-            locate_workspace_root(&cwd)
-                .ok_or_else(|| "not inside a git repo".to_string())?
+    // Root resolution touches the filesystem too (`current_dir`, `.git`
+    // walk-up, `exists`), so do it inside the blocking closure as well.
+    tokio::task::spawn_blocking(move || {
+        let root_path = match root {
+            Some(s) => PathBuf::from(s),
+            None => {
+                let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+                locate_workspace_root(&cwd).ok_or_else(|| "not inside a git repo".to_string())?
+            }
+        };
+        if !root_path.exists() {
+            return Err(format!("root does not exist: {}", root_path.display()));
         }
-    };
-    if !root_path.exists() {
-        return Err(format!("root does not exist: {}", root_path.display()));
-    }
-    let tree = scan_tree(&root_path);
-    Ok(tree)
+        Ok(scan_tree(&root_path))
+    })
+    .await
+    .map_err(|e| format!("project_tree_scan task panicked: {e}"))?
 }

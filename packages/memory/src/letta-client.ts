@@ -33,6 +33,20 @@ export type LettaResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: string };
 
+/**
+ * Health signal for the Letta hot-memory layer, so callers can tell *why* a method
+ * degraded instead of only seeing `{ ok: false }`:
+ *   - `connected` — the server answered the probe; reads/writes should work.
+ *   - `degraded`  — reachable at the connection level but not healthy (a non-2xx
+ *                   that isn't a transport failure, e.g. auth rejected or a server
+ *                   error). Calls will likely keep failing, but the box is *up*.
+ *   - `down`      — unreachable (ECONNREFUSED / DNS / timeout). The server is off.
+ *   - `disabled`  — the `LETTA_DISABLED=1` kill switch is set; zero network was done.
+ * `down` and `disabled` are both "no Letta," but distinguishing them lets ops tell a
+ * crashed server from an intentional offline run.
+ */
+export type LettaStatus = 'connected' | 'degraded' | 'down' | 'disabled';
+
 export interface LettaClientConfig {
   /** Base URL of the Letta server. Default: env LETTA_BASE_URL or :8283. */
   baseUrl?: string;
@@ -65,10 +79,11 @@ export class LettaClient {
   private readonly apiKey: string | undefined;
   private readonly timeoutMs: number;
 
-  // Cached availability probe. `undefined` = not yet probed. A job either has Letta
-  // or it doesn't for its lifetime; `available()` takes a `force` flag for long-lived
-  // clients that want to re-check.
-  private availabilityProbe: Promise<boolean> | undefined;
+  // Cached health probe. `undefined` = not yet probed. A job either has Letta or it
+  // doesn't for its lifetime; `available()`/`status()` take a `force` flag for
+  // long-lived clients that want to re-check. We cache the richer `LettaStatus` and
+  // derive the boolean `available()` from it, so a single probe answers both.
+  private statusProbe: Promise<LettaStatus> | undefined;
 
   constructor(config: LettaClientConfig = {}) {
     // Trim a trailing slash so we can join paths with a leading slash uniformly.
@@ -93,25 +108,42 @@ export class LettaClient {
    * `force: true` to bypass the cache.
    */
   async available(force = false): Promise<boolean> {
-    if (this.disabled()) return false;
-    if (this.availabilityProbe === undefined || force) {
-      this.availabilityProbe = this.probe();
-    }
-    return this.availabilityProbe;
+    return (await this.status(force)) === 'connected';
   }
 
-  private async probe(): Promise<boolean> {
+  /**
+   * Cached health signal — see {@link LettaStatus}. Returns `disabled` IMMEDIATELY
+   * (no network) under `LETTA_DISABLED=1`. Otherwise probes the server and reports
+   * `connected` / `degraded` / `down` so callers can distinguish a working server
+   * from one that's up-but-unhealthy from one that's off. Never throws. Pass
+   * `force: true` to bypass the cache.
+   */
+  async status(force = false): Promise<LettaStatus> {
+    if (this.disabled()) return 'disabled';
+    if (this.statusProbe === undefined || force) {
+      this.statusProbe = this.probe();
+    }
+    return this.statusProbe;
+  }
+
+  private async probe(): Promise<LettaStatus> {
     // Root `/` answers on most builds; some only expose `/v1/health`. Treat any 2xx
-    // as reachable. We only fall through to the health route on a 404 (a reachable
-    // server that simply lacks the root handler) — a connection-level failure (the
-    // server is down) means the fallback would fail identically, so we skip it.
+    // as reachable (`connected`). We only fall through to the health route on a 404 —
+    // a reachable server that simply lacks the root handler.
     const root = await this.request('GET', '/');
-    if (root.ok) return true;
+    if (root.ok) return 'connected';
     if (root.status === 404) {
       const health = await this.request('GET', '/v1/health');
-      return health.ok;
+      if (health.ok) return 'connected';
+      // 404 on root but health also non-2xx: the box is up (it answered HTTP) but
+      // not serving a healthy API → degraded, not down.
+      return health.status !== undefined ? 'degraded' : 'down';
     }
-    return false;
+    // A non-2xx status on root (auth rejected, 5xx, etc.) means the server answered
+    // — it's reachable but unhealthy → degraded. A `status === undefined` here means
+    // the request never completed at the HTTP level (ECONNREFUSED / timeout / DNS) →
+    // the server is down.
+    return root.status !== undefined ? 'degraded' : 'down';
   }
 
   /**

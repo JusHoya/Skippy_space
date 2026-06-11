@@ -15,6 +15,7 @@
 
 import { trace } from '@opentelemetry/api';
 import { ulid } from 'ulid';
+import { z } from 'zod';
 
 import { BOARDS, type BoardId } from '@skippy/shared';
 
@@ -24,6 +25,55 @@ import { logger } from './logger.js';
 import { writeEnvelope } from './protocol.js';
 
 const tracer = trace.getTracer('skippy-supervisor');
+
+/**
+ * Matches the renderer's `deadline` contract: `z.string().datetime({ offset: true })`
+ * (RFC-3339 with a `Z` or `±HH:MM` offset). The renderer rejects the WHOLE
+ * `DelegationEnvelope` if `deadline` is present but not offset-datetime — so a bare
+ * `2026-06-10`, a `tomorrow`, or any other model-supplied junk would make the entire
+ * delegation silently vanish from the UI. We mirror the schema here so the supervisor
+ * (the single owner that writes the envelope) can reject-or-coerce before the wire.
+ *
+ * We use the SAME zod check the renderer uses (`z.string().datetime({ offset: true })`)
+ * rather than a hand-rolled regex: a shape-only regex accepts numerically-invalid
+ * values like `2026-13-45T99:99:99Z`, which the renderer's zod then rejects — exactly
+ * the silent-vanish bug we're closing.
+ */
+const OFFSET_DATETIME = z.string().datetime({ offset: true });
+
+/**
+ * Validate / normalize a model-supplied `deadline` so a bad value can never make a
+ * delegation disappear (docs/REVIEW-2026-06-10.md §6, `supervisor.ts:138`):
+ *
+ *   1. Already a valid offset datetime → pass through unchanged.
+ *   2. Otherwise `Date`-parseable (e.g. `2026-06-10`, an epoch, an RFC-2822 date) →
+ *      coerce to a canonical `...Z` ISO string the renderer's schema accepts.
+ *   3. Unsalvageable (`tomorrow`, `eod`, gibberish) → drop it and log, so the rest of
+ *      the delegation still reaches the UI rather than being rejected wholesale.
+ *
+ * Returns `undefined` for both "no deadline given" and "given but unusable"; the
+ * caller spreads it conditionally, so a dropped deadline simply omits the field.
+ */
+export function normalizeDeadline(deadline: string | undefined): string | undefined {
+  if (deadline === undefined) return undefined;
+  const trimmed = deadline.trim();
+  if (trimmed === '') return undefined;
+  if (OFFSET_DATETIME.safeParse(trimmed).success) return trimmed;
+
+  const ms = Date.parse(trimmed);
+  if (Number.isNaN(ms)) {
+    logger.warn({ msg: 'dropping unparseable delegation deadline', deadline });
+    return undefined;
+  }
+  // `Date#toISOString` is canonical RFC-3339 `...Z`; re-assert against the schema
+  // so a coerced edge case can never slip a renderer-invalid value onto the wire.
+  const iso = new Date(ms).toISOString();
+  if (!OFFSET_DATETIME.safeParse(iso).success) {
+    logger.warn({ msg: 'dropping un-normalizable delegation deadline', deadline });
+    return undefined;
+  }
+  return iso;
+}
 
 /** Result returned to Skippy by `supervisor.delegate(...)`. Mirrors the
  * on-wire `DelegationAckEnvelope` but is a plain object so the MCP tool
@@ -106,6 +156,11 @@ export class BoardSupervisor {
       },
       async (span): Promise<SupervisorAck> => {
         try {
+          // A model-supplied `deadline` is untrusted: validate/coerce it to the
+          // renderer's offset-datetime contract (or drop it) BEFORE it can reach
+          // the wire envelope, so a bad value can't make the whole delegation vanish.
+          const normalizedDeadline = normalizeDeadline(deadline);
+
           const board = this.boards.get(toBoardId);
           if (!board) {
             // The supervisor was asked for a board that didn't start. We
@@ -135,7 +190,7 @@ export class BoardSupervisor {
             toBoardId,
             missionBrief,
             ...(constraints && constraints.length > 0 ? { constraints } : {}),
-            ...(deadline ? { deadline } : {}),
+            ...(normalizedDeadline ? { deadline: normalizedDeadline } : {}),
             ts: new Date().toISOString(),
           };
           writeEnvelope(delegationEnv);
@@ -146,7 +201,7 @@ export class BoardSupervisor {
             missionBrief,
             fromAgentId: 'skippy',
             ...(constraints ? { constraints } : {}),
-            ...(deadline ? { deadline } : {}),
+            ...(normalizedDeadline ? { deadline: normalizedDeadline } : {}),
           };
           const ack: BoardAck = await board.receiveDelegation(delegation);
 

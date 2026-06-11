@@ -42,6 +42,14 @@ export interface VectorStore {
   readonly available: boolean;
   /** Embed text → vector, or null when no embedder is available. */
   embed(text: string): Promise<number[] | null>;
+  /**
+   * Vector for a CORPUS item, preferring its precomputed Smart Connections vector
+   * (no model load) and only embedding the text live on a cache miss. Callers that
+   * precompute corpus vectors (e.g. the link job) MUST use this rather than
+   * `embed(item.text)`, or the SC cache is bypassed entirely. Null when neither an
+   * SC vector nor a live embedder is available.
+   */
+  vectorForItem(item: CorpusItem): Promise<number[] | null>;
   /** Rank `corpus` against `query` by cosine similarity; top `topK`, desc. */
   search(query: string, corpus: CorpusItem[], topK: number): Promise<ScoredHit[]>;
 }
@@ -68,14 +76,19 @@ export async function makeVectorStore(
 
   // 2. Local embedder — needed to embed the *query* (and any corpus item the SC
   //    cache doesn't cover). We attempt it regardless of #1: SC gives us corpus
-  //    vectors but not a way to embed a fresh query string.
+  //    vectors but not a way to embed a fresh query string, and `search()` always
+  //    has to embed the query live. Without an embedder there is no usable search
+  //    path (SC corpus vectors alone can't score a fresh query), so we degrade.
   const embedder = await getLocalEmbedder();
 
-  if (scVectors.size > 0 || embedder !== null) {
+  if (embedder !== null) {
+    // SC vectors (if any) accelerate corpus scoring; the embedder handles the query
+    // and any item the SC cache misses.
     return new EmbeddingVectorStore(scVectors, embedder);
   }
 
-  // 3. Nothing available — degrade.
+  // 3. No live embedder — even with SC corpus vectors we can't embed the query, so
+  //    `search()` would always return []. Report unavailable rather than lie.
   return new NullVectorStore();
 }
 
@@ -85,19 +98,36 @@ export async function makeVectorStore(
 
 /**
  * Backed by an optional Smart Connections vector map + an optional local embedder.
- * `available` is true if *either* source exists. Corpus items are embedded by
- * looking them up in the SC map first (by id), falling back to live embedding.
- * The query is always embedded live (SC has no entry for an arbitrary query), so a
- * store with SC vectors but no live embedder can only score pre-embedded queries —
- * in that (rare) case `search()` returns [] for an un-embeddable query.
+ *
+ * `available` reflects whether `search()` can ACTUALLY return hits, not merely
+ * whether some vectors exist. The query string has no precomputed vector (SC only
+ * embeds vault notes, never an arbitrary query), so it MUST be embedded live — a
+ * store with SC corpus vectors but no live embedder can never score anything and
+ * `search()` would always return []. We therefore gate `available` on the live
+ * embedder, so an SC-only/no-embedder store correctly reports `available:false`
+ * instead of advertising a search path that silently yields nothing (review §3).
+ *
+ * Corpus lookup: SC keys its cache by vault PATH (`10_Atomic/<ULID>.md`), but the
+ * corpus addresses items by bare ULID. We bridge that by indexing the SC map on the
+ * ULID embedded in each path key (the filename stem) at construction time, so a
+ * corpus item's `id` resolves to its precomputed SC vector. Anything the SC cache
+ * doesn't cover falls back to live embedding of the item text.
  */
-class EmbeddingVectorStore implements VectorStore {
-  readonly available = true;
+export class EmbeddingVectorStore implements VectorStore {
+  readonly available: boolean;
+
+  /** SC vectors re-indexed by the ULID extracted from each (path-like) cache key. */
+  private readonly scByUlid: Map<string, number[]>;
 
   constructor(
-    private readonly scVectors: Map<string, number[]>,
+    scVectors: Map<string, number[]>,
     private readonly embedder: LocalEmbedder | null,
-  ) {}
+  ) {
+    // The query can only be scored via the live embedder; without it `search()`
+    // cannot return anything, so the store is not actually "available".
+    this.available = embedder !== null;
+    this.scByUlid = indexScByUlid(scVectors);
+  }
 
   async embed(text: string): Promise<number[] | null> {
     if (this.embedder === null) return null;
@@ -117,7 +147,7 @@ class EmbeddingVectorStore implements VectorStore {
 
     const hits: ScoredHit[] = [];
     for (const item of corpus) {
-      const itemVec = await this.vectorFor(item);
+      const itemVec = await this.vectorForItem(item);
       if (itemVec === null) continue;
       hits.push({ id: item.id, score: cosineSimilarity(queryVec, itemVec) });
     }
@@ -127,18 +157,55 @@ class EmbeddingVectorStore implements VectorStore {
   }
 
   /** Prefer a precomputed SC vector for this item; else embed its text live. */
-  private async vectorFor(item: CorpusItem): Promise<number[] | null> {
-    const precomputed = this.scVectors.get(item.id);
+  async vectorForItem(item: CorpusItem): Promise<number[] | null> {
+    // Corpus items are addressed by bare ULID; SC vectors are indexed here by the
+    // ULID extracted from each path key, so this lookup actually hits (review §3).
+    const precomputed = this.scByUlid.get(item.id);
     if (precomputed) return precomputed;
     if (this.embedder === null) return null;
     return this.embedder(item.text);
   }
 }
 
+// A ULID is 26 chars of Crockford base32. We match leniently on `[0-9A-Za-z]{26}`
+// (the same charset frontmatter.ts validates) so a real id is never missed; the
+// surrounding `/` and `.` path delimiters keep the run from over-matching.
+const ULID_IN_KEY_RE = /[0-9A-Za-z]{26}/;
+
+/**
+ * Re-index a Smart Connections vector map (keyed by vault PATH, e.g.
+ * `10_Atomic/<ULID>.md`) by the ULID embedded in each key, so corpus items — which
+ * are addressed by bare ULID — can resolve their precomputed vectors. Keys that are
+ * already bare ULIDs map to themselves; keys with no recognizable ULID are dropped
+ * (they can't be matched to a corpus id anyway). On collision, first write wins.
+ */
+function indexScByUlid(scVectors: Map<string, number[]>): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  for (const [key, vec] of scVectors) {
+    const ulid = ulidFromKey(key);
+    if (ulid !== null && !out.has(ulid)) out.set(ulid, vec);
+  }
+  return out;
+}
+
+/** Extract the note ULID from a path-like SC cache key, or null if absent. */
+function ulidFromKey(key: string): string | null {
+  // Prefer the filename stem (`.../<ULID>.md` → `<ULID>`), which is where the
+  // distiller writes the id; fall back to any 26-char ULID-shaped run in the key.
+  const stem = key.replace(/\\/g, '/').split('/').pop() ?? key;
+  const fromStem = stem.replace(/\.[^.]+$/, '');
+  if (ULID_IN_KEY_RE.test(fromStem) && fromStem.length === 26) return fromStem;
+  const m = key.match(ULID_IN_KEY_RE);
+  return m ? m[0] : null;
+}
+
 /** The degraded store: no vectors, `search()` always returns []. */
 class NullVectorStore implements VectorStore {
   readonly available = false;
   async embed(): Promise<number[] | null> {
+    return null;
+  }
+  async vectorForItem(): Promise<number[] | null> {
     return null;
   }
   async search(): Promise<ScoredHit[]> {

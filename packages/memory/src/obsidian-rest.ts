@@ -17,6 +17,17 @@
 // plain HTTP on :27123. We default to the non-TLS port to dodge the self-signed-cert
 // rejection that Node's fetch would otherwise throw; an https:// URL is still honored
 // if the caller sets one (and has the cert trusted / NODE_TLS_REJECT_UNAUTHORIZED).
+//
+// SAME RAILS AS THE fs PATH (CLAUDE.md #5 / PRD §8.2-§8.3): REST writes are still
+// vault writes, so they must honor the same invariants atomic.ts enforces — wikilinks
+// only (no relative `.md` links) on any appended markdown, and the §8.3 frontmatter
+// contract on any frontmatter PATCH. We REUSE the canonical guards/validators from
+// atomic.ts + frontmatter.ts here rather than re-deriving them, so the two write
+// paths can never drift. A guard/validation failure degrades to `{ ok: false }`
+// *before* the network call — REST must not be a backdoor around the rules.
+
+import { hasRelativeMdLink } from './atomic.js';
+import { validateFrontmatter, makeFrontmatter } from './frontmatter.js';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Result type — mirrors the {ok}-discriminated style used across @skippy/memory.
@@ -25,6 +36,20 @@
 export type RestResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: string };
+
+/**
+ * Health signal for the Obsidian REST layer (D1), mirroring Letta's `LettaStatus`
+ * so callers can tell *why* a method degraded rather than only seeing `{ ok: false }`:
+ *   - `connected` — the plugin answered the probe; surgical edits/search should work.
+ *   - `degraded`  — reachable at the connection level but not healthy (a non-2xx that
+ *                   isn't a transport failure, e.g. the bearer token was rejected).
+ *   - `down`      — unreachable (ECONNREFUSED / DNS / timeout); Obsidian/the plugin
+ *                   is off, so callers should take the `fs` path.
+ *   - `no-key`    — no `OBSIDIAN_API_KEY` configured; REST is definitionally
+ *                   unavailable and zero network was done (the analogue of Letta's
+ *                   `disabled`).
+ */
+export type ObsidianStatus = 'connected' | 'degraded' | 'down' | 'no-key';
 
 export interface ObsidianRestConfig {
   /** Base URL of the Local REST API. Default: env OBSIDIAN_API_URL or the :27123 HTTP port. */
@@ -48,10 +73,11 @@ export class ObsidianRestClient {
   private readonly apiKey: string | undefined;
   private readonly timeoutMs: number;
 
-  // Cached availability probe. `undefined` = not yet probed; resets are not needed
-  // for a job's lifetime (a job either has REST or it doesn't), but `available()`
-  // accepts a `force` flag for long-lived clients that want to re-check.
-  private availabilityProbe: Promise<boolean> | undefined;
+  // Cached health probe. `undefined` = not yet probed; resets are not needed for a
+  // job's lifetime (a job either has REST or it doesn't), but `available()`/`status()`
+  // accept a `force` flag for long-lived clients that want to re-check. We cache the
+  // richer `ObsidianStatus` and derive the boolean `available()` from it.
+  private statusProbe: Promise<ObsidianStatus> | undefined;
 
   constructor(config: ObsidianRestConfig = {}) {
     // Trim a trailing slash so we can join paths with a leading slash uniformly.
@@ -75,18 +101,32 @@ export class ObsidianRestClient {
    * Pass `force: true` to bypass the cache.
    */
   async available(force = false): Promise<boolean> {
-    if (!this.hasKey()) return false;
-    if (this.availabilityProbe === undefined || force) {
-      this.availabilityProbe = this.probe();
-    }
-    return this.availabilityProbe;
+    return (await this.status(force)) === 'connected';
   }
 
-  private async probe(): Promise<boolean> {
+  /**
+   * Cached health signal — see {@link ObsidianStatus}. Returns `no-key` IMMEDIATELY
+   * (no network) when no bearer token is configured. Otherwise probes the plugin and
+   * reports `connected` / `degraded` / `down` so callers can distinguish a working
+   * REST plugin from one that's up-but-unhealthy (e.g. a rejected token) from one
+   * that's off. Never throws. Pass `force: true` to bypass the cache.
+   */
+  async status(force = false): Promise<ObsidianStatus> {
+    if (!this.hasKey()) return 'no-key';
+    if (this.statusProbe === undefined || force) {
+      this.statusProbe = this.probe();
+    }
+    return this.statusProbe;
+  }
+
+  private async probe(): Promise<ObsidianStatus> {
     // The plugin's root `/` returns 200 with `{ status: "OK", ... }` for an
-    // authenticated request. We treat any 2xx as reachable.
+    // authenticated request. We treat any 2xx as `connected`. A non-2xx that still
+    // carried an HTTP status (the box answered, e.g. a 401 rejected token) is
+    // `degraded`; a transport failure with no status (ECONNREFUSED/timeout) is `down`.
     const res = await this.request('GET', '/');
-    return res.ok;
+    if (res.ok) return 'connected';
+    return res.status !== undefined ? 'degraded' : 'down';
   }
 
   /**
@@ -114,6 +154,16 @@ export class ObsidianRestClient {
     key: string,
     value: unknown,
   ): Promise<RestResult<true>> {
+    // §8.3 guard: a frontmatter PATCH is a vault write, so the new value must hold
+    // for the field it targets (e.g. `type`/`status` are closed enums, `confidence`
+    // is 0..1). We validate the single field against the canonical schema *before*
+    // touching the network so REST can't smuggle an out-of-schema value past the
+    // contract the fs path enforces. Fields the §8.3 schema doesn't constrain
+    // (passthrough keys like `schema_version`) pass through untouched.
+    const fieldErr = validateFrontmatterField(key, value);
+    if (fieldErr !== null) {
+      return { ok: false, error: `patchFrontmatter: ${fieldErr}` };
+    }
     const res = await this.request('PATCH', `/vault/${encodePath(vaultRelPath)}`, {
       contentType: 'application/json',
       headers: {
@@ -133,6 +183,16 @@ export class ObsidianRestClient {
    * Append-only — matches the §8.5 agent_log/daily semantics without re-reading.
    */
   async appendBlock(vaultRelPath: string, markdown: string): Promise<RestResult<true>> {
+    // Wikilink guard (CLAUDE.md #5 / PRD §8.2): appended markdown is a vault write,
+    // so relative `.md` links are forbidden here exactly as in atomic.ts. We reuse
+    // atomic.ts's own predicate (single source of truth) and degrade to {ok:false}
+    // before the network call rather than throwing — callers expect a soft result.
+    if (hasRelativeMdLink(markdown)) {
+      return {
+        ok: false,
+        error: `appendBlock to "${vaultRelPath}" contains a relative markdown link; use [[wikilinks]] only (PRD §8.2)`,
+      };
+    }
     const res = await this.request('POST', `/vault/${encodePath(vaultRelPath)}`, {
       contentType: 'text/markdown',
       body: markdown,
@@ -189,7 +249,10 @@ export class ObsidianRestClient {
       headers?: Record<string, string>;
       body?: string;
     } = {},
-  ): Promise<{ ok: true; status: number; body: string } | { ok: false; error: string }> {
+  ): Promise<
+    | { ok: true; status: number; body: string }
+    | { ok: false; status?: number; error: string }
+  > {
     if (!this.hasKey()) {
       return { ok: false, error: 'OBSIDIAN_API_KEY is not set; REST is unavailable' };
     }
@@ -212,7 +275,13 @@ export class ObsidianRestClient {
       });
       const body = await res.text();
       if (!res.ok) {
-        return { ok: false, error: `HTTP ${res.status} ${res.statusText}: ${body.slice(0, 200)}` };
+        // Carry the HTTP status so `probe()` can tell `degraded` (the box answered)
+        // from `down` (a transport failure that never reaches this branch).
+        return {
+          ok: false,
+          status: res.status,
+          error: `HTTP ${res.status} ${res.statusText}: ${body.slice(0, 200)}`,
+        };
       }
       return { ok: true, status: res.status, body };
     } catch (err) {
@@ -233,6 +302,43 @@ export interface SearchHit {
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Validate a single frontmatter field against the §8.3 schema, returning a human
+ * error string or `null` if the value is acceptable for that key. Reuses the
+ * canonical validators (`makeFrontmatter` for a valid baseline + `validateFrontmatter`
+ * for the check) rather than re-listing the enums/ranges, so REST and the fs path
+ * can't drift.
+ *
+ * We validate the field in isolation by overriding it on a known-valid baseline and
+ * keeping only the issues that target the patched key — so the schema's cross-field
+ * `superRefine` (e.g. atomic_fact↔source) never produces a false positive about a
+ * *different* field we aren't touching. Keys the §8.3 schema doesn't constrain
+ * (passthrough) are always accepted.
+ */
+function validateFrontmatterField(key: string, value: unknown): string | null {
+  // A baseline that satisfies the schema with zero superRefine coupling: a non-
+  // atomic_fact type with a source means the §8.10 sourceless-fact rule never fires,
+  // so any residual issue is attributable to the field we override below.
+  const baseline = makeFrontmatter({
+    title: 'patch-probe',
+    type: 'concept',
+    authored_by: 'obsidian.rest',
+    source: 'ref:patch-probe',
+    status: 'active',
+  }) as Record<string, unknown>;
+  const candidate = { ...baseline, [key]: value };
+  const res = validateFrontmatter(candidate);
+  if (res.ok) return null;
+  // `validateFrontmatter` formats issues as `"<path>: <message>"`. Keep only the
+  // ones whose path is the patched key — passthrough keys (not in the §8.3 core
+  // set) never produce an issue for their own path, so they pass through untouched,
+  // and cross-field superRefine issues (which target a *different* field) are
+  // excluded so we never reject a value the patched field actually accepts.
+  const prefix = `${key}: `;
+  const own = res.errors.filter((e) => e.startsWith(prefix));
+  return own.length > 0 ? own.join('; ') : null;
+}
 
 /** Percent-encode a vault-relative path segment-wise (keep the `/` separators). */
 function encodePath(vaultRelPath: string): string {

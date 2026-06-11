@@ -1,27 +1,44 @@
 // board.ts — one logical Board Captain process.
 //
-// PRD §5.1 says "each board agent as its own root query() process" — at the
-// SDK level, that means a Claude Agent SDK `query()` per board, isolated
-// contexts, distinct system prompts, distinct memory bindings. For Phase 1 we
-// run each board as an in-process logical session rather than an OS-level
-// child process for three reasons:
+// HONEST STATE OF THE TOPOLOGY (was overstated; corrected per review §6):
+// PRD §5.1's full vision is "each board agent as its own root query() process"
+// — a Claude Agent SDK `query()` per board, with isolated contexts and distinct
+// memory bindings. That is NOT what this file implements yet. What it actually
+// does:
 //
-//   1. The Claude Agent SDK npm package (`@anthropic-ai/claude-agent-sdk`) is
-//      not yet in `apps/agent-runtime/package.json` (only `@anthropic-ai/sdk`
-//      is). Spawning a query() per board would require either landing that
-//      dep or reimplementing the query loop. Both are >Phase-1 scope.
-//   2. PRD R-01 calls out the 12s SDK cold-start; OS-process-per-board would
-//      multiply that 8× on boot. In-process boards warm in parallel almost
-//      instantly because they only need to load a charter and register a
-//      session id — no second `node` process to spin up.
-//   3. The PRD's "process" language is about *logical* isolation (one query()
-//      context per board, distinct conversation state, no token bleed between
-//      boards). An in-process Board class achieves that contract trivially:
-//      each Board holds its own `messages: []` history and its own system
-//      prompt, and the supervisor never crosses the streams.
+//   * Each board is an in-process logical session (a `Board` instance), never
+//     an OS process or worker thread. There is one shared Node process for all
+//     eight boards plus the supervisor.
+//   * The Claude Agent SDK IS now a dependency (`@anthropic-ai/claude-agent-sdk`
+//     in package.json), but a real `query()` is reached ONLY on the gated path
+//     (`PHASE3_AGENTS_ENABLED=1` + an API key) via `sdk-board.ts`, and even then
+//     it is a one-shot `query()` per *delegation*, not a long-lived per-board
+//     session. With the gate off (the default, and the only mode the exit gate
+//     exercises) a board does no LLM work at all — it returns a keyword-routed
+//     ack and a stub `delegation_complete`.
+//   * The "isolation" we genuinely provide is the trivial kind: each Board owns
+//     its own `history` array and system prompt, and the supervisor never
+//     crosses the streams. There is no token-bleed because, off the gate, there
+//     are no tokens.
 //
-// In Phase 2+ we expect to migrate to one of:
-//   (a) `claude-agent-sdk` `query()` per board, still in this process.
+// FAILURE MODEL (PRD §5.3 — partially implemented, honestly):
+//   * A delegation that fails (SDK error, thrown exception, empty result) emits
+//     a `delegation_complete` with `result:'failure'` — the renderer's failure
+//     arm is reachable and the board always returns to `ready`. See
+//     `emitDelegationComplete`.
+//   * What §5.3 promises but is NOT here: SQLite-checkpoint rehydration of board
+//     state across the 2 s sidecar restart, and a real retry/backoff policy.
+//     A crashed sidecar loses all in-flight delegation state. Tracked as a gap.
+//   * Concurrency: a board executes ONE mission at a time. A second delegation
+//     arriving mid-flight is declined (not silently accepted) so `markReady()`
+//     never lies about state. See the `busy` guard in `receiveDelegation`.
+//
+// PRD R-01 (the only Critical risk — 12 s SDK cold start) is UNMITIGATED here:
+// the gated path pays the cold start on every delegation; the warm pool the PRD
+// envisions is an unreferenced stub elsewhere.
+//
+// In Phase 2+ we still expect to migrate to one of:
+//   (a) a long-lived `claude-agent-sdk` `query()` per board, still in-process.
 //   (b) `worker_threads.Worker` per board if we need true thread isolation.
 //   (c) child Node processes per board only if (a) and (b) are insufficient.
 //
@@ -76,6 +93,16 @@ export class Board {
   readonly agentId: `board.${BoardId}`;
   private readonly charter: Charter;
   private phase: Phase = 'spawning';
+
+  /**
+   * True from the moment an accepted delegation starts executing until its
+   * `delegation_complete` has been emitted (success OR failure). A board runs
+   * exactly one mission at a time; a second delegation arriving while `busy`
+   * is declined rather than silently accepted, so `markReady()` never lies
+   * about state mid-flight (review §6, board.ts:196). Phase 2 may replace the
+   * reject-while-busy policy with a bounded queue.
+   */
+  private busy = false;
 
   /**
    * Per-board conversation log. In Phase 2 this becomes the actual Claude
@@ -169,16 +196,20 @@ export class Board {
   /**
    * Handle one delegation envelope. PRD §5.2: synchronously return the ack
    * (accept | decline | counter_propose), then asynchronously emit a
-   * `delegation_complete` envelope once the (stubbed) work is done.
+   * `delegation_complete` envelope once the work (stub or gated SDK run) is
+   * done — with the REAL success/failure of that work, not a hardcoded success.
    *
-   * For Phase 1 the policy is intentionally simple:
-   *   - obvious-wrong-board heuristic -> decline.
-   *   - otherwise -> accept + emit a delegation_complete with a stub summary.
+   * Policy:
+   *   - board already busy with another mission -> decline (one mission at a
+   *     time; never silently accept and lie about state).
+   *   - obvious-wrong-board heuristic -> counter_propose.
+   *   - otherwise -> accept, claim the board, and run the mission. The
+   *     `delegation_complete` carries `result:'success'` only if the work
+   *     actually succeeded; any failure (or thrown error) emits
+   *     `result:'failure'` so the board always frees and the UI never hangs.
    *
-   * The heuristic uses a tiny keyword match against the board's scope; it
-   * intentionally errs toward `accept` so most missions flow through (the
-   * acceptance criterion only requires "Skippy can call delegate_to_board and
-   * receive an ack").
+   * The routing heuristic uses a tiny keyword match against the board's scope;
+   * it intentionally errs toward `accept` so most missions flow through.
    */
   async receiveDelegation(env: BoardDelegation): Promise<BoardAck> {
     return tracer.startActiveSpan(
@@ -193,6 +224,46 @@ export class Board {
       },
       async (span): Promise<BoardAck> => {
         try {
+          // Serialize: one mission per board at a time. A delegation arriving
+          // while a prior one is still executing is declined — we do NOT flip
+          // to `working` or touch `busy`, so the in-flight mission's state is
+          // untouched and `markReady()` stays truthful (review §6).
+          if (this.busy) {
+            span.setAttribute('skippy.delegation.decision', 'decline');
+            span.setAttribute('skippy.board.busy', true);
+            span.setStatus({ code: SpanStatusCode.OK });
+            return {
+              delegationId: env.delegationId,
+              boardId: this.boardId,
+              decision: 'decline',
+              counterText: `Board ${this.boardId} is busy with another mission; re-delegate once it reports complete.`,
+            };
+          }
+
+          const decision = this.decideDelegation(env);
+          span.setAttribute('skippy.delegation.decision', decision);
+
+          // Only an accepted mission claims the board and flips it to `working`.
+          // Decline/counter leave the board exactly where it was (ready).
+          if (decision !== 'accept') {
+            return decision === 'counter_propose'
+              ? {
+                  delegationId: env.delegationId,
+                  boardId: this.boardId,
+                  decision,
+                  counterText: `Board ${this.boardId} suggests routing to a sibling captain — mission keywords look out-of-scope.`,
+                }
+              : {
+                  delegationId: env.delegationId,
+                  boardId: this.boardId,
+                  decision,
+                };
+          }
+
+          // Claim the board for this mission BEFORE returning the ack, so a
+          // concurrent delegation that arrives before the microtask runs sees
+          // `busy` and is declined.
+          this.busy = true;
           this.phase = 'working';
           writeEnvelope({
             type: 'board_state',
@@ -207,45 +278,27 @@ export class Board {
             content: `Skippy delegates: ${env.missionBrief}`,
           });
 
-          const decision = this.decideDelegation(env);
-          const ack: BoardAck =
-            decision === 'counter_propose'
-              ? {
-                  delegationId: env.delegationId,
-                  boardId: this.boardId,
-                  decision,
-                  counterText: `Board ${this.boardId} suggests routing to a sibling captain — mission keywords look out-of-scope.`,
-                }
-              : {
-                  delegationId: env.delegationId,
-                  boardId: this.boardId,
-                  decision,
-                };
-
-          span.setAttribute('skippy.delegation.decision', decision);
-
           // Fire-and-forget the completion emission; do not await it on the
-          // ack path. Supervisor / Skippy continue without blocking.
-          if (decision === 'accept') {
-            queueMicrotask(() => {
-              void this.emitDelegationComplete(env).catch((e: unknown) => {
-                logger.warn({ msg: 'emitDelegationComplete failed', boardId: this.boardId, err: String(e) });
-                this.markReady();
-              });
+          // ack path. Supervisor / Skippy continue without blocking. The
+          // completion path is itself exhaustively guarded (it always emits a
+          // `delegation_complete` and always clears `busy` via `markReady`), so
+          // this `.catch` is a belt-and-suspenders backstop only.
+          queueMicrotask(() => {
+            void this.emitDelegationComplete(env).catch((e: unknown) => {
+              logger.warn({ msg: 'emitDelegationComplete failed', boardId: this.boardId, err: String(e) });
+              this.failDelegation(env, `internal error: ${String(e)}`);
             });
-          } else {
-            // Drop back to ready immediately on decline/counter.
-            queueMicrotask(() => {
-              this.markReady();
-            });
-          }
+          });
 
           span.setStatus({ code: SpanStatusCode.OK });
-          return ack;
+          return {
+            delegationId: env.delegationId,
+            boardId: this.boardId,
+            decision,
+          };
         } catch (err) {
           span.recordException(err as Error);
           span.setStatus({ code: SpanStatusCode.ERROR });
-          this.markReady();
           throw err;
         } finally {
           span.end();
@@ -275,16 +328,50 @@ export class Board {
   }
 
   /**
-   * Emit the delegation outcome. By default (PHASE3_AGENTS_ENABLED off) this is
-   * the Phase-1 stub acknowledgement. When the flag is on AND an API key is
-   * present, the board executes the mission for real via the Claude Agent SDK
-   * (`sdk-board.ts`), using its charter as the system prompt; any SDK failure
-   * falls back to the stub summary so a delegation never wedges.
+   * Emit the delegation outcome, propagating the REAL success/failure of the
+   * run (review §6, board.ts:305/309). Two modes:
+   *
+   *   - Gate off (default): the Phase-1 stub acknowledgement. The stub does no
+   *     work and cannot fail, so it legitimately reports `result:'success'`.
+   *   - Gate on (PHASE3_AGENTS_ENABLED=1 + API key): the board executes the
+   *     mission via the Claude Agent SDK. If the SDK run fails (no key, SDK
+   *     error, empty result, or a thrown exception anywhere in this path) we
+   *     emit `result:'failure'` — never a fake `'success'` — so the renderer's
+   *     failure arm is reachable and the delegation can be retried.
+   *
+   * This method ALWAYS emits exactly one `delegation_complete` and ALWAYS
+   * returns the board to `ready` (clearing `busy`), including when the SDK call
+   * throws — the `try/catch` guarantees no path exits without an envelope, so
+   * the UI never hangs on a half-finished delegation.
    */
   private async emitDelegationComplete(env: BoardDelegation): Promise<void> {
-    let summary = `Board ${this.boardId} acknowledges and is queuing this mission. (Stub — set PHASE3_AGENTS_ENABLED=1 for real SDK execution.)`;
+    // Resolve the real outcome first, THEN emit exactly once. Keeping the emit
+    // out of the try/catch guarantees a single `delegation_complete` per call:
+    // a failure inside the work can't race a success emit, and `writeEnvelope`
+    // is never re-entered from a catch arm.
+    const { result, summary } = await this.runDelegation(env);
+    this.emitCompletion(env, result, summary);
+  }
 
-    if (sdkBoardsEnabled()) {
+  /**
+   * Run the mission and return its real outcome. Never throws: any failure
+   * (no API key, SDK error, empty result, or a thrown exception while building
+   * MCP servers / resolving the vault root) is captured as a `'failure'` tuple
+   * so `emitDelegationComplete` can always emit a completion envelope and free
+   * the board — the renderer's failure arm stays reachable and the UI can't hang.
+   */
+  private async runDelegation(
+    env: BoardDelegation,
+  ): Promise<{ result: 'success' | 'failure'; summary: string }> {
+    if (!sdkBoardsEnabled()) {
+      // Stub path: an acknowledgement, not real work. Genuinely succeeds.
+      return {
+        result: 'success',
+        summary: `Board ${this.boardId} acknowledges and is queuing this mission. (Stub — set PHASE3_AGENTS_ENABLED=1 for real SDK execution.)`,
+      };
+    }
+
+    try {
       // Build this board's MCP servers (obsidian/letta) from its charter, so the
       // real agent can do surgical vault edits, semantic search, and archival
       // memory. Only happens on the gated path — never when the flag is off.
@@ -301,23 +388,65 @@ export class Board {
         mcpServers,
         permissions,
       });
-      summary = sdk.ok
-        ? sdk.summary
-        : `Board ${this.boardId}: real execution unavailable, acknowledged only. ${sdk.summary}`.trim();
-    }
 
+      if (sdk.ok) {
+        return { result: 'success', summary: sdk.summary };
+      }
+      // The SDK could not complete the mission. Report the real failure so the
+      // wire contract's failure arm is exercised (do NOT dress it up as a
+      // success). `sdk.summary` carries the error note from sdk-board.ts.
+      logger.warn({ msg: 'delegation failed', boardId: this.boardId, delegationId: env.delegationId, err: sdk.summary });
+      return {
+        result: 'failure',
+        summary: `Board ${this.boardId}: real execution failed. ${sdk.summary}`.trim(),
+      };
+    } catch (err) {
+      logger.warn({ msg: 'delegation errored', boardId: this.boardId, delegationId: env.delegationId, err: String(err) });
+      return {
+        result: 'failure',
+        summary: `Board ${this.boardId}: delegation errored. ${String(err)}`,
+      };
+    }
+  }
+
+  /** Emit a `delegation_complete` with the given result, then return to ready.
+   * Single choke point so every completion path is symmetric and always frees
+   * the board (clears `busy`). */
+  private emitCompletion(
+    env: BoardDelegation,
+    result: 'success' | 'failure',
+    summary: string,
+  ): void {
     writeEnvelope({
       type: 'delegation_complete',
       delegationId: env.delegationId,
       fromBoardId: this.boardId,
-      result: 'success',
+      result,
       summary,
       ts: new Date().toISOString(),
     });
     this.markReady();
   }
 
+  /** Emit a failing `delegation_complete` (and free the board). Backstop for
+   * the `.catch` in `receiveDelegation` — used only if the completion path
+   * itself rejects — so a failed mission can never hang the UI or leave the
+   * board stuck `busy`. */
+  private failDelegation(env: BoardDelegation, summary: string): void {
+    logger.warn({ msg: 'delegation failed (backstop)', boardId: this.boardId, delegationId: env.delegationId, summary });
+    this.emitCompletion(env, 'failure', summary);
+  }
+
   private markReady(): void {
+    // A completion that lands AFTER shutdown must not resurrect the board: flipping
+    // phase back to 'ready' and emitting board_state:'ready' would contradict the
+    // shutdown and leave a zombie pedestal in the UI. Once shut down, stay down
+    // (still clear busy so internal bookkeeping is consistent).
+    if (this.phase === 'shutdown') {
+      this.busy = false;
+      return;
+    }
+    this.busy = false;
     this.phase = 'ready';
     writeEnvelope({
       type: 'board_state',

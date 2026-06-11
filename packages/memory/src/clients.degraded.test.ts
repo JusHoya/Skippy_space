@@ -74,6 +74,70 @@ test('ObsidianRestClient: no API key → unavailable, methods degrade without ne
   if (!read.ok) assert.match(read.error, /OBSIDIAN_API_KEY/);
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// status() — the health signal (REVIEW §3/§7): "no-key" vs "down" must be
+// distinguishable, not collapsed into a bare available()===false.
+// ──────────────────────────────────────────────────────────────────────────────
+
+test('ObsidianRestClient.status(): no key → "no-key" (zero network), unbound port → "down"', async () => {
+  const noKey = new ObsidianRestClient({ apiUrl: 'http://127.0.0.1:9', apiKey: '' });
+  const started = Date.now();
+  assert.equal(await noKey.status(), 'no-key');
+  assert.ok(Date.now() - started < 200, 'no-key must not dial the network');
+
+  const down = unboundClient();
+  const status = await down.status();
+  assert.equal(status, 'down'); // transport failure → server is off
+  assert.notEqual(status, 'no-key'); // observably distinct from the missing-key case
+  assert.equal(await down.available(), false);
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Write-rail parity (REVIEW §3): REST writes must honor the same wikilink + §8.3
+// rails as the fs path, BEFORE any network call (so they degrade without a server).
+// ──────────────────────────────────────────────────────────────────────────────
+
+test('ObsidianRestClient.appendBlock: relative .md link is rejected before the network', async () => {
+  // Use an *unbound* port: if the guard didn't fire we'd get a network error, not
+  // the wikilink error — so matching the wikilink message proves we short-circuited.
+  const client = unboundClient();
+  const bad = await client.appendBlock('40_Daily/today.md', 'see [readme](./README.md)');
+  assert.equal(bad.ok, false);
+  if (!bad.ok) assert.match(bad.error, /wikilink|relative markdown link/i);
+
+  // A [[wikilink]] (and an absolute http link) is allowed through to the network,
+  // where the unbound port then degrades it — so NOT a wikilink-guard rejection.
+  const okShape = await client.appendBlock('40_Daily/today.md', 'see [[other-note]]');
+  assert.equal(okShape.ok, false);
+  if (!okShape.ok) assert.doesNotMatch(okShape.error, /relative markdown link/i);
+});
+
+test('ObsidianRestClient.patchFrontmatter: invalid §8.3 field value rejected before the network', async () => {
+  const client = unboundClient();
+
+  // `status` is a closed §8.4/§8.3 enum — a bogus value must be caught by the
+  // reused validator, not silently PATCHed onto the live note.
+  const badStatus = await client.patchFrontmatter('10_Atomic/x.md', 'status', 'not-a-status');
+  assert.equal(badStatus.ok, false);
+  if (!badStatus.ok) assert.match(badStatus.error, /patchFrontmatter/i);
+
+  // `confidence` is constrained to 0..1; out-of-range is rejected too.
+  const badConf = await client.patchFrontmatter('10_Atomic/x.md', 'confidence', 5);
+  assert.equal(badConf.ok, false);
+  if (!badConf.ok) assert.match(badConf.error, /patchFrontmatter/i);
+
+  // A valid value for a constrained field passes the guard and reaches the network
+  // (where the unbound port degrades it) — so NOT a patchFrontmatter validation error.
+  const okStatus = await client.patchFrontmatter('10_Atomic/x.md', 'status', 'active');
+  assert.equal(okStatus.ok, false);
+  if (!okStatus.ok) assert.doesNotMatch(okStatus.error, /patchFrontmatter:/);
+
+  // A passthrough key the §8.3 schema doesn't constrain is not blocked by the guard.
+  const okExtra = await client.patchFrontmatter('10_Atomic/x.md', 'schema_version', 3);
+  assert.equal(okExtra.ok, false);
+  if (!okExtra.ok) assert.doesNotMatch(okExtra.error, /patchFrontmatter:/);
+});
+
 test('readSmartConnectionsEmbeddings: no .smart-env → empty Map (no throw)', async () => {
   const dir = await tmpDir();
   const map = await readSmartConnectionsEmbeddings(dir);

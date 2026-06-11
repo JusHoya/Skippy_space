@@ -5,13 +5,15 @@
 // is mirrored in `agent_space/CLAUDE.md`. The body is the system prompt the
 // charter's agent runs under.
 //
-// We deliberately avoid adding `gray-matter` / `js-yaml` as dependencies for
-// Phase 1 — neither is in `apps/agent-runtime/package.json` yet (only the
-// workspace has a transitive `js-yaml` via some other package, which we are
-// not supposed to rely on). The frontmatter shape we need is shallow enough
-// that a tiny hand-rolled parser is both safer (no surprise YAML edge cases on
-// untrusted text) and faster (no extra startup cost). If a future charter
-// needs nested structures we cannot handle, we can drop `gray-matter` in then.
+// We deliberately keep this loader off a full YAML engine. The hand-rolled
+// parser below handles the actual charter shape — nested block maps and
+// list-valued keys (e.g. the `memory:` stanza's `core_memory_facts:` list two
+// levels deep) — which the charters have used since Phase 1; it stays a small,
+// indentation-driven walk (no block scalars / anchors / aliases) so there are
+// no surprise YAML edge cases on the (author-controlled) charter text and no
+// extra startup cost. `gray-matter` is a dependency used elsewhere in the
+// runtime; if a charter ever needs full YAML we can route this through it, but
+// that day has not come.
 //
 // Failure modes (per Agent F's tolerance contract):
 //   - File missing -> return a placeholder Charter with a stub system prompt
@@ -24,9 +26,10 @@ import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { BoardId, StaffOfficerId } from '@skippy/shared';
+import { STAFF_OFFICERS, type BoardId, type StaffOfficerId } from '@skippy/shared';
 
 import { logger } from './logger.js';
+import { setBoardModelFromCharter } from './modelRegistry.js';
 import { writeEnvelope } from './protocol.js';
 
 /** Identifiers the loader can resolve to a file path on disk. */
@@ -39,7 +42,8 @@ export type CharterAgentId =
 export interface Charter {
   /** The agent id this charter was loaded for. */
   readonly agentId: CharterAgentId;
-  /** Parsed (shallow) YAML frontmatter. Unknown keys are kept as strings. */
+  /** Parsed YAML frontmatter (nested maps + lists; PRD §6.1). Values the
+   * parser cannot coerce are kept as their raw string. */
   readonly frontmatter: Record<string, unknown>;
   /** Markdown body, with frontmatter fence removed. Used as the system prompt. */
   readonly body: string;
@@ -104,74 +108,178 @@ function resolveCharterPath(agentId: CharterAgentId): string {
  *   key: [a, b, c]       -> string[]
  *   key:                 -> begins a nested mapping
  *     subkey: value
+ *     subkey:            -> which may ITSELF nest a map or a list
+ *       - item
  *   key:                 -> begins a sequence
  *     - item
+ *
+ * Nesting is indentation-driven and recurses to arbitrary depth, so a block map
+ * whose own keys carry list values parses correctly — e.g. the `memory:` stanza
+ * in every charter, where `core_memory_facts:` is a list nested two levels down
+ * (PRD §6.1). The earlier hand-rolled pass flattened one level only and bailed
+ * at the first `- ` item, which silently dropped `core_memory_facts` in all 13
+ * charters; the recursive walk below fixes that.
  *
  * We do NOT handle:
  *   - block scalars (>, |)
  *   - anchors / aliases
  *   - quoted multi-line strings
  *
- * Anything we cannot parse cleanly is kept as its raw string. The frontmatter
- * is informational at this layer; the *body* is what feeds the LLM, so loss-of-
- * fidelity in frontmatter never affects agent behavior — just metadata.
+ * Anything we cannot parse cleanly is kept as its raw string. This frontmatter
+ * is NOT purely informational: `charterPermissions()` reads `permission_mode` /
+ * `tools` / `disallowed_tools` off it to drive the gated SDK board's safety
+ * rails (PRD §6.1), the model registry reads `model`, and the MCP registry reads
+ * `mcp_servers` / `memory.letta_agent_id`. Parse fidelity here is load-bearing.
  */
 function parseFrontmatter(raw: string): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
   const lines = raw.split(/\r?\n/);
-  let i = 0;
+  const [value] = parseBlock(lines, 0, -1);
+  return (value ?? {}) as Record<string, unknown>;
+}
+
+/** Leading-whitespace width of a line (tabs counted as one column each — the
+ * charters indent with spaces, and we only compare relative depth). A blank or
+ * comment-only line returns `Infinity` so it never closes an open block. */
+function indentOf(line: string): number {
+  if (line.trim() === '' || line.trim().startsWith('#')) return Infinity;
+  return (/^(\s*)/.exec(line)?.[1] ?? '').length;
+}
+
+/**
+ * Parse the block of lines starting at `start` whose indentation is strictly
+ * greater than `parentIndent`. Returns the parsed value (a map, a string[], or
+ * an empty object for an empty block) and the index of the first line that does
+ * NOT belong to the block, so the caller can resume.
+ *
+ * The block is a sequence when its first significant line begins with `- `,
+ * otherwise a mapping. A mapping key whose inline value is empty opens a deeper
+ * block, parsed by recursing — which is what makes `core_memory_facts:` (a list
+ * two levels under `memory:`) round-trip.
+ */
+function parseBlock(
+  lines: string[],
+  start: number,
+  parentIndent: number,
+): [unknown, number] {
+  // Find the first significant line of this block to fix its indentation.
+  let i = start;
+  while (i < lines.length && indentOf(lines[i] ?? '') === Infinity) i++;
+  if (i >= lines.length) return [{}, i];
+  const blockIndent = indentOf(lines[i] ?? '');
+  if (blockIndent <= parentIndent) return [{}, start];
+
+  const firstTrimmed = (lines[i] ?? '').trim();
+  if (firstTrimmed.startsWith('- ') || firstTrimmed === '-') {
+    return parseSequence(lines, i, blockIndent);
+  }
+  return parseMapping(lines, i, blockIndent);
+}
+
+function parseSequence(
+  lines: string[],
+  start: number,
+  blockIndent: number,
+): [string[], number] {
+  const list: string[] = [];
+  let i = start;
   while (i < lines.length) {
     const line = lines[i] ?? '';
-    if (line.trim() === '' || line.trim().startsWith('#')) {
+    const indent = indentOf(line);
+    if (indent === Infinity) {
       i++;
       continue;
     }
-    const m = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(line);
-    if (!m) {
-      i++;
-      continue;
-    }
-    const key = m[1] as string;
-    const rest = (m[2] ?? '').trim();
-    if (rest === '') {
-      // Nested block — peek the next line's indent.
-      const block: Record<string, unknown> = {};
-      const list: string[] = [];
-      let j = i + 1;
-      let mode: 'map' | 'list' | null = null;
-      while (j < lines.length) {
-        const sub = lines[j] ?? '';
-        if (sub.trim() === '') {
-          j++;
-          continue;
-        }
-        const indent = /^(\s+)/.exec(sub);
-        if (!indent) break;
-        const trimmed = sub.trim();
-        if (trimmed.startsWith('- ')) {
-          mode ??= 'list';
-          if (mode !== 'list') break;
-          list.push(trimmed.slice(2).trim().replace(/^['"]|['"]$/g, ''));
-        } else if (/^[A-Za-z0-9_]+:/.test(trimmed)) {
-          mode ??= 'map';
-          if (mode !== 'map') break;
-          const sm = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
-          if (sm && sm[1] !== undefined) {
-            block[sm[1]] = coerceScalar(sm[2] ?? '');
-          }
-        } else {
-          break;
-        }
-        j++;
-      }
-      out[key] = mode === 'list' ? list : block;
-      i = j;
-      continue;
-    }
-    out[key] = coerceScalar(rest);
+    if (indent < blockIndent) break;
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('-')) break; // a map key at this depth ends the list
+    const item = coerceScalar(stripComment(trimmed.replace(/^-\s*/, '')));
+    list.push(typeof item === 'string' ? item : String(item ?? ''));
     i++;
   }
-  return out;
+  return [list, i];
+}
+
+function parseMapping(
+  lines: string[],
+  start: number,
+  blockIndent: number,
+): [Record<string, unknown>, number] {
+  const map: Record<string, unknown> = {};
+  let i = start;
+  while (i < lines.length) {
+    const line = lines[i] ?? '';
+    const indent = indentOf(line);
+    if (indent === Infinity) {
+      i++;
+      continue;
+    }
+    if (indent < blockIndent) break;
+    if (indent > blockIndent) {
+      // Stray deeper line with no opener — skip rather than mis-attribute it.
+      i++;
+      continue;
+    }
+    const trimmed = line.trim();
+    if (trimmed.startsWith('-')) break; // a list item at this depth ends the map
+    const m = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
+    if (!m || m[1] === undefined) {
+      i++;
+      continue;
+    }
+    const key = m[1];
+    const rest = stripComment(m[2] ?? '').trim();
+    if (rest === '') {
+      // Empty inline value — the value is whatever block follows, if it is
+      // indented deeper than this key; otherwise it is an explicit null.
+      const nextSignificant = nextSignificantIndent(lines, i + 1);
+      if (nextSignificant > blockIndent) {
+        const [value, next] = parseBlock(lines, i + 1, blockIndent);
+        map[key] = value;
+        i = next;
+        continue;
+      }
+      map[key] = null;
+      i++;
+      continue;
+    }
+    map[key] = coerceScalar(rest);
+    i++;
+  }
+  return [map, i];
+}
+
+/** Indentation of the next significant (non-blank, non-comment) line, or
+ * `-Infinity` when none remains — used to decide whether an empty `key:` opens
+ * a nested block or is a bare null. */
+function nextSignificantIndent(lines: string[], start: number): number {
+  for (let i = start; i < lines.length; i++) {
+    const indent = indentOf(lines[i] ?? '');
+    if (indent !== Infinity) return indent;
+  }
+  return -Infinity;
+}
+
+/**
+ * Strip a trailing ` # comment` from a scalar value. A `#` only starts a comment
+ * when it is preceded by whitespace (or starts the value); a `#` inside a token
+ * — notably hex colors like `#66FCF1` — is preserved. Comments are not stripped
+ * inside quotes.
+ */
+function stripComment(value: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch === "'" && !inDouble) inSingle = !inSingle;
+    else if (ch === '"' && !inSingle) inDouble = !inDouble;
+    else if (ch === '#' && !inSingle && !inDouble) {
+      const prev = value[i - 1];
+      if (i === 0 || prev === ' ' || prev === '\t') {
+        return value.slice(0, i).replace(/\s+$/, '');
+      }
+    }
+  }
+  return value;
 }
 
 function coerceScalar(raw: string): unknown {
@@ -221,6 +329,15 @@ export async function loadCharter(agentId: CharterAgentId): Promise<Charter> {
       path: filePath,
     };
     cache.set(agentId, charter);
+    // A board's charter `model:` is an honored contract: seed the model registry
+    // so `getModelFor('board.<id>')` resolves to the charter's declared model
+    // (PRD §6.1), with BOARD_META as the fallback. No-ops if the user already
+    // rebound the board. (Skippy's model is seeded from SKIPPY_MODEL / Opus in
+    // the registry itself; staff have no registry scope yet — see loadStaffCharters.)
+    if (agentId.startsWith('board.')) {
+      const boardId = agentId.slice('board.'.length) as BoardId;
+      setBoardModelFromCharter(boardId, charter.frontmatter['model']);
+    }
     return charter;
   } catch (err) {
     logger.warn({
@@ -293,6 +410,38 @@ function friendlyName(agentId: CharterAgentId): string {
 /** Test-only / shutdown helper: clear the cache. */
 export function clearCharterCache(): void {
   cache.clear();
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Staff Officers (PRD §6.3)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Load all four Staff Officer charters (`agent-creator`, `skill-auditor`,
+ * `memory-manager`, `psych-monitor`) so they are resolvable and referenceable.
+ *
+ * Why this exists: Skippy's charter body (his system prompt) directs him to use
+ * the Staff Officers every turn — "validate via `psych-monitor`", "create types
+ * via `agent-creator`" (PRD §6.3, `agent_space/skippy.md`). Until this loader
+ * existed nothing read the `staff/*.md` files at all, so the prompt promised a
+ * capability the runtime could not honor. This is the smaller, correct half of
+ * that fix: the charters are now LOADABLE (same cache + placeholder-tolerant
+ * path as boards), which is the prerequisite for referencing them.
+ *
+ * It is NOT yet full invocation: Skippy has no `delegate_to_staff` tool, and the
+ * gated SDK board path does not spawn staff sessions. Wiring that tool + an
+ * execution path lives in `skippy.ts` / the SDK board layer, outside this
+ * module — tracked as a residual gap so the prompt/runtime mismatch is at least
+ * visible and the charters are ready to be consumed when that lands.
+ */
+export async function loadStaffCharters(): Promise<Map<StaffOfficerId, Charter>> {
+  const entries = await Promise.all(
+    STAFF_OFFICERS.map(async (id) => {
+      const charter = await loadCharter(`staff.${id}`);
+      return [id, charter] as const;
+    }),
+  );
+  return new Map(entries);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

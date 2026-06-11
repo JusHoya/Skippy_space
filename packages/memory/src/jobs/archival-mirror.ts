@@ -12,21 +12,36 @@
 // a re-run never clobbers it); every write appends a timestamped `## ... — archival`
 // section through appendSection (append-only, PRD §8.5).
 //
+// HEADER-LESS REPAIR: a lost create-race can leave a header-less log forever — if
+// appendSection creates the file before writeNoteIfAbsent stamps it, every later
+// writeNoteIfAbsent sees `{exists}` and never repairs the missing §8.3 frontmatter,
+// so the note fails validation permanently. We therefore detect a frontmatter-less
+// existing log and repair it by PREPENDING a valid header (history untouched —
+// append-only is preserved; we only add the header we never managed to write).
+//
 // WIKILINK GUARD: appendSection refuses relative `.md` markdown links (PRD §8.2).
 // Archival text comes from agents and may contain them, so we neutralize relative
 // `.md` links before appending and retry once; if it still can't be written we
 // return {ok:false} cleanly. We never let the guard (or a lock) throw out of here.
 
+import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import {
   appendSection,
   writeNoteIfAbsent,
+  withFileLock,
+  atomicWrite,
   hasRelativeMdLink,
   WikilinkViolationError,
   type WriteResult,
 } from '../atomic.js';
-import { makeFrontmatter } from '../frontmatter.js';
+import {
+  makeFrontmatter,
+  parseNote,
+  serializeNote,
+  validateFrontmatter,
+} from '../frontmatter.js';
 
 /** Outcome of a mirror attempt. `path` is the agent_log note targeted either way. */
 export interface MirrorResult {
@@ -86,7 +101,16 @@ export async function mirrorArchivalToVault(
     // header isn't on disk yet appendSection will create a header-less file. That's
     // acceptable: the section is the durable record; the frontmatter is a one-time
     // nicety. We don't fail the mirror on a create-time lock.
-    void created;
+    //
+    // `{written:false, reason:'exists'}` is the steady-state path AND the symptom of a
+    // lost create-race: the file is there, but it may be the header-less artifact a
+    // prior appendSection created before writeNoteIfAbsent could stamp it. Repair it
+    // once here so the §8.3 header is restored instead of being missing forever. The
+    // repair is append-only-safe (prepends the header, never rewrites history) and
+    // never throws — a failure to repair just leaves the (still-appendable) log as-is.
+    if (!created.written && created.reason === 'exists') {
+      await repairHeaderIfNeeded(target, board);
+    }
   } catch (err) {
     // A malformed-frontmatter throw (shouldn't happen with fixed inputs) must not
     // crash the mirror — degrade to {ok:false} so the caller can retry/alert.
@@ -121,6 +145,60 @@ export async function mirrorArchivalToVault(
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Repair a header-less agent_log left by a lost create-race. Reads `target`; if it
+ * already carries valid §8.3 frontmatter (the steady-state) it is a cheap no-op. If
+ * the frontmatter is MISSING or invalid, it prepends a fresh `agent_log` header,
+ * keeping the existing content verbatim as the body — append-only is preserved
+ * because we only ADD the header we never managed to write, never rewriting history.
+ *
+ * Done inside the file lock with a re-check so a concurrent writer can't clobber, and
+ * NEVER throws (a read/lock failure leaves the log untouched — it stays appendable).
+ */
+async function repairHeaderIfNeeded(target: string, board: string): Promise<void> {
+  try {
+    // Fast path: if the on-disk note already validates, there's nothing to repair.
+    const raw = await fs.readFile(target, 'utf8');
+    if (isValidNote(raw)) return;
+
+    await withFileLock(target, async () => {
+      // Re-read inside the lock: another writer (or an earlier repair) may have
+      // stamped the header in the gap between our check and acquiring the lock.
+      const current = await fs.readFile(target, 'utf8');
+      if (isValidNote(current)) return;
+
+      // Prepend a valid header, carrying the existing content forward as the body so
+      // every already-appended `## ... — archival` section survives intact. The body
+      // is written verbatim (no wikilink guard) — we're restoring a header on content
+      // that is already on disk, not introducing new links.
+      const fm = makeFrontmatter({
+        type: 'agent_log',
+        status: 'active',
+        authored_by: `board.${board}`,
+        source: 'gen://letta-archival',
+        title: `${board} — agent log`,
+      });
+      // serializeNote normalizes a single leading newline after the fence, so the
+      // existing content (which starts with appendSection's leading `\n`) flows in cleanly.
+      const repaired = serializeNote(fm, current);
+      await atomicWrite(target, repaired);
+    });
+  } catch {
+    // Lock contention, a read race, or a malformed-frontmatter throw must not crash
+    // the mirror. The log is still appendable; the next cycle can retry the repair.
+    return;
+  }
+}
+
+/** True iff `raw` parses to a §8.3-valid note (frontmatter present + schema-valid). */
+function isValidNote(raw: string): boolean {
+  try {
+    return validateFrontmatter(parseNote(raw).frontmatter).ok;
+  } catch {
+    return false;
+  }
+}
 
 type AppendOutcome =
   | { kind: 'ok' }
