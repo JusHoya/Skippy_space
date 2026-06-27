@@ -51,12 +51,24 @@ function digitFromCode(code: string): ControlGroupKey | null {
   return n as ControlGroupKey;
 }
 
-/** Map F-key code → minimap layer name. */
+/**
+ * Map F-key code → minimap layer name.
+ *
+ * PRD §14.5 reconciliation (Phase 4): F1 is reassigned to the in-app docs
+ * overlay, so it is NO LONGER a plain minimap-layer key here. The `size`
+ * layer that used to live on F1 is re-homed to **Shift+F1** (see
+ * `SHIFT_F_KEY_LAYERS` and the matching legend in MinimapPane). F2–F4 keep
+ * their original layers untouched, preserving muscle memory for three of four.
+ */
 const F_KEY_LAYERS: Record<string, MinimapLayer> = {
-  F1: 'size',
   F2: 'gitAge',
   F3: 'testCoverage',
   F4: 'errorDensity',
+};
+
+/** Minimap layers reached via Shift+F-key (the F1 re-home — see above). */
+const SHIFT_F_KEY_LAYERS: Record<string, MinimapLayer> = {
+  F1: 'size',
 };
 
 /** Current selection set: multi if non-empty, else the uiStore primary. */
@@ -159,7 +171,24 @@ export default function Hotkeys(): null {
         return;
       }
 
-      // ── F1..F4 → minimap layer toggle ─────────────────────────────────────
+      // ── F1 → in-app docs overlay (PRD §14.5) ──────────────────────────────
+      // PRD §14.5 assigns F1 to the in-app docs. We toggle `uiStore.docsOpen`
+      // directly (discrete UI state — convention #3). Shift+F1 keeps the
+      // displaced minimap "size" overlay reachable from the keyboard. When the
+      // docs panel is already open it owns F1/Esc in the capture phase (see
+      // DocsPanel) and stops propagation, so this branch only ever *opens* it.
+      if (e.code === 'F1' && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        if (e.shiftKey) {
+          const layer = SHIFT_F_KEY_LAYERS[e.code];
+          if (layer) emit({ command: 'minimap.toggleLayer', args: { layer } });
+        } else {
+          useUiStore.getState().toggleDocs();
+        }
+        e.preventDefault();
+        return;
+      }
+
+      // ── F2..F4 → minimap layer toggle ─────────────────────────────────────
       const layer = F_KEY_LAYERS[e.code];
       if (layer && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
         emit({ command: 'minimap.toggleLayer', args: { layer } });

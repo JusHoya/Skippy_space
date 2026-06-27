@@ -108,9 +108,22 @@ interface LayerChipProps {
   onClick: () => void;
 }
 
+/**
+ * Display-key override for the legend chips.
+ *
+ * Phase 4 (PRD §14.5) reassigned F1 to the in-app docs overlay, so the `size`
+ * layer was re-homed to Shift+F1 in Hotkeys.tsx. `MINIMAP_LAYER_KEYS` (in
+ * @skippy/shared) still records the historical `size: 'F1'`; rather than widen
+ * that shared constant's type, we override the *label* locally so the chip
+ * matches the live binding. F2–F4 are unchanged.
+ */
+const LAYER_KEY_LABEL: Partial<Record<MinimapLayer, string>> = {
+  size: '⇧F1',
+};
+
 /** A clickable F-key legend chip — the keyboard route is wired by Zone 6. */
 function LayerChip({ layer, active, onClick }: LayerChipProps) {
-  const fkey = MINIMAP_LAYER_KEYS[layer];
+  const fkey = LAYER_KEY_LABEL[layer] ?? MINIMAP_LAYER_KEYS[layer];
   return (
     <button
       type="button"
@@ -173,7 +186,7 @@ export default function MinimapPane() {
     <div className="minimap">
       <div className="panel-header">
         <span>Minimap</span>
-        <span style={{ color: 'var(--c-text-dim)' }}>F1·F2·F3·F4</span>
+        <span style={{ color: 'var(--c-text-dim)' }}>⇧F1·F2·F3·F4</span>
       </div>
       <div className="minimap-canvas">
         <svg

@@ -58,6 +58,11 @@ export default defineConfig({
   },
   use: {
     baseURL: 'http://localhost:5173',
+    // The gallery's Pixi ticker animates continuously and `animations:'disabled'`
+    // only freezes CSS, so a full-page screenshot races the tick. The gallery
+    // honors reduced-motion by rendering a single fixed frame (GalleryTile),
+    // making the visual baselines byte-stable without freezing the live app.
+    reducedMotion: 'reduce',
     trace: 'retain-on-failure',
     video: 'retain-on-failure',
     screenshot: 'only-on-failure',

@@ -12,6 +12,8 @@ export * from './link.js';
 export * from './lint.js';
 // Phase 3.5 (WS-D) — archival->vault mirror (pure filesystem durable fallback).
 export * from './archival-mirror.js';
+// Phase 4 (OQ-D4-04) — provision per-board Letta agents from the charters.
+export * from './letta-bootstrap.js';
 
 import { runIngest, type IngestResult } from './ingest.js';
 import { runDistill, mockDistill, type DistillFn, type DistillResult } from './distill.js';

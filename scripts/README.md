@@ -97,5 +97,52 @@ zod v4); `@skippy/shared` + `@skippy/memory` stay on zod@3.
    `agent_log.md` STILL grows (the mirror fallback). Close Obsidian and confirm
    `obsidian_*` degrades while atomic fs writes keep working.
 
-Letta REST endpoint paths (insert/search/core-memory) are provisional — verify
-against the pinned Letta image during this pass (OQ-D4-01/02/03).
+Letta REST endpoint paths (insert/search/core-memory) were VERIFIED in Phase 4 —
+see `letta-verify.mjs` below (OQ-D4-01/02/03) and `letta-bootstrap.mjs` (OQ-D4-04).
+
+## `letta-verify.mjs` — live Letta REST contract check (OQ-D4-01/02/03)
+
+Round-trips archival **append → search** and a **core-memory edit** against a
+throwaway test agent on a running Letta server, trying the same candidate
+path/verb/body shapes the `@skippy/memory` `LettaClient` falls through, and
+**printing which shape this server accepted**. It cleans up the test agent after.
+
+```powershell
+pnpm validate:letta                 # or: node scripts/letta-verify.mjs
+LETTA_BASE_URL=http://localhost:8283 node scripts/letta-verify.mjs
+```
+
+Verified-current shapes (Letta REST v1, docs.letta.com, June 2026):
+
+| OQ | Operation | Method + path | Body / query |
+|----|-----------|---------------|--------------|
+| D4-01 | archival insert | `POST /v1/agents/{id}/archival-memory` | `{ text }` |
+| D4-02 | archival search | `GET /v1/agents/{id}/archival-memory/search` | `?query=&top_k=` |
+| D4-03 | core-memory edit | `PATCH /v1/agents/{id}/core-memory/blocks/{label}` | `{ value }` |
+
+**Safe in the headless gate:** respects `LETTA_DISABLED=1` (zero network) and, when
+Letta is simply unreachable, **SKIPS with a clear message and exits 0**. It exits
+non-zero only when the server is reachable but a verification step failed. The
+client tries the verified shape first, then falls back through the known legacy
+variants (`/archival/insert`, POST-search, `/memory/block/{label}`) so a `:latest`
+image drift degrades rather than hard-fails.
+
+## `letta-bootstrap.mjs` — provision per-board Letta agents (OQ-D4-04)
+
+Parses every charter under `agent_space/` (`skippy.md`, `boards/*.md`,
+`staff/*.md`), reads each `memory.letta_agent_id` + `memory.core_memory_facts`, and
+**idempotently** ensures that agent exists on the Letta server — creating it (with
+its facts seeded into a `persona` core-memory block) when missing, skipping it when
+already present. Logic lives in
+`packages/memory/src/jobs/letta-bootstrap.ts` (`bootstrapLettaAgents`, unit-tested
+headless); this `.mjs` is a thin launcher that runs it under `tsx`.
+
+```powershell
+pnpm letta:bootstrap                # or: node scripts/letta-bootstrap.mjs
+node scripts/letta-bootstrap.mjs --agent-space=/path/to/agent_space
+```
+
+**Graceful:** when Letta is down or `LETTA_DISABLED=1`, it does no network work and
+**exits 0** (clear "skipped" message). It exits non-zero **only** when the server is
+reachable but a create/list op failed — the one operator-actionable condition.
+Replaces the Phase 3.5 manual "pre-create each board agent" checklist step.

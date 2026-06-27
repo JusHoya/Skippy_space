@@ -11,6 +11,47 @@ authoritative for *when* something shipped.
 
 ---
 
+## [Unreleased] — Phase 4 polish (2026-06-26)
+
+"Polish + Ship" (PRD §14.5), buildable subset. Ship infrastructure (EV
+code-signing, auto-updater endpoint, v1.0 release) is deferred — it needs a real
+Azure Key Vault cert + hosted update endpoint that can't be provisioned
+headlessly — and stays TODO in §14.5. Landed via an orchestrated agent team
+(sprites / UI / Letta in parallel, then integration + gate). New gate:
+`pnpm validate:phase4` (26/26 green); `validate:phase3.5` re-run proves zero
+regression.
+
+- **Sprite v1 — generative polish** (`packages/sprite-kit`): metal/3D beercan
+  body (`paintBrushedMetal`, rim/lip, LED + antenna glow halos), per-board
+  costume distinction, and a richer animation FSM (`tick.ts`). 100% procedural
+  PixiJS `Graphics` — no binary atlas (resolves the OQ-02 contradiction in favor
+  of "generative throughout"). The gallery (`?gallery`) gained an
+  animation-state showcase row.
+- **Onboarding flow** (`apps/ui/src/hud/Onboarding.tsx`): a first-run
+  Skippy-voiced overlay (intro → scanned-CLAUDE.md summary → one-click sample
+  mission), gated on a `localStorage` flag, re-openable from the TopBar ★.
+- **In-app docs on F1** (`apps/ui/src/hud/DocsPanel.tsx`): searchable help
+  overlay. F1 was a minimap-layer toggle (`size`); it's reassigned to docs and
+  the `size` layer re-homed to **Shift+F1** (F2–F4 unchanged).
+- **Letta carryover resolved — OQ-D4-01..04.** The REST client
+  (`packages/memory/src/letta-client.ts`) is hardened to the verified current
+  Letta v1 contract (`archival-memory` insert/search, `core-memory/blocks` edit)
+  with graceful legacy fallbacks; added `listAgents`/`createAgent`. New
+  `letta-bootstrap` job (`pnpm letta:bootstrap`) idempotently provisions per-board
+  agents from the charters, and `pnpm validate:letta` (`scripts/letta-verify.mjs`)
+  live-checks the contract — both skip cleanly (exit 0) when Letta is down.
+- **Visual-test hardening** (`tests/visual/gallery.spec.ts`): the gallery spec
+  now gates on a deterministic `data-painted` readiness flag and drops the
+  full-roster pixel baseline (two large-glow procedural cans render with GPU
+  sub-pixel non-determinism — a ~12% two-tile noise floor that exceeds the signal
+  of a real regression). Per-tile pixel coverage stays via `skippy-speaking.png`;
+  Playwright runs under `reducedMotion` so the gallery freezes to a fixed frame.
+- **Docs:** PRD §14.5 split into landed-polish vs deferred-ship; OQ-02 +
+  OQ-D4-01..04 marked resolved; `scripts/README.md` documents the new Letta
+  scripts.
+
+---
+
 ## [Unreleased] — Review remediation (2026-06-10 → 2026-06-11)
 
 A multi-agent comprehensive review (`docs/REVIEW-2026-06-10.md`: 1 critical, 17

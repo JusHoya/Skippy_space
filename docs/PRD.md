@@ -856,14 +856,35 @@ bootstrap), tracked in §16.
 
 ### 14.5 Phase 4 — Polish + Ship (week 11–13)
 
+**Polish (landed 2026-06-26):**
+
+- [x] Onboarding flow (CLAUDE.md scan, first-run skippy intro, sample mission).
+      `apps/ui/src/hud/Onboarding.tsx` — Skippy-voiced first-run overlay (intro →
+      scanned-CLAUDE.md summary → one-click sample mission delegating to a board),
+      gated on a `localStorage` first-run flag, re-openable from the TopBar ★.
+- [x] In-app docs (open at any time, **F1**). `apps/ui/src/hud/DocsPanel.tsx` —
+      searchable overlay (keybindings, the eight boards, launching a mission,
+      the Iron Law). **F1 reconciliation:** F1 was previously a minimap-layer
+      toggle (`size`); Phase 4 reassigns F1 → docs and re-homes the `size` layer
+      to **Shift+F1** (F2–F4 unchanged), preserving muscle memory for three of
+      four layers (`apps/ui/src/hud/Hotkeys.tsx`).
+- [x] Sprite v1 — **generative/procedural polish** (per OQ-02, *not* a
+      commissioned atlas): metal/3D beercan body, per-board costume distinction,
+      richer animation FSM. 100% PixiJS `Graphics`, no binary assets
+      (`packages/sprite-kit`).
+- [x] Letta carryover resolved (OQ-D4-01..04): hardened/verified REST client,
+      `pnpm validate:letta`, and the `letta-bootstrap` provisioning job.
+
+**Ship (deferred — needs a real EV cert + hosted update endpoint):**
+
 - [ ] EV code-signing pipeline (Azure Key Vault).
-- [ ] Tauri auto-updater.
-- [ ] Onboarding flow (CLAUDE.md scan, first-run skippy intro, sample mission).
-- [ ] In-app docs (open at any time, F1).
-- [ ] Sprite v1 (commissioned hand-pixeled).
+- [ ] Tauri auto-updater (plugin still commented out in `apps/shell/src-tauri/src/lib.rs`).
 - [ ] v1.0 release; announce in Hoya_Box README.
 
-**Exit criterion:** v1.0 build runs on a clean Windows 11 install with `winget install` of dependencies, signed installer, no SmartScreen warnings.
+**Exit criterion (polish):** `pnpm validate:phase4` is green (26/26) and
+re-running `pnpm validate:phase3.5` proves zero regression on the gated path.
+**Exit criterion (ship):** v1.0 build runs on a clean Windows 11 install with
+`winget install` of dependencies, signed installer, no SmartScreen warnings.
 
 ### 14.6 v1.1+ (post-ship)
 
@@ -899,7 +920,7 @@ bootstrap), tracked in §16.
 | ID | Question | Tentative answer |
 |---|---|---|
 | **OQ-01** | Should `psych-monitor` be a Staff Officer or under Research? | Staff Officer with read-access across boards. | 
-| **OQ-02** | Generative AI sprites or commissioned artist for v1? | Generative throughout project
+| **OQ-02** | Generative AI sprites or commissioned artist for v1? | **Resolved (Phase 4): generative throughout.** v1 ships the *procedural* beercans — every pixel drawn from PixiJS v8 `Graphics` (`packages/sprite-kit`), no binary atlas, no commissioned art. "Sprite v1" in §14.5 means the procedural polish pass (metal/3D body, per-board costume distinction, animation FSM), NOT a hand-pixeled atlas. The `createBeercan` API stays atlas-swappable behind `BeercanRefs` if a future version wants commissioned art, but that is explicitly out of v1 scope. (This supersedes the "commissioned hand-pixeled" wording that lingered in the §14.5 checklist.)
 | **OQ-03** | Run Letta inside the Tauri sidecar or as a separate Docker container? | Docker container in v0; consider embedding in v1.x.
 | **OQ-04** | n8n: bundle (run on user machine) or require user to install separately? | Require separate install + document; bundle would balloon the installer.
 | **OQ-05** | Voice-to-task: in v1.0 or v1.1? | v1.1 — keep v1.0 scope tight. 
@@ -913,10 +934,10 @@ bootstrap), tracked in §16.
 | **OQ-13** | What's the smallest possible v0 demo to validate the RTS-feel hypothesis with the user? | Phase 0 + a single board with a two sprites walking to a seperate file pedestals. Aim for end-of-week-2.
 | **OQ-14** | Should the app's window title use Skippy-voice ("Skippy is, in fact, magnificent")? | Yes. Default on; toggle off in settings. 
 | **OQ-18** | How / how often do we refresh the pinned per-model pricing + context-window tables the cost meter and pressure bar bill against? | **Pinned 2026-06-03; refresh quarterly with R-02.** The figures live wrapped in DTOs (`packages/shared/src/pricing.ts` `MODEL_PRICING`, `packages/shared/src/model-limits.ts` `MODEL_CONTEXT_LIMITS`) so a bump is a one-file edit and never leaks model-specific arithmetic into call sites. Refresh both together whenever Anthropic changes list pricing or window sizes. (OQ ids 15–17 were never assigned; this id is referenced from the pricing/limits source comments.)
-| **OQ-D4-01** | Are the Letta REST endpoint **paths** for archival *insert* correct against the pinned Letta image? | **Provisional — verify live (Phase 3.5 carryover).** Implemented in `packages/memory/src/letta-client.ts`; confirm against the pinned `letta/letta` image during the §14.45 manual live-validation pass. The board never hard-fails on a wrong path — the archival→vault mirror keeps the durable record (`scripts/README.md`).
-| **OQ-D4-02** | Are the Letta REST endpoint **paths** for archival *search* correct against the pinned Letta image? | **Provisional — verify live (Phase 3.5 carryover).** Same as OQ-D4-01: `letta_search_archival` round-trips are checked during the §14.45 live pass; degrades to `isError` when Letta is down.
-| **OQ-D4-03** | Are the Letta REST endpoint **paths** for *core-memory* edits correct against the pinned Letta image? | **Provisional — verify live (Phase 3.5 carryover).** Same as OQ-D4-01/02 for `letta_edit_core`.
-| **OQ-D4-04** | Who bootstraps the per-board Letta agents (`bd_research_v1`, …)? Is there an automated provisioning job? | **No bootstrap job yet (Phase 3.5 carryover).** Today each board agent is pre-created by hand before a live run (`scripts/README.md` step 1). A `letta-bootstrap` job that provisions agents from charter `memory.letta_agent_id` is deferred to a Phase 3.x / Phase 4 follow-up.
+| **OQ-D4-01** | Are the Letta REST endpoint **paths** for archival *insert* correct against the pinned Letta image? | **Resolved (Phase 4) — verified + hardened.** `letta-client.ts` uses `POST /v1/agents/{id}/archival-memory` `{text}` (verified against the current Letta REST v1 docs, 2026-06), with graceful fallback to legacy `/archival/insert` + `{content}` on a shape/path rejection. Live round-trip is reproducible via `pnpm validate:letta` (`scripts/letta-verify.mjs`), which skips cleanly when Letta is down. The archival→vault mirror still keeps the durable record regardless.
+| **OQ-D4-02** | Are the Letta REST endpoint **paths** for archival *search* correct against the pinned Letta image? | **Resolved (Phase 4) — verified + hardened.** Uses `GET /v1/agents/{id}/archival-memory/search?query=&top_k=`, normalizing `{results:[{content}]}`, with fallback to the legacy POST-search routes. Script-verifiable via `pnpm validate:letta`; degrades to `isError` when Letta is down.
+| **OQ-D4-03** | Are the Letta REST endpoint **paths** for *core-memory* edits correct against the pinned Letta image? | **Resolved (Phase 4) — verified.** `PATCH /v1/agents/{id}/core-memory/blocks/{label}` `{value}` confirmed against the current docs; fallbacks (`POST` same path, `PATCH /memory/block/{label}`) added. Script-verifiable via `pnpm validate:letta`.
+| **OQ-D4-04** | Who bootstraps the per-board Letta agents (`bd_research_v1`, …)? Is there an automated provisioning job? | **Resolved (Phase 4).** `bootstrapLettaAgents()` (`packages/memory/src/jobs/letta-bootstrap.ts`, CLI `pnpm letta:bootstrap`) parses every charter (`skippy.md`, `boards/*.md`, `staff/*.md`), reads `memory.letta_agent_id` + `memory.core_memory_facts`, and idempotently creates each missing agent (facts seeded into a persona block). Replaces the manual "pre-create each board agent" step; degrades to a clean exit-0 skip when Letta is down or `LETTA_DISABLED=1`. *Note:* `infra/letta/docker-compose.yml` still pins `:latest` — the client's fallback chain absorbs version drift until a concrete tag is pinned.
 
 ---
 

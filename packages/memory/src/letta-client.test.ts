@@ -12,8 +12,76 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer, type IncomingMessage, type Server } from 'node:http';
 
 import { LettaClient } from './letta-client.js';
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stub-server harness — a node:http server whose handler decides each response, with
+// every request (method + path + parsed body) recorded so endpoint-fallback tests can
+// assert exactly which route/verb/body the client used. Mirrors the inline servers in
+// the status() tests but reusable across the endpoint-contract tests below.
+// ──────────────────────────────────────────────────────────────────────────────
+
+interface RecordedReq {
+  method: string;
+  path: string;
+  body: unknown;
+}
+
+type Handler = (req: RecordedReq) => { status: number; json?: unknown };
+
+async function stubServer(handler: Handler): Promise<{
+  client: LettaClient;
+  requests: RecordedReq[];
+  close: () => Promise<void>;
+}> {
+  const requests: RecordedReq[] = [];
+  const server: Server = createServer((req: IncomingMessage, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (c) => chunks.push(c as Buffer));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let body: unknown = null;
+      try {
+        body = raw.length > 0 ? JSON.parse(raw) : null;
+      } catch {
+        body = raw;
+      }
+      const rec: RecordedReq = { method: req.method ?? '', path: req.url ?? '', body };
+      requests.push(rec);
+      const out = handler(rec);
+      res.statusCode = out.status;
+      if (out.json !== undefined) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify(out.json));
+      } else {
+        res.end();
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+  const client = new LettaClient({ baseUrl: `http://127.0.0.1:${port}`, timeoutMs: 1000 });
+  return {
+    client,
+    requests,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+function withoutKillSwitch(fn: () => Promise<void>): () => Promise<void> {
+  return async () => {
+    const prev = process.env.LETTA_DISABLED;
+    delete process.env.LETTA_DISABLED;
+    try {
+      await fn();
+    } finally {
+      if (prev !== undefined) process.env.LETTA_DISABLED = prev;
+    }
+  };
+}
 
 // Port 9 (discard) is effectively never listening; fetch → ECONNREFUSED fast.
 // A short timeout keeps the test snappy even if the OS slow-fails the connect.
@@ -188,3 +256,151 @@ test('LettaClient.status(): a healthy server → "connected" (and available() tr
     if (prev !== undefined) process.env.LETTA_DISABLED = prev;
   }
 });
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Endpoint contract (OQ-D4-01/02/03) — the VERIFIED-current shapes are tried first;
+// known legacy variants are tried only on a shape/path rejection (404/405/422); a
+// transport failure or hard status does NOT fan out across candidates.
+// ──────────────────────────────────────────────────────────────────────────────
+
+test('appendArchival: uses POST /archival-memory {text} on a modern server', withoutKillSwitch(async () => {
+  const srv = await stubServer((req) => {
+    if (req.method === 'POST' && req.path === '/v1/agents/bd_research_v1/archival-memory') {
+      return { status: 200, json: [{ id: 'passage-1' }] };
+    }
+    return { status: 404, json: { error: 'not found' } };
+  });
+  try {
+    const res = await srv.client.appendArchival('bd_research_v1', 'a fact');
+    assert.equal(res.ok, true);
+    if (res.ok) assert.equal(res.data.id, 'passage-1');
+    // Exactly one request — the verified path won on the first try.
+    assert.equal(srv.requests.length, 1);
+    assert.deepEqual(srv.requests[0]?.body, { text: 'a fact' });
+  } finally {
+    await srv.close();
+  }
+}));
+
+test('appendArchival: falls back to legacy /archival/insert when modern path 404s', withoutKillSwitch(async () => {
+  const srv = await stubServer((req) => {
+    if (req.path === '/v1/agents/a1/archival-memory') return { status: 404, json: { error: 'gone' } };
+    if (req.path === '/v1/agents/a1/archival/insert') return { status: 200, json: { id: 'legacy-1' } };
+    return { status: 500 };
+  });
+  try {
+    const res = await srv.client.appendArchival('a1', 'x');
+    assert.equal(res.ok, true);
+    if (res.ok) assert.equal(res.data.id, 'legacy-1');
+    // First candidate 404'd → fell through to the legacy insert route.
+    assert.equal(srv.requests.length, 2);
+    assert.equal(srv.requests[1]?.path, '/v1/agents/a1/archival/insert');
+  } finally {
+    await srv.close();
+  }
+}));
+
+test('searchArchival: GET /archival-memory/search wins; results normalized from {results:[{content}]}', withoutKillSwitch(async () => {
+  const srv = await stubServer((req) => {
+    if (req.method === 'GET' && req.path.startsWith('/v1/agents/a1/archival-memory/search')) {
+      return { status: 200, json: { count: 1, results: [{ id: 'p1', content: 'plasma fact' }] } };
+    }
+    return { status: 404 };
+  });
+  try {
+    const res = await srv.client.searchArchival('a1', 'plasma', 5);
+    assert.equal(res.ok, true);
+    if (res.ok) {
+      assert.equal(res.data.results.length, 1);
+      assert.equal(res.data.results[0]?.text, 'plasma fact');
+    }
+    // The query went on the URL (GET), not a body.
+    assert.match(srv.requests[0]?.path ?? '', /query=plasma/);
+    assert.match(srv.requests[0]?.path ?? '', /top_k=5/);
+    assert.equal(srv.requests.length, 1);
+  } finally {
+    await srv.close();
+  }
+}));
+
+test('editCore: PATCH core-memory/blocks/{label} {value} on a modern server', withoutKillSwitch(async () => {
+  const srv = await stubServer((req) => {
+    if (req.method === 'PATCH' && req.path === '/v1/agents/a1/core-memory/blocks/persona') {
+      return { status: 200, json: { label: 'persona', value: 'new' } };
+    }
+    return { status: 404 };
+  });
+  try {
+    const res = await srv.client.editCore('a1', 'persona', 'new');
+    assert.equal(res.ok, true);
+    assert.equal(srv.requests.length, 1);
+    assert.deepEqual(srv.requests[0]?.body, { value: 'new' });
+  } finally {
+    await srv.close();
+  }
+}));
+
+test('a transport failure does NOT fan out across all candidates (fast degrade)', withoutKillSwitch(async () => {
+  // Unreachable host: the first candidate fails at the transport level (status
+  // undefined), so the client must stop immediately rather than dialing all three.
+  const client = new LettaClient({ baseUrl: 'http://127.0.0.1:9', timeoutMs: 400 });
+  const started = Date.now();
+  const res = await client.appendArchival('a1', 'x');
+  assert.equal(res.ok, false);
+  // Three sequential 400ms timeouts would be ≥1200ms; one is well under.
+  assert.ok(Date.now() - started < 900, `expected a single transport attempt, took ${Date.now() - started}ms`);
+}));
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Agent provisioning helpers (OQ-D4-04) — listAgents / createAgent.
+// ──────────────────────────────────────────────────────────────────────────────
+
+test('listAgents: GET /v1/agents?name= and normalizes {id,name}', withoutKillSwitch(async () => {
+  const srv = await stubServer((req) => {
+    if (req.method === 'GET' && req.path.startsWith('/v1/agents')) {
+      return { status: 200, json: [{ id: 'agent-1', name: 'bd_research_v1', extra: 'ignored' }] };
+    }
+    return { status: 404 };
+  });
+  try {
+    const res = await srv.client.listAgents('bd_research_v1');
+    assert.equal(res.ok, true);
+    if (res.ok) {
+      assert.equal(res.data.length, 1);
+      assert.deepEqual(res.data[0], { id: 'agent-1', name: 'bd_research_v1' });
+    }
+    assert.match(srv.requests[0]?.path ?? '', /name=bd_research_v1/);
+  } finally {
+    await srv.close();
+  }
+}));
+
+test('createAgent: POST /v1/agents with name + memory_blocks; returns {id,name}', withoutKillSwitch(async () => {
+  const srv = await stubServer((req) => {
+    if (req.method === 'POST' && req.path === '/v1/agents') {
+      return { status: 200, json: { id: 'agent-9', name: 'bd_research_v1' } };
+    }
+    return { status: 404 };
+  });
+  try {
+    const res = await srv.client.createAgent({
+      name: 'bd_research_v1',
+      memoryBlocks: [{ label: 'persona', value: 'I am Research.' }],
+    });
+    assert.equal(res.ok, true);
+    if (res.ok) assert.deepEqual(res.data, { id: 'agent-9', name: 'bd_research_v1' });
+    const body = srv.requests[0]?.body as Record<string, unknown>;
+    assert.equal(body.name, 'bd_research_v1');
+    assert.deepEqual(body.memory_blocks, [{ label: 'persona', value: 'I am Research.' }]);
+  } finally {
+    await srv.close();
+  }
+}));
+
+test('listAgents/createAgent degrade to {ok:false} against an unreachable host', withoutKillSwitch(async () => {
+  const client = new LettaClient({ baseUrl: 'http://127.0.0.1:9', timeoutMs: 500 });
+  const list = await client.listAgents('x');
+  assert.equal(list.ok, false);
+  const create = await client.createAgent({ name: 'x' });
+  assert.equal(create.ok, false);
+}));

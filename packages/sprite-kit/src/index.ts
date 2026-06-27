@@ -14,7 +14,7 @@ export type { AnimationState } from './states';
 export { ANIMATION_STATES, isAnimationState } from './states';
 
 export type { BeercanRefs, CreateBeercanOpts } from './beercan';
-export { createBeercan } from './beercan';
+export { createBeercan, paintBrushedMetal } from './beercan';
 
 export type {
   Costume,

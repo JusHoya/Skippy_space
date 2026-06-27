@@ -20,9 +20,25 @@
 // ZERO network I/O — for offline CI, the exit-gate validators, and any run that must
 // not touch :8283. `available()` likewise returns false immediately in that mode.
 //
-// ENDPOINTS (Letta REST, v1): several are flagged PROVISIONAL below — Letta's archival
-// body shape and core-memory verb/path have shifted across releases, so we encode our
-// best current guess and mark each with a TODO to reconcile against the live server.
+// ENDPOINTS (Letta REST, v1): VERIFIED 2026-06 against the current Letta server REST
+// API (docs.letta.com, the line `infra/letta/docker-compose.yml` pins via
+// `letta/letta:latest`). Paths confirmed:
+//   - archival INSERT  → POST  /v1/agents/{id}/archival-memory          body { text }
+//       https://docs.letta.com/api/python/resources/agents/subresources/passages/methods/create
+//   - archival SEARCH  → GET   /v1/agents/{id}/archival-memory/search   ?query=&top_k=
+//       https://docs.letta.com/api/python/resources/agents/subresources/passages/methods/search/
+//   - core-memory EDIT → PATCH /v1/agents/{id}/core-memory/blocks/{label}  body { value }
+//       https://docs.letta.com/api/resources/agents/subresources/blocks/methods/update/
+//   - agent CREATE     → POST  /v1/agents                                body { name, memory_blocks }
+//       https://docs.letta.com/api/resources/agents/methods/create/
+//   - agent LIST       → GET   /v1/agents                                ?name=
+//       https://docs.letta.com/api/resources/agents/methods/list/
+// Letta's archival path/body and core-memory verb HAVE drifted across releases
+// (older builds used POST /archival/insert + /archival/search with {content}/{limit},
+// and /memory/block/{label}). Because the compose tag is the floating `:latest`, each
+// write method below tries the VERIFIED-current shape FIRST and then falls back through
+// the known legacy variants — so a version drift degrades (a fallback path may still
+// answer) rather than hard-failing. Every method stays non-throwing and zod-free.
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Result type — mirrors the {ok}-discriminated style used across @skippy/memory
@@ -65,6 +81,34 @@ export interface ArchivalHit {
   text: string;
   source?: string;
 }
+
+/** A minimal agent record (id + human-readable name), normalized from list/create. */
+export interface LettaAgentSummary {
+  /** Letta's DB id (e.g. `agent-<uuid>`). May be '' if a create response omits it. */
+  id: string;
+  /** The agent's human handle (matches a charter's `memory.letta_agent_id`). */
+  name: string;
+}
+
+/** One core-memory block to seed at agent-create time (e.g. persona/human). */
+export interface MemoryBlockSpec {
+  label: string;
+  value: string;
+}
+
+/** Spec for {@link LettaClient.createAgent}. Only `name` is required; the server
+ * applies its configured default LLM + embedding when `model`/`embedding` are
+ * omitted, which is the usual self-hosted path. */
+export interface CreateAgentSpec {
+  name: string;
+  memoryBlocks?: MemoryBlockSpec[];
+  model?: string;
+  embedding?: string;
+}
+
+/** HTTP statuses that mean "the server answered but rejected this route/body" — the
+ * only case where trying the next (legacy) endpoint variant can succeed. */
+const RETRYABLE_SHAPE = new Set([400, 404, 405, 415, 422]);
 
 /**
  * A best-effort client for the Letta REST API. Construct it freely even when Letta
@@ -147,70 +191,157 @@ export class LettaClient {
   }
 
   /**
-   * Search an agent's archival memory. POST /v1/agents/{agentId}/archival/search
-   * with `{ query, limit }`. Returns normalized `{ results }`. The response shape
-   * varies across Letta versions (a bare array, `{ results: [...] }`, or passages
-   * with a `text`/`content` field), so we map defensively to `ArchivalHit[]`.
+   * Search an agent's archival memory. VERIFIED current shape:
+   * GET /v1/agents/{agentId}/archival-memory/search?query=&top_k= → `{ results }`.
+   *
+   * Falls back to the legacy POST shapes (`/archival/search` and
+   * `/archival-memory/search` with a `{ query, limit }` body) when the current path
+   * 404/405/422s, so a drifted server still answers. The response shape varies across
+   * versions (a bare array, `{ results: [...] }`, `{ passages: [...] }`, or passages
+   * carrying a `text`/`content` field), so we map defensively to `ArchivalHit[]`.
    */
   async searchArchival(
     agentId: string,
     query: string,
     limit = 10,
   ): Promise<LettaResult<{ results: ArchivalHit[] }>> {
-    const res = await this.request(
-      'POST',
-      `/v1/agents/${encodeURIComponent(agentId)}/archival/search`,
-      { query, limit },
-    );
+    const id = encodeURIComponent(agentId);
+    const res = await this.requestFirstOk([
+      // VERIFIED 2026-06: GET archival-memory/search with query params.
+      { method: 'GET', path: withQuery(`/v1/agents/${id}/archival-memory/search`, { query, top_k: limit }) },
+      // Legacy POST variants (pre-rename / POST-search builds).
+      { method: 'POST', path: `/v1/agents/${id}/archival-memory/search`, body: { query, top_k: limit } },
+      { method: 'POST', path: `/v1/agents/${id}/archival/search`, body: { query, limit } },
+    ]);
     if (!res.ok) return { ok: false, error: res.error };
     return { ok: true, data: { results: normalizeArchivalHits(res.json) } };
   }
 
   /**
-   * Append a passage to an agent's archival memory.
-   * POST /v1/agents/{agentId}/archival/insert with `{ text }`.
+   * Append a passage to an agent's archival memory. VERIFIED current shape:
+   * POST /v1/agents/{agentId}/archival-memory with `{ text }`.
    *
-   * TODO(letta-provisional): Letta v1's archival insert body shape has drifted
-   * across releases (`{ text }` vs `{ content }` vs `{ memory: { ... } }`). We send
-   * `{ text }` first as the most common contract; reconcile against the live server
-   * and widen if a 422 surfaces.
+   * Falls back through the known legacy variants — the older `/archival/insert`
+   * route and the `{ content }` body shape — when the current path/shape 404/405/422s,
+   * so a drifted server still writes. The insert response (often the created passage,
+   * sometimes an array of them) may or may not carry an id; we extract it defensively.
    */
   async appendArchival(
     agentId: string,
     text: string,
   ): Promise<LettaResult<{ id?: string }>> {
-    const res = await this.request(
-      'POST',
-      `/v1/agents/${encodeURIComponent(agentId)}/archival/insert`,
-      { text },
-    );
+    const id = encodeURIComponent(agentId);
+    const res = await this.requestFirstOk([
+      // VERIFIED 2026-06: POST archival-memory with { text }.
+      { method: 'POST', path: `/v1/agents/${id}/archival-memory`, body: { text } },
+      // Legacy route (pre-rename builds).
+      { method: 'POST', path: `/v1/agents/${id}/archival/insert`, body: { text } },
+      // Body-shape variant some releases used (`content` instead of `text`).
+      { method: 'POST', path: `/v1/agents/${id}/archival-memory`, body: { content: text } },
+    ]);
     if (!res.ok) return { ok: false, error: res.error };
-    // The insert response (often the created passage) may or may not carry an id.
-    const id = extractId(res.json);
-    return { ok: true, data: id !== undefined ? { id } : {} };
+    const newId = extractId(res.json);
+    return { ok: true, data: newId !== undefined ? { id: newId } : {} };
   }
 
   /**
-   * Replace the value of a core-memory block (always-in-context memory).
-   * PATCH /v1/agents/{agentId}/core-memory/blocks/{block} with `{ value }`.
+   * Replace the value of a core-memory block (always-in-context memory). VERIFIED
+   * current shape: PATCH /v1/agents/{agentId}/core-memory/blocks/{block} with
+   * `{ value }`.
    *
-   * TODO(letta-provisional): the exact path AND verb for core-block edits have
-   * varied (`/core-memory/blocks/{label}` PATCH vs `/memory/block/{label}` POST vs a
-   * label query param). We encode PATCH + `/core-memory/blocks/{block}` as the
-   * current best guess; reconcile against the live server.
+   * Falls back through the known legacy verb/path variants (POST same path, and
+   * PATCH `/memory/block/{label}`) when the current shape 404/405/422s, so a drifted
+   * server still applies the edit.
    */
   async editCore(
     agentId: string,
     block: string,
     value: string,
   ): Promise<LettaResult<unknown>> {
-    const res = await this.request(
-      'PATCH',
-      `/v1/agents/${encodeURIComponent(agentId)}/core-memory/blocks/${encodeURIComponent(block)}`,
-      { value },
-    );
+    const id = encodeURIComponent(agentId);
+    const b = encodeURIComponent(block);
+    const res = await this.requestFirstOk([
+      // VERIFIED 2026-06: PATCH core-memory/blocks/{label} with { value }.
+      { method: 'PATCH', path: `/v1/agents/${id}/core-memory/blocks/${b}`, body: { value } },
+      // Verb variant some proxies/builds accept.
+      { method: 'POST', path: `/v1/agents/${id}/core-memory/blocks/${b}`, body: { value } },
+      // Legacy path (pre-rename builds).
+      { method: 'PATCH', path: `/v1/agents/${id}/memory/block/${b}`, body: { value } },
+    ]);
     if (!res.ok) return { ok: false, error: res.error };
     return { ok: true, data: res.json };
+  }
+
+  /**
+   * List agents on the server, optionally filtered by `name` (exact-name query).
+   * GET /v1/agents?name= → `LettaAgentSummary[]`. Used by the letta-bootstrap job to
+   * decide whether a board's agent already exists (idempotent provisioning). Returns
+   * `{ ok: false }` — never throws — when Letta is down/disabled. The response is a
+   * bare array of agent objects each carrying `id` + `name`; we map defensively.
+   */
+  async listAgents(name?: string): Promise<LettaResult<LettaAgentSummary[]>> {
+    const path =
+      name !== undefined && name.length > 0
+        ? withQuery('/v1/agents', { name })
+        : '/v1/agents';
+    const res = await this.request('GET', path);
+    if (!res.ok) return { ok: false, error: res.error };
+    return { ok: true, data: normalizeAgentSummaries(res.json) };
+  }
+
+  /**
+   * Create an agent. VERIFIED current shape: POST /v1/agents with
+   * `{ name, memory_blocks: [{ label, value }] }` (the server applies its own
+   * configured default LLM + embedding when those fields are omitted). Returns the
+   * created agent's `{ id, name }`. Used by letta-bootstrap to provision a board's
+   * agent when `listAgents(name)` finds none. Non-throwing; `{ ok: false }` when Letta
+   * is down/disabled or the create is rejected.
+   */
+  async createAgent(spec: CreateAgentSpec): Promise<LettaResult<LettaAgentSummary>> {
+    const body: Record<string, unknown> = { name: spec.name };
+    if (spec.memoryBlocks && spec.memoryBlocks.length > 0) {
+      body.memory_blocks = spec.memoryBlocks.map((b) => ({ label: b.label, value: b.value }));
+    }
+    if (spec.model !== undefined) body.model = spec.model;
+    if (spec.embedding !== undefined) body.embedding = spec.embedding;
+    const res = await this.request('POST', '/v1/agents', body);
+    if (!res.ok) return { ok: false, error: res.error };
+    const summary = normalizeAgentSummary(res.json);
+    if (summary === undefined) {
+      // A 2xx with an unrecognizable body still means the agent was created; surface
+      // the name we asked for so the caller can proceed (id is best-effort).
+      return { ok: true, data: { id: extractId(res.json) ?? '', name: spec.name } };
+    }
+    return { ok: true, data: summary };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Fallback driver — try a sequence of (method, path, body) candidates, returning
+  // the first 2xx. Continues to the next candidate ONLY on a "wrong shape/path"
+  // status (the server answered but rejected the route or body: 400/404/405/415/422).
+  // A transport failure (status undefined → server down/timeout) stops immediately —
+  // every candidate would fail the same way and burn a full timeout each. A hard
+  // status (401/403/5xx) likewise stops: a different path won't fix auth or a crash.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  private async requestFirstOk(
+    candidates: Array<{ method: string; path: string; body?: unknown }>,
+  ): Promise<
+    | { ok: true; status: number; json: unknown }
+    | { ok: false; status?: number; error: string }
+  > {
+    let last: { ok: false; status?: number; error: string } = {
+      ok: false,
+      error: 'no request attempted',
+    };
+    for (const c of candidates) {
+      const res = await this.request(c.method, c.path, c.body);
+      if (res.ok) return res;
+      last = res;
+      // Only a recoverable shape/path rejection is worth another candidate.
+      if (res.status === undefined || !RETRYABLE_SHAPE.has(res.status)) break;
+    }
+    return last;
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -325,6 +456,51 @@ function pickArray(json: unknown): unknown[] {
     if (Array.isArray(o['passages'])) return o['passages'];
   }
   return [];
+}
+
+/**
+ * Coerce a Letta list-agents response into `LettaAgentSummary[]`. Accepts a bare
+ * array OR a `{ agents: [...] }` / `{ results: [...] }` wrapper, mapping any element
+ * carrying a string `id`/`name` through {@link normalizeAgentSummary}. Unrecognized
+ * rows are dropped rather than throwing.
+ */
+function normalizeAgentSummaries(json: unknown): LettaAgentSummary[] {
+  const rows = Array.isArray(json)
+    ? json
+    : typeof json === 'object' && json !== null
+      ? (Array.isArray((json as Record<string, unknown>)['agents'])
+          ? ((json as Record<string, unknown>)['agents'] as unknown[])
+          : Array.isArray((json as Record<string, unknown>)['results'])
+            ? ((json as Record<string, unknown>)['results'] as unknown[])
+            : [])
+      : [];
+  const out: LettaAgentSummary[] = [];
+  for (const row of rows) {
+    const s = normalizeAgentSummary(row);
+    if (s !== undefined) out.push(s);
+  }
+  return out;
+}
+
+/** Map a single agent object to `{ id, name }`, or undefined if it has neither. */
+function normalizeAgentSummary(json: unknown): LettaAgentSummary | undefined {
+  if (typeof json !== 'object' || json === null) return undefined;
+  const o = json as Record<string, unknown>;
+  const id = typeof o['id'] === 'string' ? o['id'] : undefined;
+  const name = typeof o['name'] === 'string' ? o['name'] : undefined;
+  if (id === undefined && name === undefined) return undefined;
+  return { id: id ?? '', name: name ?? '' };
+}
+
+/** Append a query string to a path, URL-encoding values and skipping undefined ones.
+ * Numbers/booleans are stringified. No leading `?` is added when nothing applies. */
+function withQuery(path: string, params: Record<string, string | number | undefined>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined) continue;
+    parts.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+  }
+  return parts.length > 0 ? `${path}?${parts.join('&')}` : path;
 }
 
 /** Pull an `id` out of an insert response (object or `{ id }`-bearing array head). */

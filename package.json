@@ -30,7 +30,10 @@
     "validate:phase2": "node scripts/phase2-validate.mjs",
     "validate:phase3": "node scripts/phase3-validate.mjs",
     "validate:phase3.5": "node scripts/phase3p5-validate.mjs",
-    "validate:boot": "node scripts/boot-smoke.mjs"
+    "validate:phase4": "node scripts/phase4-validate.mjs",
+    "validate:letta": "node scripts/letta-verify.mjs",
+    "validate:boot": "node scripts/boot-smoke.mjs",
+    "letta:bootstrap": "node scripts/letta-bootstrap.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

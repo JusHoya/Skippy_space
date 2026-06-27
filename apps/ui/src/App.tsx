@@ -6,6 +6,8 @@ import MinimapPane from './hud/MinimapPane';
 import CommandBar from './hud/CommandBar';
 import Hotkeys from './hud/Hotkeys';
 import ReplayScrubber from './hud/ReplayScrubber';
+import Onboarding from './hud/Onboarding';
+import DocsPanel from './hud/DocsPanel';
 import SceneRoot from './scene/SceneRoot';
 import SpriteGallery from './gallery/SpriteGallery';
 
@@ -35,6 +37,11 @@ function MainHud() {
       <TerminalCluster />
       <MinimapPane />
       <ReplayScrubber />
+      {/* Phase 4 (PRD §14.5): first-run intro + F1 docs. Both are dormant
+          overlays — they render null until their uiStore flag flips, so they
+          never touch the boot path once onboarding has been seen. */}
+      <Onboarding />
+      <DocsPanel />
     </div>
   );
 }

@@ -17,6 +17,8 @@ export default function TopBar() {
   const togglePaused = useUiStore((s) => s.togglePaused);
   const skippyModel = useModelStore((s) => s.skippyModel);
   const setSkippyModel = useModelStore((s) => s.setSkippyModel);
+  const openDocs = useUiStore((s) => s.openDocs);
+  const openOnboarding = useUiStore((s) => s.openOnboarding);
   const lastTokPerSec = useTelemetryStore((s) => s.lastTokPerSec);
   const skippyCtx = useTelemetryStore((s) => s.contextByAgent['skippy']);
 
@@ -74,6 +76,12 @@ export default function TopBar() {
           </button>
           <button type="button" title="Auto-commit vault now" onClick={handleAutoCommit}>
             ⎘
+          </button>
+          <button type="button" title="Skippy orientation" onClick={openOnboarding}>
+            ★
+          </button>
+          <button type="button" title="Field manual (F1)" onClick={openDocs}>
+            ?
           </button>
           <button type="button" title="Settings" disabled>
             ⚙

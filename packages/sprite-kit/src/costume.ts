@@ -673,8 +673,10 @@ export function drawInsignia(g: Graphics, name: InsigniaId, accent: number): voi
   const cy = 0;
   const R = 6; // badge radius
 
+  // Soft accent halo so the badge reads as a glowing emblem.
+  g.circle(cx, cy, R + 2).fill({ color: accent, alpha: 0.12 });
   // Common badge plate + outline.
-  g.circle(cx, cy, R).fill({ color: 0x0b0c10, alpha: 0.75 });
+  g.circle(cx, cy, R).fill({ color: 0x0b0c10, alpha: 0.8 });
   g.circle(cx, cy, R).stroke({ width: 1.2, color: accent, alpha: 1 });
 
   switch (name) {
@@ -887,11 +889,12 @@ export function applyCostume(refs: BeercanRefs, costume: Costume): void {
   refs.accentColor = costume.accentColor;
 
   // Repaint the accent bands so a costume swap visibly retints the can.
-  refs.topBand.clear().roundRect(-BODY_W / 2 + 1, -BODY_H / 2 + 4, BODY_W - 2, 6, 2).fill({
+  // Coords mirror createBeercan()'s topBand/bottomBand exactly.
+  refs.topBand.clear().roundRect(-BODY_W / 2 + 1, -BODY_H / 2 + 6, BODY_W - 2, 6, 2).fill({
     color: costume.accentColor,
     alpha: 0.9,
   });
-  refs.bottomBand.clear().roundRect(-BODY_W / 2 + 1, BODY_H / 2 - 8, BODY_W - 2, 3, 1).fill({
+  refs.bottomBand.clear().roundRect(-BODY_W / 2 + 1, BODY_H / 2 - 9, BODY_W - 2, 3, 1).fill({
     color: costume.accentColor,
     alpha: 0.7,
   });
