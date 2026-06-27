@@ -169,17 +169,22 @@ impl PtyManager {
             pixel_height: 0,
         })?;
 
-        // Cheap pre-flight: if the binary isn't on PATH at all, fail fast
-        // with a friendly error instead of letting portable-pty surface a
-        // raw OS error. Dev envs without `claude` installed are the common
-        // miss here (PRD R-01 mitigation: report it, don't crash).
-        if !is_on_path(program) {
-            return Err(anyhow!(
-                "executable `{program}` not found on PATH; install it or extend PATH"
-            ));
-        }
+        // Resolve `program` to something CreateProcessW can actually launch,
+        // and fail fast with a friendly error otherwise (PRD R-01: report it,
+        // don't crash). On Windows an npm-installed `claude` is a `.cmd` + sh
+        // shim that *forwards* to a real `claude.exe` nested in node_modules;
+        // CreateProcessW can't execute the shim, and the old `is_on_path`
+        // pre-flight greenlit it anyway, so every R-hotkey spawn failed
+        // (red-team pty-claudecode #2). `resolve_launchable` follows the shim to
+        // the real `.exe` (or resolves a genuine on-PATH executable directly).
+        let launch = resolve_launchable(program).ok_or_else(|| {
+            anyhow!(
+                "executable `{program}` not found on PATH, or only an unrunnable shim exists \
+                 (no resolvable .exe); install it or extend PATH"
+            )
+        })?;
 
-        let mut cb = CommandBuilder::new(program);
+        let mut cb = CommandBuilder::new(launch);
         for a in args {
             cb.arg(*a);
         }
@@ -469,6 +474,120 @@ fn is_on_path(program: &str) -> bool {
     false
 }
 
+/// Resolve a program name to something `CommandBuilder`/CreateProcessW can
+/// actually launch, returning the path/name to spawn (or `None` if nothing
+/// runnable was found).
+///
+/// On non-Windows we keep the prior behavior: confirm it's on PATH and let
+/// `execvp` resolve the bare name. On Windows we must be smarter — see
+/// [`resolve_windows_exe`].
+#[cfg(not(windows))]
+fn resolve_launchable(program: &str) -> Option<std::ffi::OsString> {
+    if is_on_path(program) {
+        Some(std::ffi::OsString::from(program))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn resolve_launchable(program: &str) -> Option<std::ffi::OsString> {
+    resolve_windows_exe(program).map(std::path::PathBuf::into_os_string)
+}
+
+/// Windows program resolution that survives npm/pnpm shims.
+///
+/// CreateProcessW can only launch a real PE image (`.exe`/`.com`) — it cannot
+/// execute a `.cmd`/`.bat` batch shim or an extensionless sh shim. An
+/// npm-installed `claude` ships exactly such shims, each forwarding to a real
+/// `claude.exe` nested under `node_modules/.../bin/`. So we:
+///   1. take a directly-executable `.exe`/`.com` on PATH if one exists
+///      (the normal case, e.g. `pwsh.exe` or a future native `claude.exe`);
+///   2. otherwise find a shim on PATH and follow it to the real `.exe`.
+#[cfg(windows)]
+fn resolve_windows_exe(program: &str) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+
+    // A caller-supplied extension is honored literally.
+    if Path::new(program).extension().is_some() {
+        return find_on_path_first(program, &[""]);
+    }
+    // 1) Real executable image on PATH.
+    if let Some(exe) = find_on_path_first(program, &[".exe", ".com"]) {
+        return Some(exe);
+    }
+    // 2) Only a shim exists — follow it to the forwarded `.exe`.
+    for ext in [".cmd", ".bat", ""] {
+        if let Some(shim) = find_on_path_first(program, &[ext]) {
+            if let Some(exe) = exe_target_from_shim(&shim) {
+                if exe.is_file() {
+                    return Some(exe);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Return the first `dir/{program}{ext}` that exists, scanning PATH in order and
+/// `exts` in order (an empty `ext` means the bare name).
+#[cfg(windows)]
+fn find_on_path_first(program: &str, exts: &[&str]) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let cand = if ext.is_empty() {
+                dir.join(program)
+            } else {
+                dir.join(format!("{program}{ext}"))
+            };
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Extract the real `.exe` a Windows shim forwards to, resolved against the
+/// shim's own directory. Handles both the npm `.cmd`
+/// (`"%dp0%\node_modules\...\bin\name.exe"  %*`) and the sh shim
+/// (`exec "$basedir/node_modules/.../bin/name.exe" "$@"`), whose target paths
+/// are relative to the shim dir via a `%~dp0`/`%dp0%`/`$basedir` placeholder.
+#[cfg(windows)]
+fn exe_target_from_shim(shim: &std::path::Path) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(shim).ok()?;
+    let shim_dir = shim.parent()?;
+    // First reference to a `.exe` (case-insensitive) is the forwarded target.
+    let lower = text.to_ascii_lowercase();
+    let exe_end = lower.find(".exe")? + 4;
+    // The token starts after the nearest preceding quote/whitespace.
+    let start = text[..exe_end]
+        .rfind(['"', '\'', ' ', '\t', '\n', '\r'])
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let token = text[start..exe_end].trim().trim_matches('"');
+    let rel = strip_shim_placeholder(token)?;
+    let rel = rel.trim_start_matches(['\\', '/']).replace('\\', "/");
+    Some(shim_dir.join(rel))
+}
+
+/// Strip a leading shim dir placeholder, returning the path tail relative to the
+/// shim dir. If the token is already absolute (no placeholder), return it whole.
+#[cfg(windows)]
+fn strip_shim_placeholder(token: &str) -> Option<&str> {
+    for p in ["%~dp0", "%dp0%", "${basedir}", "$basedir"] {
+        if let Some(rest) = token.strip_prefix(p) {
+            return Some(rest);
+        }
+    }
+    if std::path::Path::new(token).is_absolute() {
+        Some(token)
+    } else {
+        None
+    }
+}
+
 /// Decode the next chunk of PTY bytes into a UTF-8 `String`, carrying any
 /// trailing incomplete multibyte sequence forward via `carry`.
 ///
@@ -692,6 +811,76 @@ mod tests {
         assert!(carry.is_empty());
         // Empty carry flushes to None.
         assert!(flush_carry(&mut carry).is_none());
+    }
+
+    /// An npm `.cmd` shim must resolve to the real `.exe` it forwards to,
+    /// relative to the shim's own dir (red-team pty-claudecode #2). Hermetic:
+    /// builds a temp shim + target so it doesn't depend on a real install.
+    #[cfg(windows)]
+    #[test]
+    fn cmd_shim_resolves_to_forwarded_exe() {
+        let dir = std::env::temp_dir().join(format!("skippy-shim-{}", Uuid::new_v4()));
+        let bin = dir.join("node_modules\\@anthropic-ai\\claude-code\\bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("claude.exe");
+        std::fs::write(&exe, b"MZ").unwrap(); // contents irrelevant; must exist
+        let shim = dir.join("claude.cmd");
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\n\
+             SETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n",
+        )
+        .unwrap();
+
+        let resolved = exe_target_from_shim(&shim).expect("shim should resolve to an exe");
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            exe.canonicalize().unwrap(),
+            "the .cmd shim must resolve to the nested real claude.exe"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The extensionless sh shim (`exec "$basedir/.../bin/name.exe" "$@"`) must
+    /// resolve the same way.
+    #[cfg(windows)]
+    #[test]
+    fn sh_shim_resolves_to_forwarded_exe() {
+        let dir = std::env::temp_dir().join(format!("skippy-shim-sh-{}", Uuid::new_v4()));
+        let bin = dir.join("node_modules\\@anthropic-ai\\claude-code\\bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("claude.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let shim = dir.join("claude");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nbasedir=$(dirname \"$0\")\n\
+             exec \"$basedir/node_modules/@anthropic-ai/claude-code/bin/claude.exe\" \"$@\"\n",
+        )
+        .unwrap();
+
+        let resolved = exe_target_from_shim(&shim).expect("sh shim should resolve to an exe");
+        assert_eq!(resolved.canonicalize().unwrap(), exe.canonicalize().unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end on a machine with `claude` actually installed: `resolve_launchable`
+    /// must hand back a real, existing `.exe` (never the un-runnable shim).
+    /// Skipped gracefully where `claude` isn't on PATH (portable CI).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_launchable_follows_installed_claude_to_a_real_exe() {
+        let Some(resolved) = resolve_launchable("claude") else {
+            eprintln!("claude not on PATH; skipping live resolution test");
+            return;
+        };
+        let p = std::path::PathBuf::from(&resolved);
+        assert!(p.is_file(), "resolved claude target must exist: {p:?}");
+        assert_eq!(
+            p.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase),
+            Some("exe".to_string()),
+            "must resolve to a launchable .exe, not the .cmd/sh shim"
+        );
     }
 
     /// `close` must remove the entry from the manager map, so a *second* close

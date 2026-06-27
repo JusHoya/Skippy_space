@@ -183,12 +183,18 @@ async fn claude_code_spawn(
     //   is combined with `--print`. The CLI errors out without it.
     let args: Vec<&str> = vec![
         "-p",
-        task_brief.as_str(),
         "--model",
         resolved_model.as_str(),
         "--output-format",
         "stream-json",
         "--verbose",
+        // End option parsing so the prompt is taken as the positional `[prompt]`
+        // even when a brief begins with `-` — otherwise it's mis-parsed as flags
+        // (red-team pty-claudecode #34 / security #18). The brief is spawned as a
+        // discrete argv entry to a real .exe (no shell), so no cmd/sh metachar
+        // escaping is needed.
+        "--",
+        task_brief.as_str(),
     ];
     // ANTHROPIC_API_KEY is the only env var the CLI strictly needs; we forward
     // it from the shell's env if set. (claude also reads ~/.claude credentials
