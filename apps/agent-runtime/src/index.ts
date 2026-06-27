@@ -11,6 +11,13 @@
 // board comes online; Skippy's `delegate_to_board` tool routes through the
 // same supervisor singleton.
 
+// MUST be first: populate process.env from the repo .env before any module
+// below reads a credential or config var (logger/otel/modelRegistry read env at
+// import time; claude.ts builds its Anthropic client lazily from it). Without
+// this the sidecar launched with ANTHROPIC_API_KEY unset and the orchestrator
+// wedged into 'error' on the first prompt. See load-env.ts.
+import { dotenvResult } from './load-env.js';
+
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -50,6 +57,14 @@ async function main(): Promise<void> {
   await initOtel();
 
   logger.info({ msg: 'agent-runtime starting', node: process.version });
+  if (dotenvResult.path) {
+    logger.info({
+      msg: 'loaded .env',
+      file: dotenvResult.path,
+      set: dotenvResult.loaded.length,
+      skippedAlreadySet: dotenvResult.skipped.length,
+    });
+  }
   writeEnvelope({
     type: 'log',
     level: 'info',
@@ -57,6 +72,25 @@ async function main(): Promise<void> {
     message: 'sidecar ready',
     ts: new Date().toISOString(),
   });
+
+  // Boot-time credential check. The orchestrator cannot reach the model without
+  // this key, and the failure used to be invisible until the first prompt
+  // wedged Skippy to 'error' with only a buried error_span. Surface it loudly at
+  // boot with concrete remediation instead (red-team finding boot-orchestrator
+  // #5). We do NOT exit — boards still warm up so the rest of the UI is alive.
+  if (!process.env.ANTHROPIC_API_KEY) {
+    const detail = dotenvResult.path
+      ? `ANTHROPIC_API_KEY is missing from ${dotenvResult.path}. Skippy and every Board will fail on the first prompt — add the key and relaunch.`
+      : 'ANTHROPIC_API_KEY is not set and no .env was found. Copy .env.example to .env at the repo root, add your key, and relaunch (or export ANTHROPIC_API_KEY before launch).';
+    logger.error({ msg: 'missing ANTHROPIC_API_KEY', detail });
+    writeEnvelope({
+      type: 'log',
+      level: 'error',
+      source: 'agent-runtime',
+      message: detail,
+      ts: new Date().toISOString(),
+    });
+  }
 
   // Spin up the 8-Board supervisor in the background. We deliberately do NOT
   // await — boards emit their own `board_ready` envelopes when each one
