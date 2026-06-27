@@ -50,11 +50,14 @@ export default function CommandBar() {
   const status =
     submitting
       ? 'dispatching…'
+      : current && current.error
+      ? '⚠ error — see telemetry'
       : current && !current.complete
       ? current.streamed.length > 0
         ? 'speaking…'
         : 'thinking…'
       : null;
+  const statusIsError = Boolean(current?.error) && !submitting;
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -113,7 +116,15 @@ export default function CommandBar() {
           aria-expanded={navOpen}
           aria-controls="agent-navigator"
         />
-        {status ? <span className="status">{status}</span> : null}
+        {status ? (
+          <span
+            className={statusIsError ? 'status status-error' : 'status'}
+            role={statusIsError ? 'alert' : undefined}
+            style={statusIsError ? { color: '#ff5d5d' } : undefined}
+          >
+            {status}
+          </span>
+        ) : null}
         <button type="submit" disabled={submitting || draft.trim().length === 0 || navOpen}>
           Send
         </button>

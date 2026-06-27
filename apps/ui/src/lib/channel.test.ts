@@ -268,6 +268,53 @@ test('agent_complete flushes buffered tokens before finalizing', async () => {
   cleanup();
 });
 
+// ── orchestrator error surfacing (red-team ui-state-pixi #11/#12) ────────────
+//
+// When a Skippy turn fails the sidecar emits error_span then agent_state:'error'
+// (skippy.ts catch). Pre-fix, the error path neither flushed the rAF-buffered
+// token run (so a next-frame flush resurrected 'speaking' over the dead turn)
+// nor finalized the prompt (so the CommandBar showed 'thinking…/speaking…'
+// forever and the failure was invisible on the default panel). This locks in
+// both fixes.
+
+test('agent_state:error finalizes the prompt and is not clobbered by a buffered token', async () => {
+  const { _subscribeEffect, flushTokenBatch, _pendingTokenPromptCount } = currentMod;
+  const { usePromptStore } = (await import(
+    '../stores/promptStore.js'
+  )) as typeof import('../stores/promptStore.js');
+  const { useAgentStore } = (await import(
+    '../stores/agentStore.js'
+  )) as typeof import('../stores/agentStore.js');
+
+  const cleanup = _subscribeEffect();
+  const promptId = 'prompt-error';
+  usePromptStore.getState().setPrompt(promptId, 'do a thing');
+
+  const ts = new Date().toISOString();
+  // A token is buffered (rAF-coalesced) when the turn fails.
+  deliver({ type: 'agent_token', agentId: 'skippy', promptId, text: 'partial', ts });
+  assert.equal(_pendingTokenPromptCount(), 1, 'token is buffered before the failure');
+
+  deliver({ type: 'error_span', agentId: 'skippy', errorKind: 'BadRequest', message: 'boom', ts });
+  deliver({ type: 'agent_state', agentId: 'skippy', state: 'error', promptId, ts });
+
+  // The error path drained the buffer synchronously, so a late frame is a no-op
+  // and cannot resurrect 'speaking'.
+  assert.equal(_pendingTokenPromptCount(), 0, 'buffer drained by the error path');
+  flushTokenBatch();
+
+  const cur = usePromptStore.getState().current;
+  assert.equal(cur?.complete, true, 'a failed turn is terminal (complete)');
+  assert.ok(cur?.error, 'the prompt is flagged errored so the HUD stops showing thinking…');
+  assert.equal(
+    useAgentStore.getState().agents.skippy?.state,
+    'error',
+    'Skippy stays in error — not clobbered back to speaking by the buffered token',
+  );
+
+  cleanup();
+});
+
 // ── sidecar-crash recovery (REVIEW §5 critic, sidecar.rs) ───────────────────
 //
 // A sidecar (agent-runtime child) crash used to be invisible to the renderer:

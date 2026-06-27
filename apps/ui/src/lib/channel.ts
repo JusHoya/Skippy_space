@@ -219,6 +219,16 @@ export function dispatchEnvelope(raw: unknown): void {
   const env = parsed.data;
   switch (env.type) {
     case 'agent_state': {
+      // A terminal 'error' must win over any token run still buffered earlier in
+      // this turn. Drain the buffer NOW (flushTokenBatch also cancels the pending
+      // frame) so its 'speaking' write lands BEFORE we set 'error' — otherwise a
+      // next-frame flush resurrects 'speaking' over the dead turn (red-team
+      // ui-state-pixi #11). Then finalize the prompt so the HUD stops showing
+      // 'thinking…/speaking…' forever (ui-state-pixi #12).
+      if (env.state === 'error') {
+        flushTokenBatch();
+        if (env.promptId) usePromptStore.getState().failPrompt(env.promptId);
+      }
       useAgentStore.getState().setAgent(env.agentId, {
         state: env.state,
         updatedAt: env.ts,
@@ -410,6 +420,11 @@ export function dispatchEnvelope(raw: unknown): void {
       break;
     }
     case 'error_span': {
+      // Drain buffered tokens first so a coalesced run scheduled earlier in the
+      // turn can't flush on a later frame and resurrect 'speaking' after the
+      // failure (red-team ui-state-pixi #11). error_span carries no promptId, so
+      // the prompt itself is finalized by the paired agent_state:'error'.
+      flushTokenBatch();
       useTelemetryStore.getState().recordError(env);
       console.warn(`[skippy/ui] error_span ${env.agentId}: ${env.errorKind} — ${env.message}`);
       break;

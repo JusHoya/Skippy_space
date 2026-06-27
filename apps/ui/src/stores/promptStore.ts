@@ -12,6 +12,13 @@ export interface CurrentPrompt {
   streamed: string;
   complete: boolean;
   startedAt: number;
+  /**
+   * Set when the turn ended in failure (the orchestrator hit `error`). A failed
+   * turn is also `complete: true` — the distinction lets the CommandBar show an
+   * error status instead of a perpetual "thinking…/speaking…" (red-team
+   * ui-state-pixi #12).
+   */
+  error?: string | null;
 }
 
 export interface PromptStore {
@@ -20,6 +27,8 @@ export interface PromptStore {
   setPrompt: (promptId: string, text: string) => void;
   appendToken: (promptId: string, chunk: string) => void;
   completePrompt: (promptId: string) => void;
+  /** Terminate the current prompt as failed (sets complete + error). */
+  failPrompt: (promptId: string, message?: string) => void;
   clear: () => void;
 }
 
@@ -36,6 +45,7 @@ export const usePromptStore = create<PromptStore>((set) => ({
         streamed: '',
         complete: false,
         startedAt: Date.now(),
+        error: null,
       },
     })),
   appendToken: (promptId, chunk) =>
@@ -52,6 +62,17 @@ export const usePromptStore = create<PromptStore>((set) => ({
       const completed: CurrentPrompt = { ...s.current, complete: true };
       const history = [completed, ...s.history].slice(0, HISTORY_LIMIT);
       return { ...s, current: completed, history };
+    }),
+  failPrompt: (promptId, message) =>
+    set((s) => {
+      if (!s.current || s.current.promptId !== promptId) return s;
+      const failed: CurrentPrompt = {
+        ...s.current,
+        complete: true,
+        error: message ?? 'error',
+      };
+      const history = [failed, ...s.history].slice(0, HISTORY_LIMIT);
+      return { ...s, current: failed, history };
     }),
   clear: () => set({ current: null }),
 }));
