@@ -1,0 +1,2 @@
+# Shell scripts run on Linux hosts (e.g. alcyone); keep LF on Windows checkouts.
+*.sh text eol=lf
