@@ -123,7 +123,9 @@ console.log(`\n${DIM}wiring${RESET}`);
   const reg = readIf('apps/agent-runtime/src/mcp-registry.ts') ?? '';
   record('buildMcpServers wires obsidian + letta servers', /buildObsidianServer/.test(reg) && /buildLettaServer/.test(reg), null);
   const sdkBoard = readIf('apps/agent-runtime/src/sdk-board.ts') ?? '';
-  record('sdk-board passes mcpServers into query()', /mcpServers:\s*params\.mcpServers/.test(sdkBoard), null);
+  // T02: the servers are filtered through the charter-derived tool policy.
+  record('sdk-board passes mcpServers into query()', /mcpServers:\s*(filterMcpServers\(policy,\s*)?params\.mcpServers/.test(sdkBoard), null);
+  record('sdk-board has no permission bypass (T02)', !/permissionMode:\s*'bypassPermissions'/.test(sdkBoard), null);
   const board = readIf('apps/agent-runtime/src/board.ts') ?? '';
   record('board.ts builds mcpServers inside the gated block', /sdkBoardsEnabled\(\)/.test(board) && /buildMcpServers\(/.test(board), null);
   const idx = readIf('packages/memory/src/index.ts') ?? '';

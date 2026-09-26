@@ -15,11 +15,31 @@
 // @skippy/shared + @skippy/memory stay on zod@3. Live execution still needs an
 // API key (and, for full effect, a running Obsidian/Letta) — it cannot run in
 // the headless, no-key exit gate.
+//
+// TOOL AUTHORITY (T02, FR-SEC-01, A02): there is NO permission bypass. The
+// board's charter is turned into an ExecutionPolicy (tool-policy.ts) and the
+// SDK runs under that policy's native controls — restricted `tools`, empty
+// `allowedTools`, `disallowedTools`, a `canUseTool` + `PreToolUse` deny gate,
+// an explicit `cwd`, no ambient settings and a strict MCP allowlist. If the
+// policy cannot be derived or this adapter cannot enforce it, the mission is
+// refused before the SDK is even imported. Without an assigned worktree the
+// board runs read-only (no built-in write root).
 
 import type { ModelId } from '@skippy/shared';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 
+import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { logger } from './logger.js';
+import {
+  CLAUDE_AGENT_SDK_CAPABILITIES,
+  ToolPolicyError,
+  assertExecutorEligible,
+  buildClaudeSdkPermissionOptions,
+  derivePolicy,
+  filterMcpServers,
+  type ExecutionPolicy,
+  type SdkEnforcementHooks,
+} from './tool-policy.js';
 
 export interface SdkBoardResult {
   ok: boolean;
@@ -46,6 +66,28 @@ export interface ExecuteBoardMissionParams {
   mcpServers?: Record<string, McpServerConfig>;
   /** Tool-loop ceiling (R-01 cost guard). */
   maxTurns?: number;
+  /** Charter the policy is derived from; loaded from agent_space when omitted. */
+  charter?: Charter;
+  /** Assigned worktree (absolute): the only built-in write root. Omitted =>
+   * read-only execution rooted at the process cwd. */
+  worktreePath?: string;
+  /** Approval + path-guard hooks; default approver denies (no approval channel). */
+  enforcement?: SdkEnforcementHooks;
+}
+
+/**
+ * Derive the enforced policy for a board mission and prove this adapter can
+ * enforce it. Throws ToolPolicyError (the mission must be refused).
+ */
+export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Promise<ExecutionPolicy> {
+  const charter =
+    params.charter ?? (await loadCharter(`board.${params.boardId}` as CharterAgentId));
+  const policy = derivePolicy(charter, {
+    cwd: params.worktreePath ?? process.cwd(),
+    ...(params.worktreePath ? { worktreePath: params.worktreePath } : {}),
+  });
+  assertExecutorEligible(policy, CLAUDE_AGENT_SDK_CAPABILITIES);
+  return policy;
 }
 
 /**
@@ -56,16 +98,40 @@ export interface ExecuteBoardMissionParams {
 export async function executeBoardMissionViaSdk(
   params: ExecuteBoardMissionParams,
 ): Promise<SdkBoardResult> {
+  let policy: ExecutionPolicy;
+  try {
+    policy = await resolveBoardPolicy(params);
+  } catch (err) {
+    const reason = err instanceof ToolPolicyError ? err.message : String(err);
+    logger.warn({ msg: 'SDK board refused: tool policy', boardId: params.boardId, err: reason });
+    return { ok: false, summary: `SDK board execution refused by tool policy: ${reason}` };
+  }
+
   try {
     const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    const permission = buildClaudeSdkPermissionOptions(policy, {
+      ...params.enforcement,
+      onDecision: (e) => {
+        if (!e.decision.allow) {
+          logger.warn({
+            msg: 'tool call denied by policy',
+            boardId: params.boardId,
+            tool: e.toolName,
+            code: e.decision.code,
+            via: e.via,
+          });
+        }
+        params.enforcement?.onDecision?.(e);
+      },
+    });
     const q = sdk.query({
       prompt: params.missionBrief,
       options: {
         model: params.model,
         systemPrompt: params.systemPrompt,
         maxTurns: params.maxTurns ?? 8,
-        permissionMode: 'bypassPermissions',
-        ...(params.mcpServers ? { mcpServers: params.mcpServers } : {}),
+        ...permission,
+        mcpServers: filterMcpServers(policy, params.mcpServers),
       },
     });
 
