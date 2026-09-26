@@ -127,7 +127,7 @@ console.log(`\n${DIM}wiring${RESET}`);
   record('sdk-board passes mcpServers into query()', /mcpServers:\s*(filterMcpServers\(policy,\s*)?params\.mcpServers/.test(sdkBoard), null);
   record('sdk-board has no permission bypass (T02)', !/permissionMode:\s*'bypassPermissions'/.test(sdkBoard), null);
   const board = readIf('apps/agent-runtime/src/board.ts') ?? '';
-  record('board.ts builds mcpServers inside the gated block', /sdkBoardsEnabled\(\)/.test(board) && /buildMcpServers\(/.test(board), null);
+  record('board.ts builds mcpServers inside the gated block', /sdkBoardsEnabled\(\)|resolveExecutionGate\(/.test(board) && /buildMcpServers\(/.test(board), null);
   const idx = readIf('packages/memory/src/index.ts') ?? '';
   record('@skippy/memory exports LettaClient + archival mirror', /letta-client/.test(idx) && /jobs\/index|archival-mirror/.test(idx + (readIf('packages/memory/src/jobs/index.ts') ?? '')), null);
 }

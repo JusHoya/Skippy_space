@@ -467,9 +467,11 @@ export default function SceneRoot() {
       ): void => {
         if (pedestalLayouts.length === 0) return;
         for (const [id, rec] of Object.entries(delegations)) {
-          // Spawn a walker once the delegation is accepted; skip pending/declined.
+          // Spawn a walker once the delegation is accepted/running (or truly
+          // succeeded); skip pending/declined and every non-success outcome —
+          // simulated/blocked/failed work must not animate as done (G0).
           if (walkerByDelegation.has(id)) continue;
-          if (rec.status !== 'accepted' && rec.status !== 'succeeded') continue;
+          if (rec.status !== 'accepted' && rec.status !== 'running' && rec.status !== 'succeeded') continue;
           const target = pickPedestalForBoard(pedestalLayouts, rec.toBoardId, id);
           if (!target) continue;
           const fromPos = BOARD_CLOCK_POSITIONS[rec.toBoardId];

@@ -244,7 +244,7 @@ async function checkEnvelopes() {
     `  { type: 'board_state', boardId: 'design', agentId: 'board.design', state: 'working', ts: new Date().toISOString() },`,
     `  { type: 'delegation', delegationId: 'D1', fromAgentId: 'skippy', toBoardId: 'engineering', missionBrief: 'do the thing', ts: new Date().toISOString() },`,
     `  { type: 'delegation_ack', delegationId: 'D1', fromBoardId: 'engineering', decision: 'accept', ts: new Date().toISOString() },`,
-    `  { type: 'delegation_complete', delegationId: 'D1', fromBoardId: 'engineering', result: 'success', summary: 'ok', ts: new Date().toISOString() },`,
+    `  { type: 'delegation_complete', delegationId: 'D1', fromBoardId: 'engineering', outcome: 'blocked', mode: 'live', validation: 'not_run', reason: { code: 'execution_disabled', message: 'disabled' }, summary: 'not executed', ts: new Date().toISOString() },`,
     `];`,
     `for (const c of cases) {`,
     `  const r = Envelope.safeParse(c);`,

@@ -20,6 +20,7 @@ import { BOARDS, type BoardId } from '@skippy/shared';
 
 import { Board, type BoardAck, type BoardDelegation } from './board.js';
 import { loadCharter } from './charter.js';
+import type { ExecutionGate } from './execution-gate.js';
 import { logger } from './logger.js';
 import { writeEnvelope } from './protocol.js';
 
@@ -33,6 +34,8 @@ export interface SupervisorAck {
   toBoardId: BoardId;
   decision: 'accept' | 'decline' | 'counter_propose';
   counterText?: string;
+  /** For an accept: expected execution (live / demo / blocked + reason). */
+  execution?: ExecutionGate;
 }
 
 export class BoardSupervisor {
@@ -86,8 +89,9 @@ export class BoardSupervisor {
   /**
    * Skippy's `delegate_to_board` lands here. Emits a `delegation` envelope to
    * the renderer, hands the brief to the target board, awaits the ack, and
-   * returns it. The `delegation_complete` envelope is emitted by the Board
-   * after the ack returns; we do not block on it.
+   * returns it. For an accept it then starts the board's execution; the
+   * terminal `delegation_complete` envelope is emitted by the Board once the
+   * executor's terminal result is in. We do not block Skippy on it.
    */
   async delegate(
     toBoardId: BoardId,
@@ -162,11 +166,26 @@ export class BoardSupervisor {
 
           span.setAttribute('skippy.supervisor.decision', ack.decision);
 
+          // 4. Only now — with `accepted` on the wire — start execution. The
+          //    board awaits a terminal executor result and emits exactly one
+          //    `delegation_complete` (FR-RUN-01). Skippy is not blocked on it:
+          //    the ack he receives means accepted, never completed.
+          if (ack.decision === 'accept') {
+            board.runAcceptedDelegation(delegation).catch((err: unknown) => {
+              logger.error({
+                msg: 'runAcceptedDelegation rejected',
+                delegationId: ack.delegationId,
+                err: String(err),
+              });
+            });
+          }
+
           const result: SupervisorAck = {
             delegationId: ack.delegationId,
             toBoardId: ack.boardId,
             decision: ack.decision,
             ...(ack.counterText ? { counterText: ack.counterText } : {}),
+            ...(ack.execution ? { execution: ack.execution } : {}),
           };
           return result;
         } finally {

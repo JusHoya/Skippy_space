@@ -1,12 +1,15 @@
 // sdk-board.ts — gated real-agent execution for Board Captains via the Claude
 // Agent SDK (PRD §5.1: boards as root query() processes).
 //
-// OFF BY DEFAULT. The eight boards otherwise run as the Phase-1 keyword stub
-// (board.ts). Set PHASE3_AGENTS_ENABLED=1 (and provide ANTHROPIC_API_KEY) to
-// route an accepted delegation through a real `query()` — the board's charter
-// as the system prompt — instead of the stub. ANY failure (no key, SDK error,
-// the R-01 cold-start, a permission hang) is caught and the caller falls back
-// to the stub summary, so enabling the flag can never wedge a delegation.
+// OFF BY DEFAULT. Set PHASE3_AGENTS_ENABLED=1 (and provide ANTHROPIC_API_KEY)
+// to route an accepted delegation through a real `query()` — the board's
+// charter as the system prompt. Whether a delegation may run live at all is
+// decided by `resolveExecutionGate` (execution-gate.ts). This module only
+// reports what the executor terminally did (PRD v0.2 FR-RUN-01): a `result`
+// `success` message is the ONLY path to `status: 'succeeded'`; a tool-policy
+// refusal is `blocked`; a thrown SDK error, an error result subtype, or a
+// stream that ends without a result are `failed` with a reason. There is no
+// stub fallback — a failure never masquerades as success.
 //
 // MCP tools (Phase 3.5): the Obsidian (D1) + Letta (D4) MCP servers ARE now
 // wired — board.ts builds them from the charter's `mcp_servers:` via
@@ -25,10 +28,11 @@
 // refused before the SDK is even imported. Without an assigned worktree the
 // board runs read-only (no built-in write root).
 
-import type { ModelId } from '@skippy/shared';
+import type { ExecutorTerminal, ModelId } from '@skippy/shared';
 import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
+import { resolveExecutionGate } from './execution-gate.js';
 import { logger } from './logger.js';
 import {
   CLAUDE_AGENT_SDK_CAPABILITIES,
@@ -41,19 +45,25 @@ import {
   type SdkEnforcementHooks,
 } from './tool-policy.js';
 
-export interface SdkBoardResult {
-  ok: boolean;
-  /** Final assistant text (the mission outcome), or an error note when !ok. */
-  summary: string;
-  /** Total cost the SDK reported for the run, if any. */
-  costUsd?: number;
+/** Executor-level terminal result (see `ExecutorTerminal` in @skippy/shared). */
+export type SdkBoardResult = ExecutorTerminal;
+
+/** True only when the SDK board path is enabled AND an API key is present
+ * (PHASE3_AGENTS_ENABLED=1 + ANTHROPIC_API_KEY, and demo mode is off). */
+export function sdkBoardsEnabled(): boolean {
+  return resolveExecutionGate().kind === 'live';
 }
 
-/** True only when the SDK board path is enabled AND an API key is present. */
-export function sdkBoardsEnabled(): boolean {
-  return (
-    process.env.PHASE3_AGENTS_ENABLED === '1' && Boolean(process.env.ANTHROPIC_API_KEY)
-  );
+/** The subset of the SDK module this executor uses; injectable for tests. */
+export type ClaudeAgentSdkModule = Pick<typeof import('@anthropic-ai/claude-agent-sdk'), 'query'>;
+
+export interface ExecuteBoardMissionDeps {
+  /** Defaults to a dynamic import of `@anthropic-ai/claude-agent-sdk`. */
+  loadSdk?: () => Promise<ClaudeAgentSdkModule>;
+}
+
+function loadClaudeAgentSdk(): Promise<ClaudeAgentSdkModule> {
+  return import('@anthropic-ai/claude-agent-sdk');
 }
 
 export interface ExecuteBoardMissionParams {
@@ -91,12 +101,14 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
 }
 
 /**
- * Execute one board mission through the Claude Agent SDK. Dynamically imports
- * the SDK so it never touches the module-load path unless the gated flag is on.
- * Returns `{ ok:false }` on any failure so the board can fall back to the stub.
+ * Execute one board mission through the Claude Agent SDK and await its
+ * terminal result. Dynamically imports the SDK so it never touches the
+ * module-load path unless the live gate is open. Never throws: a policy
+ * refusal is returned as `blocked`, every other failure as `failed`.
  */
 export async function executeBoardMissionViaSdk(
   params: ExecuteBoardMissionParams,
+  deps: ExecuteBoardMissionDeps = {},
 ): Promise<SdkBoardResult> {
   let policy: ExecutionPolicy;
   try {
@@ -104,11 +116,29 @@ export async function executeBoardMissionViaSdk(
   } catch (err) {
     const reason = err instanceof ToolPolicyError ? err.message : String(err);
     logger.warn({ msg: 'SDK board refused: tool policy', boardId: params.boardId, err: reason });
-    return { ok: false, summary: `SDK board execution refused by tool policy: ${reason}` };
+    if (err instanceof ToolPolicyError) {
+      // The charter's authority cannot be enforced: refuse before execution.
+      return {
+        status: 'blocked',
+        reason: {
+          code: 'policy_refused',
+          message: `Board ${params.boardId} mission refused by tool policy before execution.`,
+          detail: reason,
+        },
+      };
+    }
+    return {
+      status: 'failed',
+      reason: {
+        code: 'runtime_error',
+        message: `Board ${params.boardId} tool policy could not be derived; mission not executed.`,
+        detail: reason,
+      },
+    };
   }
 
   try {
-    const sdk = await import('@anthropic-ai/claude-agent-sdk');
+    const sdk = await (deps.loadSdk ?? loadClaudeAgentSdk)();
     const permission = buildClaudeSdkPermissionOptions(policy, {
       ...params.enforcement,
       onDecision: (e) => {
@@ -135,27 +165,53 @@ export async function executeBoardMissionViaSdk(
       },
     });
 
-    let summary = '';
-    let costUsd: number | undefined;
+    // Await the terminal `result` message. The last one observed wins.
+    let terminal: SdkBoardResult | null = null;
     for await (const msg of q) {
-      if (msg.type === 'result' && msg.subtype === 'success') {
-        summary = msg.result;
-        costUsd = msg.total_cost_usd;
+      if (msg.type !== 'result') continue;
+      const costUsd = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : undefined;
+      if (msg.subtype === 'success' && !msg.is_error) {
+        terminal = { status: 'succeeded', summary: msg.result };
+      } else {
+        const detail =
+          msg.subtype === 'success'
+            ? `success result flagged is_error: ${msg.result}`
+            : [msg.subtype, ...(msg.errors ?? [])].join(': ');
+        terminal = {
+          status: 'failed',
+          reason: {
+            code: 'executor_error',
+            message: `Board ${params.boardId} executor ended with an error result (${msg.subtype}).`,
+            detail,
+          },
+        };
       }
+      if (costUsd !== undefined) terminal.costUsd = costUsd;
     }
 
-    if (summary.trim().length > 0) {
-      const out: SdkBoardResult = { ok: true, summary };
-      if (costUsd !== undefined) out.costUsd = costUsd;
-      return out;
+    if (!terminal) {
+      return {
+        status: 'failed',
+        reason: {
+          code: 'no_terminal_result',
+          message: `Board ${params.boardId} executor stream ended without a terminal result.`,
+        },
+      };
     }
-    return { ok: false, summary: '' };
+    return terminal;
   } catch (err) {
     logger.warn({
-      msg: 'SDK board execution failed; falling back to stub',
+      msg: 'SDK board execution failed',
       boardId: params.boardId,
       err: String(err),
     });
-    return { ok: false, summary: `SDK board execution failed: ${String(err)}` };
+    return {
+      status: 'failed',
+      reason: {
+        code: 'provider_error',
+        message: `Board ${params.boardId} executor failed before a terminal result.`,
+        detail: String(err),
+      },
+    };
   }
 }

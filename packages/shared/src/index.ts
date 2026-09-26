@@ -10,3 +10,5 @@ export * from './phase3prep.js';
 export * from './phase3.js';
 export * from './pricing.js';
 export * from './model-limits.js';
+export * from './outcome.js';
+export * from './delegation-record.js';

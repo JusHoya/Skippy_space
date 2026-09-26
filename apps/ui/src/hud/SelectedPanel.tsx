@@ -9,6 +9,7 @@ import { useAgentStore } from '../stores/agentStore';
 import { useUiStore } from '../stores/uiStore';
 import { usePromptStore } from '../stores/promptStore';
 import { useModelStore } from '../stores/modelStore';
+import { delegationStatusView, useDelegationStore } from '../stores/delegationStore';
 import { safeInvoke } from '../lib/tauri';
 import ModelPicker from './ModelPicker';
 import type { ModelId, ModelScope } from '@skippy/shared';
@@ -49,6 +50,7 @@ export default function SelectedPanel() {
   const current = usePromptStore((s) => s.current);
   const boardModels = useModelStore((s) => s.boardModels);
   const setBoardModel = useModelStore((s) => s.setBoardModel);
+  const delegations = useDelegationStore((s) => s.delegations);
 
   const display = useMemo<Display>(() => {
     if (!selectedId) {
@@ -104,6 +106,18 @@ export default function SelectedPanel() {
         { label: 'Insignia', value: costume.insignia },
       ].filter((row) => Boolean(row.value))
     : null;
+
+  // Most recent delegation to this board, with its truthful outcome (FR-RUN-01).
+  const lastOrder = useMemo(() => {
+    if (!display.boardId) return undefined;
+    let latest: (typeof delegations)[string] | undefined;
+    for (const rec of Object.values(delegations)) {
+      if (rec.toBoardId !== display.boardId) continue;
+      if (!latest || rec.createdAt > latest.createdAt) latest = rec;
+    }
+    return latest;
+  }, [delegations, display.boardId]);
+  const lastOrderView = lastOrder ? delegationStatusView(lastOrder.status) : undefined;
 
   // Default task placeholder — Phase 3 will replace with a live task feed.
   const taskText =
@@ -184,6 +198,18 @@ export default function SelectedPanel() {
         <span className="k">Task</span>
         <span className="v">{taskText}</span>
       </div>
+      {lastOrder && lastOrderView && (
+        <div className="stat-row" data-testid="last-order-outcome" data-tone={lastOrderView.tone}>
+          <span className="k">Last order</span>
+          <span
+            className="v"
+            style={{ color: lastOrderView.color, fontWeight: 600 }}
+            title={[lastOrder.reason?.message, lastOrder.summary].filter(Boolean).join(' — ')}
+          >
+            {lastOrderView.label}
+          </span>
+        </div>
+      )}
       <div className="stat-row">
         <span className="k">Last token</span>
         <span

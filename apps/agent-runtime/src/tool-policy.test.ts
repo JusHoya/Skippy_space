@@ -375,8 +375,10 @@ test('invalid or unknown charter permission fields fail closed', async () => {
     missionBrief: 'do things',
     charter: charter({ permission_mode: 'bypassPermissions', tools: ['Read'] }),
   });
-  assert.equal(r.ok, false);
-  assert.match(r.summary, /bypass_forbidden/);
+  // FR-RUN-01: a policy refusal is a non-success terminal outcome (blocked).
+  assert.equal(r.status, 'blocked');
+  assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
+  assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /bypass_forbidden/);
 
   // And an invalid charter gets no MCP servers at all.
   const vault = await tmpDir('skippy-policy-vault-');

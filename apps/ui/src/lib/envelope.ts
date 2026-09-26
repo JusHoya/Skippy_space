@@ -15,6 +15,7 @@ export {
   BoardStateEnvelope,
   DelegationEnvelope,
   DelegationAckEnvelope,
+  DelegationStateEnvelope,
   DelegationCompleteEnvelope,
   BoardIdSchema,
 } from '@skippy/shared';

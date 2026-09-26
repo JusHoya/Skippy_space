@@ -19,13 +19,14 @@ import type Anthropic from '@anthropic-ai/sdk';
 
 import { BOARDS, type BoardId } from '@skippy/shared';
 
+import type { ExecutionGate } from './execution-gate.js';
 import { getSupervisor, type SupervisorAck } from './supervisor.js';
 
 /** The tool definition the Anthropic Messages API consumes. */
 export const DELEGATE_TO_BOARD_TOOL: Anthropic.Messages.Tool = {
   name: 'delegate_to_board',
   description:
-    'Delegate a mission to one of the eight Board Captains (Engineering, Coding, Design, Marketing, Finance, Research, Publishing, DevOps). USE THIS for ALL implementation work — the Iron Law of Delegation: Skippy NEVER implements himself. The tool returns an acknowledgement: accept | decline | counter_propose. After accept, the Board emits a delegation_complete envelope asynchronously.',
+    'Delegate a mission to one of the eight Board Captains (Engineering, Coding, Design, Marketing, Finance, Research, Publishing, DevOps). USE THIS for ALL implementation work — the Iron Law of Delegation: Skippy NEVER implements himself. The tool returns an acknowledgement: accept | decline | counter_propose. An accept means ACCEPTED, never completed — do not report the mission as done. The Board later emits a delegation_complete record whose outcome is succeeded | failed | cancelled | interrupted | blocked | simulated; only "succeeded" means the work was actually done.',
   input_schema: {
     type: 'object',
     properties: {
@@ -69,6 +70,12 @@ export interface DelegateToBoardOutput {
   delegation_id: string;
   board_name: string;
   decision: 'accept' | 'decline' | 'counter_propose';
+  /** Lifecycle after this call (FR-RUN-01): an accept is `accepted`, never
+   * completed; decline/counter leave nothing running. */
+  status: 'accepted' | 'not_accepted';
+  /** How the accepted work will execute: live, labelled demo simulation, or
+   * blocked before starting (disabled / missing credentials). */
+  execution?: ExecutionGate['kind'];
   counter_text?: string;
   /** Human-readable summary the model can echo verbatim. */
   narration: string;
@@ -109,6 +116,7 @@ export async function handleDelegateToBoard(
       delegation_id: '',
       board_name: parsed.board_name,
       decision: 'decline',
+      status: 'not_accepted',
       counter_text: `Unknown board: ${parsed.board_name}. Valid options: ${BOARDS.join(', ')}.`,
       narration: `The Great Skippy attempted to delegate to "${parsed.board_name}", which is not on the Board. Returning to plan.`,
     };
@@ -118,6 +126,7 @@ export async function handleDelegateToBoard(
       delegation_id: '',
       board_name: parsed.board_name,
       decision: 'decline',
+      status: 'not_accepted',
       counter_text: 'mission_brief was empty. Re-issue with a concrete one-sentence brief.',
       narration: `The ${parsed.board_name} Captain stared at me politely. Apparently "do something" is not a mission brief.`,
     };
@@ -133,18 +142,37 @@ export async function handleDelegateToBoard(
     delegation_id: ack.delegationId,
     board_name: ack.toBoardId,
     decision: ack.decision,
+    status: ack.decision === 'accept' ? 'accepted' : 'not_accepted',
     narration: describeAck(ack, parsed.mission_brief),
   };
+  if (ack.execution !== undefined) {
+    result.execution = ack.execution.kind;
+  }
   if (ack.counterText !== undefined) {
     result.counter_text = ack.counterText;
   }
   return result;
 }
 
+/** What an accepted delegation will actually do, so the narration can never
+ * imply that acknowledgement equals completion (FR-RUN-01). */
+function describeExecution(gate: ExecutionGate | undefined): string {
+  switch (gate?.kind) {
+    case 'live':
+      return 'Live execution starting; the outcome arrives later in delegation_complete. Not done yet.';
+    case 'demo':
+      return 'DEMO MODE: the outcome will be a labelled simulation. No actual work will be performed.';
+    case 'blocked':
+      return `Execution is BLOCKED (${gate.reason.message}) The outcome will be "blocked", not results.`;
+    default:
+      return 'The outcome arrives later in delegation_complete. Not done yet.';
+  }
+}
+
 function describeAck(ack: SupervisorAck, brief: string): string {
   switch (ack.decision) {
     case 'accept':
-      return `Delegated to ${ack.toBoardId} Captain: "${brief}". Acknowledgement received. Task queued.`;
+      return `Delegated to ${ack.toBoardId} Captain: "${brief}". Accepted (not completed). ${describeExecution(ack.execution)}`;
     case 'decline':
       return `${ack.toBoardId} Captain declined the brief: ${ack.counterText ?? 'no rationale provided'}. Reroute or replan.`;
     case 'counter_propose':

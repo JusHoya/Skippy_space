@@ -54,14 +54,16 @@ the Phase 3 exit criterion — using the **mock distiller**. Relevant env:
 - `LETTA_DISABLED=1` — Letta (D4) is deferred to Phase 3.5; clients no-op.
 - `OBSIDIAN_API_KEY` unset — the REST client reports unavailable and the
   pipeline writes to the filesystem only (the source of truth, PRD §8.9).
-- `PHASE3_AGENTS_ENABLED` unset — Board Captains run as the Phase-1 keyword
-  stub. Set it to `1` (with `ANTHROPIC_API_KEY`) to route accepted delegations
-  through a real Claude Agent SDK `query()` using the board's charter as the
-  system prompt (`sdk-board.ts`); any SDK failure falls back to the stub. The
-  Obsidian/Letta MCP *tools* are NOT wired into that path yet — `tool()` needs
-  the SDK's bundled zod v4 and this repo is on zod v3 (a workspace-wide upgrade
-  is a separate, gated task). Live board execution is validated manually, not
-  in this gate.
+- `PHASE3_AGENTS_ENABLED` unset — accepted delegations are **not executed**:
+  each ends in a `delegation_complete` with `outcome: "blocked"` (reason
+  `execution_disabled`; `missing_credentials` if the flag is set without
+  `ANTHROPIC_API_KEY`). Set it to `1` (with `ANTHROPIC_API_KEY`) to route
+  accepted delegations through a real Claude Agent SDK `query()` using the
+  board's charter as the system prompt (`sdk-board.ts`); SDK errors end as
+  `failed`, never as a stub "success" (PRD v0.2 FR-RUN-01). Set
+  `SKIPPY_DEMO_MODE=1` for an explicit, labelled demo: outcomes are
+  `simulated` (mode `demo`) and no work is performed. Live board execution is
+  validated manually, not in this gate.
 - `SKIPPY_REPLAY=0` / `SKIPPY_MEMORY_JOBS=0` — disable the replay writer / the
   memory watcher+cron respectively.
 

@@ -337,6 +337,7 @@ Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled
 | OQ-10 | Subscription login for orchestration | Per D-05: Codex app-server (managed ChatGPT login) and the unmodified `claude` binary, human-paced and event-driven; Agent SDK library use, background automation and evaluations use API keys with auto-reload and a hard monthly cap. See [research 11](research/11-subscription-orchestration-2026-09-26.md) |
 | OQ-11 | Ceiling for "ordinary use" of subscription lanes | At most ~1 subscription orchestrator turn per minute, only while the owner is active; back off at 70%/85% of a 5-hour window |
 | OQ-12 | Specialist model portfolio and residency | One resident LLM per machine; specialists load on demand through a multiplexer and unload when idle. See the [model plan](MODEL-AND-CLUSTER-PLAN.md) |
+| OQ-13 | Validation disposition before tasks carry acceptance criteria (FR-RUN-01) | Until M1 adds criteria, a live executor's terminal success records `validation: not_defined` and may be `succeeded`; `failed` validation always forces nonsuccess. Demo (`SKIPPY_DEMO_MODE=1`) records are `simulated`, disabled/missing-key runs are `blocked`, and legacy `result: success` reads as `unverified` |
 
 ### Owner decisions, 2026-09-26
 

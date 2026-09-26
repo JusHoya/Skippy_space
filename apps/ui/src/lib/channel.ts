@@ -185,20 +185,33 @@ export function useEventChannel(): void {
           console.info(`[skippy/ui] delegation ${env.delegationId} ack: ${env.decision}`);
           break;
         }
+        case 'delegation_state': {
+          // Non-terminal lifecycle (FR-RUN-01): accepted -> running.
+          useDelegationStore
+            .getState()
+            .setStatus(env.delegationId, env.state, env.ts, { mode: env.mode });
+          break;
+        }
         case 'delegation_complete': {
-          const status = env.result === 'success' ? 'succeeded' : 'failed';
-          useDelegationStore.getState().setStatus(env.delegationId, status, env.ts, {
-            result: env.result,
+          // Terminal record. The status IS the outcome — never inferred. Only
+          // `succeeded` is success; simulated/blocked/failed/interrupted stay
+          // visibly distinct (G0).
+          useDelegationStore.getState().setStatus(env.delegationId, env.outcome, env.ts, {
             summary: env.summary,
+            mode: env.mode,
+            validation: env.validation,
+            ...(env.reason !== undefined ? { reason: env.reason } : {}),
           });
           const targetAgentId = `board.${env.fromBoardId}` as AgentId;
           useAgentStore.getState().setAgent(targetAgentId, {
             state: 'idle',
             updatedAt: env.ts,
           });
-          console.info(
-            `[skippy/ui] delegation ${env.delegationId} complete (${env.result}): ${env.summary.slice(0, 80)}`,
-          );
+          const line = `[skippy/ui] delegation ${env.delegationId} ${env.outcome} (${env.mode}${
+            env.reason ? `, ${env.reason.code}` : ''
+          }): ${env.summary.slice(0, 80)}`;
+          if (env.outcome === 'succeeded') console.info(line);
+          else console.warn(line);
           break;
         }
         // ── Phase 3-prep variants — Zone 2 + Zone 5 own the real handlers,

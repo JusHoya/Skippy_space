@@ -109,13 +109,36 @@ pub enum Envelope {
         counter_text: Option<String>,
         ts: String,
     },
+    /// Board -> Skippy non-terminal lifecycle pulse (`state`: accepted | running;
+    /// `mode`: demo | live). PRD v0.2 FR-RUN-01.
+    DelegationState {
+        #[serde(rename = "delegationId")]
+        delegation_id: String,
+        #[serde(rename = "fromBoardId")]
+        from_board_id: String,
+        state: String,
+        mode: String,
+        ts: String,
+    },
+    /// Board -> Skippy terminal record (PRD v0.2 FR-RUN-01). `outcome` is one of
+    /// succeeded | failed | cancelled | interrupted | blocked | simulated; the
+    /// shell forwards it verbatim and never infers success. Mirrors
+    /// `DelegationCompleteEnvelope` + `TerminalRecordShape` in @skippy/shared.
     DelegationComplete {
         #[serde(rename = "delegationId")]
         delegation_id: String,
         #[serde(rename = "fromBoardId")]
         from_board_id: String,
-        result: String,
+        outcome: String,
+        mode: String,
+        validation: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<OutcomeReason>,
         summary: String,
+        #[serde(rename = "costUsd", skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        artifacts: Option<Vec<ArtifactRef>>,
         ts: String,
     },
 
@@ -155,6 +178,24 @@ pub enum Envelope {
     },
 }
 
+/// Machine-readable reason attached to every non-succeeded outcome.
+/// Mirrors `OutcomeReasonSchema` in `packages/shared/src/outcome.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeReason {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Reference to an artifact produced by a unit of work. Mirrors `ArtifactRefSchema`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub kind: String,
+    #[serde(rename = "ref")]
+    pub reference: String,
+}
+
 impl Envelope {
     /// Convenience constructor for shell-originated log envelopes.
     pub fn log(level: impl Into<String>, source: impl Into<String>, message: impl Into<String>) -> Self {
@@ -164,5 +205,31 @@ impl Envelope {
             message: message.into(),
             ts: chrono::Utc::now().to_rfc3339(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shell must forward the FR-RUN-01 outcome fields verbatim; dropping
+    /// `outcome`/`reason` would leave the renderer with an ambiguous record.
+    #[test]
+    fn delegation_complete_round_trips_outcome_fields() {
+        let line = r#"{"type":"delegation_complete","delegationId":"D1","fromBoardId":"coding","outcome":"blocked","mode":"live","validation":"not_run","reason":{"code":"execution_disabled","message":"disabled"},"summary":"did not run","ts":"2026-09-26T00:00:00.000Z"}"#;
+        let env: Envelope = serde_json::from_str(line).expect("parses");
+        let out = serde_json::to_value(&env).expect("serializes");
+        assert_eq!(out["outcome"], "blocked");
+        assert_eq!(out["mode"], "live");
+        assert_eq!(out["validation"], "not_run");
+        assert_eq!(out["reason"]["code"], "execution_disabled");
+        assert!(out.get("result").is_none());
+    }
+
+    #[test]
+    fn delegation_state_parses() {
+        let line = r#"{"type":"delegation_state","delegationId":"D1","fromBoardId":"coding","state":"running","mode":"live","ts":"2026-09-26T00:00:00.000Z"}"#;
+        let env: Envelope = serde_json::from_str(line).expect("parses");
+        assert!(matches!(env, Envelope::DelegationState { .. }));
     }
 }
