@@ -37,7 +37,6 @@ export default function CommandBar() {
     // the agentStore reference doesn't change identity (Zustand always
     // returns a new object on setAgent, but this guards against any future
     // stable-identity refactor).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     [agents, current?.streamed, current?.complete],
   );
 
