@@ -7,7 +7,7 @@
 | Target | Windows desktop; personal account sessions with organization decision records |
 | Implementation audience | Claude Opus, working in bounded, verified increments |
 | Baseline | `7b17b70`; branch `assessment/desktop-harness-prd-2026-09-25` |
-| Supporting documents | [Assessment](ASSESSMENT-2026-09-25.md), [research](research/08-revival-research-2026-09-25.md), [model plan](MODEL-AND-CLUSTER-PLAN.md), [handoff](CLAUDE-OPUS-HANDOFF.md), [quantization](research/09-quantization-2026-09-26.md), [cloud cost](research/10-cloud-orchestration-cost-2026-09-26.md) |
+| Supporting documents | [Assessment](ASSESSMENT-2026-09-25.md), [research](research/08-revival-research-2026-09-25.md), [model plan](MODEL-AND-CLUSTER-PLAN.md), [handoff](CLAUDE-OPUS-HANDOFF.md), [quantization](research/09-quantization-2026-09-26.md), [cloud cost](research/10-cloud-orchestration-cost-2026-09-26.md), [subscription lanes](research/11-subscription-orchestration-2026-09-26.md) |
 
 ## 0. Authority and scope
 
@@ -334,7 +334,9 @@ Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled
 | OQ-07 | Accepted quality/cost tradeoff | Provisional section 11 targets; failing routes remain experimental |
 | OQ-08 | Cheapest cloud tier that sustains orchestration | Run on the owner's current plan with per-turn metering (D-01); compare against lower subscription tiers and a capped API budget |
 | OQ-09 | Consolidated Alcyone model and quantization | Qualify per the [model plan](MODEL-AND-CLUSTER-PLAN.md); 35B-class interim if no larger candidate passes Hermes' 65,536-context/tool suite |
-| OQ-10 | Subscription login for automated orchestration | Personal use of the unmodified `claude` binary only; Agent SDK and always-on orchestration use a capped API key. See [research 10](research/10-cloud-orchestration-cost-2026-09-26.md) |
+| OQ-10 | Subscription login for orchestration | Per D-05: Codex app-server (managed ChatGPT login) and the unmodified `claude` binary, human-paced and event-driven; Agent SDK library use, background automation and evaluations use API keys with auto-reload and a hard monthly cap. See [research 11](research/11-subscription-orchestration-2026-09-26.md) |
+| OQ-11 | Ceiling for "ordinary use" of subscription lanes | At most ~1 subscription orchestrator turn per minute, only while the owner is active; back off at 70%/85% of a 5-hour window |
+| OQ-12 | Specialist model portfolio and residency | One resident LLM per machine; specialists load on demand through a multiplexer and unload when idle. See the [model plan](MODEL-AND-CLUSTER-PLAN.md) |
 
 ### Owner decisions, 2026-09-26
 
@@ -344,5 +346,7 @@ Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled
 | D-02 | **Consolidate Hermes** onto one larger shared Alcyone model | Supersedes "do not swap Hermes back automatically" for this maintenance window only; the swap is still an explicit, rollback-ready deployment with mixed-load evidence |
 | D-03 | Money Printer is **paused** and the Alcyone model service is shut down during cluster setup | OQ-01 inventory happens against a quiet host; factory/Hermes restart waits on the D-02 qualification |
 | D-04 | Local capacity targets **implementation volume**: a strong coding model on Atlas (16 GB VRAM + 64 GB RAM) | Replaces the 9B/8k Atlas development worker; retrieval models still share Atlas |
+| D-05 | **No prepaid API wallets** for orchestration | Primary orchestrator lane is Codex app-server on ChatGPT Pro; `claude -p` on Max is secondary/reviewer; local Alcyone fallback. D-01 metering tracks subscription window usage instead of dollars. Overflow uses capped auto-reload |
+| D-06 | Add **specialist models** (image, vision/OCR, speech, small utility models) loaded on demand | Resident memory is kept small: Qwen3.8-27B becomes the default Alcyone LLM so specialists fit beside it; Atlas' GPU is time-shared |
 
 These do not block M0/M1 or UI design. Resolve at the affected boundary. Do not re-ask settled preferences: balanced local/cloud, with Claude Opus as the requested implementation model family.

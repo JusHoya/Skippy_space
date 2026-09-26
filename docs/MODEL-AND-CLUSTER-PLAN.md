@@ -1,17 +1,17 @@
 # Model portfolio and Pleiades integration plan
 
-Revised 2026-09-26 for [PRD v0.2](PRD.md) decisions D-01–D-04. Supersedes the 2026-09-25 draft, which kept a 9B model at the center and treated larger models and a coding specialist as deferred. Evidence: [quantization research](research/09-quantization-2026-09-26.md), [cloud cost research](research/10-cloud-orchestration-cost-2026-09-26.md) and the model-fit survey summarized below. No downloads, service changes or live probes were performed; every speed and memory figure is a community or vendor report or an estimate until our own qualification reproduces it.
+Revised 2026-09-26 for [PRD v0.2](PRD.md) decisions D-01–D-06. Supersedes the 2026-09-25 draft, which kept a 9B model at the center and treated larger models and a coding specialist as deferred. Evidence: [quantization research](research/09-quantization-2026-09-26.md), [cloud cost research](research/10-cloud-orchestration-cost-2026-09-26.md), [subscription lanes](research/11-subscription-orchestration-2026-09-26.md), [specialist models](research/12-specialist-models-2026-09-26.md) and the model-fit survey summarized below. No downloads, service changes or live probes were performed; every speed and memory figure is a community or vendor report or an estimate until our own qualification reproduces it.
 
 ## 1. Role split
 
 | Role (PRD schema) | Where | Primary | Challenger / fallback | Why |
 |---|---|---|---|---|
-| **Skippy + board captains** (plan, decompose, route, monitor, synthesize) | Cloud (D-01) | Claude Sonnet 5 via capped API key, 1-hour prompt cache | Opus 5.5 for replanning, cross-board conflict and high-risk plans; GPT-6 Sol A/B | Low volume, high judgment. Metered per turn so the cheapest sustaining tier can be chosen (OQ-08, [research 10](research/10-cloud-orchestration-cost-2026-09-26.md)) |
-| **Local big brain** (Hermes + local heavy lifting + future orchestration port) | Alcyone, one consolidated vLLM server (D-02) | `nvidia/Qwen3.5-122B-A10B-NVFP4` | `nvidia/Qwen3.8-27B-NVFP4`; speed option `openai/gpt-oss-120b` | Largest model that fits cleanly with 4×64K sequences and mature Qwen tool parsing |
+| **Skippy + board captains** (plan, decompose, route, synthesize) | Cloud subscriptions (D-01, D-05) | Codex app-server on ChatGPT Pro (managed login, read-only sandbox; GPT-6 Sol/Astra via `model/list`) | `claude -p` on Max (unmodified binary, plan mode) as second lane and reviewer; local big brain when both lanes near limits | No prepaid wallets. Event-driven, human-paced; quota windows metered to pick the cheapest sustaining tier (OQ-08, OQ-11, [research 11](research/11-subscription-orchestration-2026-09-26.md)) |
+| **Local big brain** (Hermes + local heavy lifting + orchestration fallback/port) | Alcyone, one consolidated vLLM server (D-02) | `nvidia/Qwen3.8-27B-NVFP4` (~40 GB, multimodal) | `nvidia/Qwen3.5-122B-A10B-NVFP4` (~84 GB); speed option `openai/gpt-oss-120b` | Highest published agentic scores per GB; leaves ~50 GB for specialists (D-06) |
 | **Coding task agents** (Coding/Engineering implementation volume) | Atlas (D-04) | `unsloth/Qwen3.6-35B-A3B-GGUF` UD-Q4_K_XL + expert offload | `unsloth/Qwen3.8-27B-GGUF` UD-Q3_K_XL fully in VRAM; experiment `unsloth/Qwen3-Coder-Next-GGUF` Q4_K_M; baseline `openai/gpt-oss-20b` | Best agentic-coding score that runs fast in 16 GB VRAM + 64 GB RAM |
-| **Coding escalation** | Cloud | Claude Code (Sonnet 5 / Opus 5.5) on the owner's plan | Codex app-server (GPT-6 Sol/Astra) as implementer or cross-vendor reviewer | After one bounded local attempt fails, or directly for high-risk work (FR-ROUTE-03) |
+| **Coding escalation** | Cloud subscriptions | Claude Code (Sonnet 5 / Opus 5.5) on the owner's plan | Codex app-server (GPT-6 Sol/Astra) as implementer or cross-vendor reviewer | After one bounded local attempt fails, or directly for high-risk work (FR-ROUTE-03) |
 | **Typed triage** | Hosted Jev, shadow mode | `jev-1.13.0` | Deterministic rules | Board assignment, routing, escalation and evidence checks at near-zero cost (PRD §9) |
-| **Retrieval** | Atlas CPU/GPU, bounded batches | `Qwen/Qwen3-Embedding-0.6B` | `Qwen/Qwen3-Reranker-0.6B` when a retrieval baseline exists | Unchanged from the 2026-09-25 draft |
+| **Specialists** (image, OCR, speech, router, FIM, guards, retrieval) | Resident small tier + on-demand pool on both machines | See §3a | See [research 12](research/12-specialist-models-2026-09-26.md) | Small purpose-built models composed by the harness instead of one model for everything |
 
 Board identity does not select hardware: eight logical boards share these routes through each charter's `execution_profile` (FR-BOARD-01). Skippy never implements (Iron Law); the local coder is a task-agent route.
 
@@ -28,7 +28,7 @@ Board identity does not select hardware: eight logical boards share these routes
 | gpt-oss-120b MXFP4 | 117B / 5.1B | ~61 GB | ~75 GB | 38 stock; up to 69 patched + EAGLE-3 | SWE-V 62.4 | harmony (qualify) |
 | Nemotron-3-Super-120B-A12B NVFP4 | 120B / 12B | ~75 GB | ~82 GB | ~23 flat to 100K | TB-hard 25.8 | `qwen3_xml` / `nemotron_v3` |
 
-**Decision rule.** Qualify the 122B first (largest model that fits) and the 27B as head-to-head challenger. If the 27B matches the 122B on the Hermes suite and our harness evaluations, prefer it: roughly 45 GB of freed memory becomes concurrency or a second on-demand service. Otherwise keep the 122B. Record the outcome in OQ-09.
+**Decision rule (revised for D-06).** The 27B is the default: it has the higher published agentic scores, is natively multimodal, and leaves room for the specialist tier (§3a, Variant A). Qualify the 122B head-to-head; adopt it only if it clearly beats the 27B on the Hermes suite and our harness evaluations, in which case capping it at ~75 GB (Variant B) pushes image, video, 3D and heavy speech to Atlas or scheduled sleep windows. Record the outcome in OQ-09.
 
 **Watch list, not candidates yet:** Qwen3.8-Flash-Next 125B-A6B (NVFP4 ≈125 GiB; fits only with unmerged vLLM patches that stream its n-gram table from NVMe); DeepSeek-V4-Flash 284B-A13B (needs a Q2 GGUF and a non-standard engine/tool format); MiniMax-M2.7 229B-A10B (~80 GB at IQ3_XXS, untested quality). **Rejected:** Mistral Small 4 (context capped at 40K on Spark, below Hermes' 65,536), dense Mistral Medium 3.5 128B (~3–4 tok/s), anything needing 2+ Sparks.
 
@@ -61,16 +61,44 @@ Atlas is DESKTOP-HOYA: RTX 5070 Ti 16 GB, 64 GB DDR5, i9-14900K, Intel UHD 770 i
 
 Tool execution stays in Skippy's Windows worktree; the Atlas endpoint returns proposals and binds to localhost.
 
+## 3a. Specialists and residency (D-06)
+
+One resident LLM per machine; everything else is a small resident service or an on-demand lease. Full portfolio, licenses and sources: [research 12](research/12-specialist-models-2026-09-26.md).
+
+| Capability | Primary | Machine | Residency |
+|---|---|---|---|
+| Fast image gen + edit | FLUX.2 [klein] 4B (Apache) | Atlas | GPU lease |
+| Text/UI-mockup images, edits | Qwen-Image-2512 / Qwen-Image-Edit-2511 (Apache) | Atlas (GGUF) or Alcyone (FP8) | On-demand |
+| PDF → Markdown OCR | PaddleOCR-VL-1.6 (Apache); GLM-OCR | Alcyone | On-demand, short TTL |
+| Screenshot/UI review | Resident multimodal LLM; Qwen3.5-9B/4B | Alcyone; Atlas | Resident / on-demand |
+| Speech-to-text | Qwen3-ASR-1.7B; Voxtral Mini 4B Realtime for streaming | Alcyone; Atlas CPU fallback | Resident |
+| Skippy's voice | Qwen3-TTS (designed original voice) → Kokoro CPU fallback | Alcyone; Atlas CPU | Resident |
+| Router / classify / JSON | Qwen3.5-4B non-thinking | Alcyone | Resident |
+| FIM autocomplete | Qwen2.5-Coder-1.5B base | Atlas GPU | Resident beside coder |
+| Embeddings / reranker | Qwen3-Embedding-0.6B / Qwen3-Reranker-0.6B | Alcyone (+ Atlas CPU copy) | Resident |
+| Guards | Qwen3Guard-Stream/Gen-0.6B; ProtectAI prompt-injection screen | Alcyone; Atlas CPU | Resident |
+| Music / video / 3D | ACE-Step 1.5 / Wan 2.2 5B / TRELLIS.2 | Alcyone | On-demand batch |
+
+**Alcyone budget (Variant A, ~90 GB):** resident LLM 40 GB + resident small tier ~22 GB + on-demand pool ~28 GB (one or two jobs: image FP8, OCR + VLM, streaming STT, or a video/3D batch). Larger diffusion jobs go to Atlas or wait for a scheduled window.
+
+**Atlas modes:** *coding* (default) — coder with partial expert offload ~12–13 GB + FIM ~1.7 GB in VRAM, CPU services (Kokoro, prompt-injection screen, whisper.cpp/Parakeet, embedding copy) on the i9; *image lease* — coder unloaded, ComfyUI loaded; the coder GGUF stays in the Windows file cache so reload should take seconds (measure).
+
+**Runtimes:** llama-swap as each machine's front door (persistent resident group, exclusive on-demand groups with TTL), launching vLLM or `llama-server` router mode; ComfyUI for diffusion with `/free` after jobs. A **GPU lease broker in the agent-runtime sidecar** grants Atlas image leases (unload coder → run ComfyUI → free → reload → emit spans). Defaults: the coder lease wins; image jobs queue unless Atlas is idle or the owner asks; the Alcyone on-demand pool is first-come with a 10-minute TTL; non-commercial models are gated by `license_class: noncommercial` in the deployment catalog. On GB10 prefer vLLM sleep level 2 over level 1 (unified memory; verify).
+
+**Qualification applies to specialists too:** manifest, license check, peak memory, cold-load time and a small task suite (OCR accuracy on our PDFs, image prompt adherence, voice latency) before a specialist becomes routable.
+
 ## 4. Routing examples
 
 | Task | First route | Escalation / validation |
 |---|---|---|
-| Decompose a mission into board tasks | Cloud orchestrator (Sonnet 5) | Opus 5.5 if replanning after failure or high risk |
+| Decompose a mission into board tasks | Codex app-server orchestrator (GPT-6 Sol) | Claude Code (Opus 5.5) for replanning after failure or high risk; local big brain when both lanes near limits |
 | Which board owns this? Retry or escalate? | Rules, then Jev (shadow) | Orchestrator on low confidence |
 | Add a small TypeScript utility and tests | Atlas coder | One bounded retry, then Claude Code / Codex; tests decide success |
 | Multi-file refactor with clear tests | Atlas coder or Alcyone big brain | Cloud escalation after a failed attempt |
 | Diagnose a cross-module orchestration failure | Alcyone big brain when capacity permits | Direct to Opus/Codex when risk merits it |
 | Schema migration, permission boundaries | Opus 5.5 / Codex Astra | Human-visible plan, regression tests, cross-vendor review |
+| Ingest a scanned PDF into the wiki | PaddleOCR-VL → Markdown with page offsets | Original preserved; draft note awaits review (FR-WIKI-03/04) |
+| Design a board-captain costume layer | FLUX.2 klein 4B ideation → Qwen-Image-Edit iteration | Multimodal LLM critique; owner approval |
 | Find the wiki decision behind a service limit | Lexical + embeddings (+ reranker) | Return source spans; generation optional |
 | Money Printer promotion/capital decision | Existing deterministic gates and owner | Skippy may summarize approved reports only |
 
@@ -84,13 +112,14 @@ Tool execution stays in Skippy's Windows worktree; the Atlas endpoint returns pr
 
 **Promotion gates:** zero crashes/OOMs and permission violations; Hermes p95 latency and factory throughput within 10% of their baseline under mixed load (product target; operator may tighten); route passes its task-family threshold (PRD G3). A failed gate keeps the previous qualified route. Model or runtime updates return a route to candidate status.
 
-## 6. Cloud metering (D-01)
+## 6. Cloud metering (D-01, D-05)
 
-Run orchestration on a dedicated, capped Anthropic API workspace for two weeks; log every turn's input, cache-read, cache-write and output tokens, model and effort to the local ledger keyed by run/attempt/board. Then apply the switching thresholds in [research 10](research/10-cloud-orchestration-cost-2026-09-26.md) §5: stay on API, move to a $20 tier, a $100 tier, or port orchestration to the Alcyone big brain once it is qualified. Subscription sessions remain for the owner's interactive Claude Code / Codex use (OQ-10).
+Orchestration runs on subscriptions, so the primary metric is **quota-window usage**, not dollars: Codex `account/rateLimits` (5-hour and weekly `usedPercent`) and Claude Code `rate_limits.five_hour/seven_day`, plus per-turn tokens from `thread/tokenUsage/updated` and stream-json results, logged to the local ledger by run/attempt/board. Backoff: ≥70% of a 5-hour window moves new planning turns to the other subscription; ≥85% sends non-critical turns local; a reached limit hard-stops that lane. After two weeks, compare peak window usage with lower tiers (ChatGPT Plus, Claude Pro) and the cost model in [research 10](research/10-cloud-orchestration-cost-2026-09-26.md). API keys exist only for Agent SDK library use, background automation and evaluations, each with auto-reload and a hard monthly cap ([research 11](research/11-subscription-orchestration-2026-09-26.md)).
 
 ## 7. Open items
 
-- OQ-09: 122B vs 27B consolidated choice (decided by the suite above).
+- OQ-09: 27B default vs 122B challenger (decided by the suite above).
+- OQ-12: specialist residency defaults and lease policy; verify the NVFP4 27B keeps its vision tower.
 - Qualify Qwen3.8-27B at 3-bit before trusting it on Atlas.
 - Check the qwen-community-1.0 license before ever adopting Qwen3.8-Flash-Next.
 - Re-verify every repo revision, tokenizer fix (e.g. early `unsloth/Qwen3.8-27B-NVFP4` truncated input at 2,048 tokens) and parser name at download time.
