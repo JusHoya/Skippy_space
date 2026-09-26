@@ -21,6 +21,8 @@ export interface ExtractedText {
   text: string;
   /** The encoding actually used to decode (always 'utf-8' for M0's qualified set). */
   encoding: 'utf-8';
+  /** True if a UTF-8 BOM was present and stripped. */
+  bomStripped: boolean;
 }
 
 export interface Extractor {
@@ -44,7 +46,14 @@ export class InvalidEncodingError extends Error {
 
 const UTF8_BOM = 0xfeff;
 
-/** Strict UTF-8 text extractor: fatal decode (no lossy replacement chars), BOM stripped. */
+/**
+ * Strict UTF-8 text extractor: fatal decode (no lossy replacement chars), BOM
+ * stripped, NUL bytes rejected (A04/E4-6). `TextDecoder({fatal:true})` alone
+ * accepts UTF-16LE text with no BOM (every other byte is a valid single-byte
+ * UTF-8 NUL) and accepts embedded NUL bytes in general — both are symptoms of
+ * a mis-declared encoding, not valid text content for a vault note, so we
+ * reject them explicitly rather than silently ingest mojibake.
+ */
 function decodeStrictUtf8(buf: Buffer): ExtractedText {
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let text: string;
@@ -53,10 +62,17 @@ function decodeStrictUtf8(buf: Buffer): ExtractedText {
   } catch (err) {
     throw new InvalidEncodingError(err instanceof Error ? err.message : String(err));
   }
+  let bomStripped = false;
   if (text.length > 0 && text.charCodeAt(0) === UTF8_BOM) {
     text = text.slice(1);
+    bomStripped = true;
   }
-  return { text, encoding: 'utf-8' };
+  if (text.includes('\u0000')) {
+    throw new InvalidEncodingError(
+      'decoded text contains NUL (U+0000) byte(s); likely a mis-declared encoding (e.g. UTF-16 without a BOM)',
+    );
+  }
+  return { text, encoding: 'utf-8', bomStripped };
 }
 
 const utf8TextExtractor: Extractor = {

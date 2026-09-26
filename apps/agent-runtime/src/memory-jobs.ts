@@ -26,6 +26,7 @@ import {
   runLint,
   mockDistill,
   watchInbox,
+  recordUnsupported,
   type DistillFn,
   type JobEvent,
   type InboxWatcher,
@@ -185,10 +186,43 @@ export function startMemoryJobs(): MemoryJobsHandle {
     distillMode: process.env.SKIPPY_DISTILL_MODE === 'llm' ? 'llm' : 'mock',
   });
 
+  // E4-3: serialize drops through a single FIFO queue rather than firing an
+  // unawaited `processDrop` per watcher event — two concurrent identical
+  // drops must not both observe "not yet ingested" and both mint a note. (A
+  // per-content-hash lock inside `runIngest` itself is the deeper fix for
+  // multi-process/resumed-run correctness; this queue additionally keeps the
+  // sidecar's own event ordering sane for humans watching the log.)
+  let dropQueue: Promise<void> = Promise.resolve();
+  const enqueueDrop = (absPath: string): void => {
+    dropQueue = dropQueue
+      .then(() => processDrop(vaultRoot, absPath, distill))
+      .catch((err) => {
+        logger.warn({ msg: 'queued processDrop failed', err: String(err) });
+      });
+  };
+
   const watcher: InboxWatcher = watchInbox({
     vaultRoot,
     onFile: (absPath) => {
-      void processDrop(vaultRoot, absPath, distill);
+      enqueueDrop(absPath);
+    },
+    onUnsupported: (absPath, ext) => {
+      // E4-5: an unsupported drop must get the same explicit, on-disk error
+      // record + `memory_job` event as a `runIngest`-detected failure, not
+      // just a console warning.
+      void (async () => {
+        try {
+          await recordUnsupported(vaultRoot, absPath, ext);
+        } catch (err) {
+          logger.warn({ msg: 'failed to record unsupported-format sidecar', err: String(err) });
+        }
+        emitJob({
+          job: 'ingest',
+          phase: 'error',
+          sourcePath: absPath,
+          detail: `unsupported format "${ext}"; original left intact, see .ingest-error.json`,
+        });
+      })();
     },
   });
 

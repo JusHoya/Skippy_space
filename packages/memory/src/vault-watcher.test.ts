@@ -77,3 +77,64 @@ test('an .ingest-error.json sidecar is ignored, never re-enqueued', async () => 
     await watcher.close();
   }
 });
+
+// E4-2: a file already sitting in the inbox BEFORE the watcher starts (e.g.
+// a crash left it there, or the sidecar restarted mid-backlog) must still be
+// enqueued — not silently stranded forever because `ignoreInitial` skipped it.
+test('E4-2: a pre-existing inbox file is enqueued by the startup scan', async () => {
+  const vaultRoot = await makeVault();
+  await fs.writeFile(path.join(vaultRoot, '00_Inbox', 'leftover.md'), '# Leftover\n');
+
+  const supported: string[] = [];
+  const watcher = watchInbox({ vaultRoot, onFile: (p) => supported.push(p) });
+  try {
+    await waitFor(() => supported.length >= 1, 4000);
+    assert.ok(supported[0]!.endsWith('leftover.md'));
+  } finally {
+    await watcher.close();
+  }
+});
+
+// E4-2: a file that previously failed (recorded via its `.ingest-error.json`
+// sidecar) and is later overwritten with DIFFERENT content must be retried —
+// the old failure recorded a different content hash, so this isn't a loop.
+test('E4-2: a file overwritten with different content after a failure is retried', async () => {
+  const vaultRoot = await makeVault();
+  const inboxDir = path.join(vaultRoot, '00_Inbox');
+  const target = path.join(inboxDir, 'retry.md');
+  await fs.writeFile(target, '# First\n');
+
+  // Simulate a prior failed ingest of the FIRST content (mirrors what
+  // `ingest/errors.ts#writeIngestError` would have written for it).
+  const { sha256Hex } = await import('./ingest/originals.js');
+  const firstHash = sha256Hex(await fs.readFile(target));
+  await fs.writeFile(
+    `${target}.ingest-error.json`,
+    JSON.stringify({
+      sourcePath: target,
+      reason: 'invalid-encoding',
+      detail: 'simulated prior failure',
+      extension: '.md',
+      at: new Date().toISOString(),
+      contentSha256: firstHash,
+    }),
+  );
+
+  const supported: string[] = [];
+  const watcher = watchInbox({ vaultRoot, onFile: (p) => supported.push(p) });
+  try {
+    // Startup scan sees the SAME content the sidecar already covers — must
+    // NOT be re-enqueued (no infinite fail-retry loop).
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(supported.length, 0, 'unchanged failing content is not re-enqueued');
+
+    // Now the file is overwritten with genuinely different content — this
+    // must be retried.
+    await new Promise((r) => setTimeout(r, 300));
+    await fs.writeFile(target, '# Second, actually different\n');
+    await waitFor(() => supported.length >= 1, 4000);
+    assert.ok(supported[0]!.endsWith('retry.md'));
+  } finally {
+    await watcher.close();
+  }
+});

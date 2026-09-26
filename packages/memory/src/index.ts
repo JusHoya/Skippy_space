@@ -26,3 +26,6 @@ export * from './vector-store.js';
 // Phase 3 (WS5) — the four-job memory pipeline + inbox watcher.
 export * from './jobs/index.js';
 export * from './vault-watcher.js';
+// M0 WS-E (FR-WIKI-03) — explicit ingest-failure reporting, for runtime wiring
+// that needs to record an unsupported drop outside `runIngest` itself (E4-5).
+export { recordUnsupported, readIngestError, type IngestErrorRecord } from './ingest/errors.js';

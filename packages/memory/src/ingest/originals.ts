@@ -20,10 +20,18 @@ import * as path from 'node:path';
 
 import writeFileAtomic from 'write-file-atomic';
 
+import { ensureContainedParentDir, recheckContained, resolveContained } from '../vault-path.js';
+
 // NOTE: this module writes its own binary/JSON payloads directly via
 // `write-file-atomic` (same tmp+rename primitive `atomic.ts` wraps for note
 // text) rather than importing `atomic.ts`'s `atomicWrite`, which is typed for
 // UTF-8 note bodies only and owned by the concurrent WS-D workstream.
+//
+// E3-2 (containment): every write below resolves its target through
+// `resolveContained` (the same real, junction/symlink-resolved proof the note
+// broker uses) and rechecks it immediately before the write, so a junction
+// planted at `60_Sources/`, `60_Sources/originals/`, or the store file itself
+// cannot redirect a "vault write" outside the vault.
 
 /** `<vaultRoot>/60_Sources/originals` — the content-addressed original store. */
 export function originalsDir(vaultRoot: string): string {
@@ -42,14 +50,42 @@ export interface NoteMarker {
   ext: string;
 }
 
-/** Absolute path to the original's content-addressed copy. */
+/** Absolute path to the original's content-addressed copy (informational; not a trust boundary). */
 export function originalStorePath(vaultRoot: string, hash: string, ext: string): string {
   return path.join(originalsDir(vaultRoot), `${hash}${ext}`);
 }
 
-/** Absolute path to the hash's completion marker. */
+/** Absolute path to the hash's completion marker (informational; not a trust boundary). */
 export function markerPath(vaultRoot: string, hash: string): string {
   return path.join(originalsDir(vaultRoot), `${hash}.note.json`);
+}
+
+/** Vault-relative path (POSIX form) of the original's content-addressed copy. */
+function originalStoreRelPath(hash: string, ext: string): string {
+  return `60_Sources/originals/${hash}${ext}`;
+}
+
+/** Vault-relative path (POSIX form) of the hash's completion marker. */
+function markerRelPath(hash: string): string {
+  return `60_Sources/originals/${hash}.note.json`;
+}
+
+/**
+ * Create `60_Sources/originals/` safely (validated real containment, never a
+ * blind `mkdir -p` through an unchecked ancestor) and return its absolute
+ * path. Used to seat the per-hash ingest lock file (E4-3) alongside the store.
+ */
+export async function ensureOriginalsDir(vaultRoot: string): Promise<string> {
+  // Resolve a target ONE LEVEL under `originals/` (never actually written) so
+  // `ensureContainedParentDir` — which creates the TARGET's missing parents,
+  // re-proving containment after each level — creates `60_Sources/` and
+  // `60_Sources/originals/` themselves, level by level, with no blind
+  // `mkdir -p` through an unchecked ancestor.
+  const cp = await resolveContained(vaultRoot, '60_Sources/originals/.lock-anchor', {
+    allowHidden: true,
+    allowNonFileTarget: true,
+  });
+  return ensureContainedParentDir(cp);
 }
 
 export class OriginalIntegrityError extends Error {
@@ -58,15 +94,6 @@ export class OriginalIntegrityError extends Error {
       `original preservation integrity check failed for ${target}: expected sha256 ${expected}, got ${actual}`,
     );
     this.name = 'OriginalIntegrityError';
-  }
-}
-
-async function exists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
   }
 }
 
@@ -84,35 +111,71 @@ export async function preserveOriginal(
   ext: string,
 ): Promise<{ hash: string; storePath: string }> {
   const hash = sha256Hex(buf);
-  const dest = originalStorePath(vaultRoot, hash, ext);
+  const cp = await resolveContained(vaultRoot, originalStoreRelPath(hash, ext));
 
-  if (await exists(dest)) {
-    const existing = await fs.readFile(dest);
+  if (cp.exists) {
+    const existing = await fs.readFile(cp.abs);
     const existingHash = sha256Hex(existing);
     if (existingHash !== hash) {
-      throw new OriginalIntegrityError(dest, hash, existingHash);
+      throw new OriginalIntegrityError(cp.abs, hash, existingHash);
     }
-    return { hash, storePath: dest };
+    return { hash, storePath: cp.abs };
   }
 
-  await fs.mkdir(path.dirname(dest), { recursive: true });
+  // Safe directory creation: `ensureContainedParentDir` creates any missing
+  // parent levels one at a time, re-proving containment after each (never a
+  // blind `mkdir -p` through an unchecked ancestor), then we recheck the
+  // target itself once more (no lock here: originals are content-addressed
+  // and idempotent; the per-hash lock in jobs/ingest.ts serializes concurrent
+  // ingests of the same content) right before the write.
+  await ensureContainedParentDir(cp);
+  await recheckContained(cp);
   // tmp + rename (same primitive `atomic.ts` uses elsewhere) so a crash
   // mid-copy never leaves a half-written file at the content-addressed path.
-  await writeFileAtomic(dest, buf);
+  await writeFileAtomic(cp.abs, buf);
 
-  const written = await fs.readFile(dest);
+  const written = await fs.readFile(cp.abs);
   const writtenHash = sha256Hex(written);
   if (writtenHash !== hash) {
-    throw new OriginalIntegrityError(dest, hash, writtenHash);
+    throw new OriginalIntegrityError(cp.abs, hash, writtenHash);
   }
-  return { hash, storePath: dest };
+  return { hash, storePath: cp.abs };
+}
+
+/**
+ * Unconditionally (re)write the content-addressed store entry for `buf`,
+ * even if a DIFFERENT (corrupted) copy already sits at that path (E4-1).
+ * Unlike `preserveOriginal` — which trusts an existing copy that hashes
+ * correctly and THROWS rather than silently clobber one that doesn't — this
+ * is for the one caller (the dedup repair path in jobs/ingest.ts) that has
+ * already independently verified `buf` against a durable, hash-committed
+ * marker and is explicitly repairing a proven-corrupt or missing store
+ * entry, not trusting an unverified write.
+ */
+export async function repairOriginal(
+  vaultRoot: string,
+  buf: Buffer,
+  ext: string,
+): Promise<{ hash: string; storePath: string }> {
+  const hash = sha256Hex(buf);
+  const cp = await resolveContained(vaultRoot, originalStoreRelPath(hash, ext));
+  await ensureContainedParentDir(cp);
+  await recheckContained(cp);
+  await writeFileAtomic(cp.abs, buf);
+  const written = await fs.readFile(cp.abs);
+  const writtenHash = sha256Hex(written);
+  if (writtenHash !== hash) {
+    throw new OriginalIntegrityError(cp.abs, hash, writtenHash);
+  }
+  return { hash, storePath: cp.abs };
 }
 
 /** Read a hash's completion marker, or `null` if absent/unparseable. */
 export async function readMarker(vaultRoot: string, hash: string): Promise<NoteMarker | null> {
-  const p = markerPath(vaultRoot, hash);
   try {
-    const raw = await fs.readFile(p, 'utf8');
+    const cp = await resolveContained(vaultRoot, markerRelPath(hash));
+    if (!cp.exists) return null;
+    const raw = await fs.readFile(cp.abs, 'utf8');
     const parsed = JSON.parse(raw) as Partial<NoteMarker>;
     if (
       typeof parsed.sourceId === 'string' &&
@@ -135,7 +198,8 @@ export async function readMarker(vaultRoot: string, hash: string): Promise<NoteM
  * re-drop of the same content, or a resumed run, skip straight to cleanup.
  */
 export async function writeMarker(vaultRoot: string, marker: NoteMarker): Promise<void> {
-  const p = markerPath(vaultRoot, marker.hash);
-  await fs.mkdir(path.dirname(p), { recursive: true });
-  await writeFileAtomic(p, JSON.stringify(marker, null, 2));
+  const cp = await resolveContained(vaultRoot, markerRelPath(marker.hash));
+  await ensureContainedParentDir(cp);
+  await recheckContained(cp);
+  await writeFileAtomic(cp.abs, JSON.stringify(marker, null, 2));
 }
