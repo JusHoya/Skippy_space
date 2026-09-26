@@ -85,9 +85,11 @@ export function requestedMcpServers(charter: Charter): string[] {
 }
 
 /**
- * Build the in-process Obsidian MCP server: surgical edits + search backed by the
- * WS2 ObsidianRestClient (live index) and atomic fs writes. Every tool degrades
- * to isError text when Obsidian/the vault is offline.
+ * Build the in-process Obsidian MCP server. Reads/search may use the WS2
+ * ObsidianRestClient (live index, read-only); EVERY write tool (write_note,
+ * patch_frontmatter, append_block) goes through the local VaultBroker, never
+ * REST (M0 red-team E3-3). Every tool degrades to isError text when
+ * Obsidian/the vault is offline or a write is refused.
  */
 export function buildObsidianServer(vaultRoot: string, broker: McpBroker): McpServerConfig {
   const client = new ObsidianRestClient();
@@ -99,9 +101,9 @@ export function buildObsidianServer(vaultRoot: string, broker: McpBroker): McpSe
     tools: [
       tool(
         'obsidian_read_note',
-        'Read a vault note (raw markdown incl. frontmatter) by its vault-relative path, e.g. "10_Atomic/x.md".',
+        'Read a vault note (raw markdown incl. frontmatter) by its vault-relative path, e.g. "10_Atomic/x.md". For .md notes the first line is "sha256: <hash>" — pass it as expected_hash when editing.',
         { path: z.string() },
-        b('obsidian_read_note', (args) => handleObsidianRead(client, args)),
+        b('obsidian_read_note', (args) => handleObsidianRead(client, args, vaultRoot)),
       ),
       tool(
         'obsidian_search',
@@ -111,15 +113,15 @@ export function buildObsidianServer(vaultRoot: string, broker: McpBroker): McpSe
       ),
       tool(
         'obsidian_patch_frontmatter',
-        'Replace a single frontmatter field on an existing note in place.',
-        { path: z.string(), key: z.string(), value: z.string() },
-        b('obsidian_patch_frontmatter', (args) => handleObsidianPatchFrontmatter(client, args)),
+        'Replace a single frontmatter field on an existing (non agent_log/daily) note, compare-and-swap: expected_hash is the sha256 from obsidian_read_note; a mismatch is a conflict. key must be lowercase snake_case and not id/created_at/updated_at/type. value is parsed as JSON when valid (numbers, booleans, null, arrays), otherwise used as a string.',
+        { path: z.string(), key: z.string(), value: z.string(), expected_hash: z.string() },
+        b('obsidian_patch_frontmatter', (args) => handleObsidianPatchFrontmatter(vaultRoot, args)),
       ),
       tool(
         'obsidian_append_block',
-        'Append a markdown block to the end of a note (append-only).',
+        'Append a markdown block to the end of an EXISTING agent_log or daily note (append-only; never creates a note — use obsidian_write_note).',
         { path: z.string(), markdown: z.string() },
-        b('obsidian_append_block', (args) => handleObsidianAppendBlock(client, args)),
+        b('obsidian_append_block', (args) => handleObsidianAppendBlock(vaultRoot, args)),
       ),
       tool(
         'obsidian_write_note',

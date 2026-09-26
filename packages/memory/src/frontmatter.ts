@@ -9,7 +9,10 @@
 // that carry extra fields (e.g. a `weekly` note's rollup pointers) round-trip
 // losslessly — we validate the closed core, preserve the rest.
 
+import { isDeepStrictEqual } from 'node:util';
+
 import matter from 'gray-matter';
+import yaml from 'js-yaml';
 import { z } from 'zod';
 import { ulid } from 'ulid';
 
@@ -134,9 +137,26 @@ export interface ParsedNote {
   body: string;
 }
 
+// YAML is parsed with js-yaml's CORE_SCHEMA (null/bool/int/float/str/seq/map),
+// i.e. WITHOUT the YAML 1.1 `timestamp` type. gray-matter's default engine
+// turns `due: 2026-10-01` into a Date, which a rewrite then serializes as
+// `2026-10-01T00:00:00.000Z` — silent type drift in unknown metadata (FR-WIKI-02,
+// red-team E3-5). Timestamps stay the exact strings the author wrote; §8.3's
+// `created_at`/`updated_at` are validated as ISO datetime strings anyway.
+const MATTER_OPTS = {
+  engines: {
+    yaml: (s: string): object => {
+      const data = yaml.load(s, { schema: yaml.CORE_SCHEMA });
+      return data !== null && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    },
+  },
+};
+
 /** Parse a markdown note into { frontmatter, body }. Does not validate. */
 export function parseNote(raw: string): ParsedNote {
-  const file = matter(raw);
+  // Passing options also bypasses gray-matter's shared parse cache, so each
+  // caller gets its own (mutable) frontmatter object.
+  const file = matter(raw, MATTER_OPTS);
   return { frontmatter: file.data as Record<string, unknown>, body: file.content };
 }
 
@@ -191,6 +211,77 @@ export function serializeNote(
   // body always starts cleanly after the closing fence.
   const content = body.startsWith('\n') ? body : `\n${body}`;
   return matter.stringify(content, canonicalize(parsed.data));
+}
+
+const SURGICAL_KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const FENCED_RE = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/;
+
+/**
+ * Re-serialize an edited note while preserving the author's frontmatter text
+ * (FR-WIKI-02 "preserve unknown metadata and authored text"; red-team E3-5).
+ *
+ * Only the top-level lines of keys whose value changed are rewritten (a new key
+ * is appended before the closing fence); comments, key order, quoting and every
+ * untouched value stay byte-for-byte. The result is re-parsed and must yield
+ * exactly `frontmatter` and `body`; if the surgical edit cannot be proven
+ * equivalent (unusual YAML such as anchors, flow maps spanning lines, a removed
+ * key), it falls back to the canonical `serializeNote` output, which drops
+ * comments. Validates §8.3 and THROWS on invalid input, like `serializeNote`.
+ */
+export function serializeNotePreserving(
+  originalRaw: string,
+  frontmatter: NoteFrontmatterInput,
+  body: string,
+): string {
+  const canonical = serializeNote(frontmatter, body); // validates §8.3
+  try {
+    return surgicalEdit(originalRaw, frontmatter, body) ?? canonical;
+  } catch {
+    return canonical;
+  }
+}
+
+function surgicalEdit(
+  originalRaw: string,
+  frontmatter: NoteFrontmatterInput,
+  body: string,
+): string | null {
+  const m = FENCED_RE.exec(originalRaw);
+  if (!m) return null;
+  const eol = originalRaw.includes('\r\n') ? '\r\n' : '\n';
+  const before = parseNote(originalRaw).frontmatter;
+  const target = Object.fromEntries(
+    Object.entries(frontmatter).filter(([, v]) => v !== undefined),
+  );
+  // A key removal cannot be expressed surgically; let the canonical path do it.
+  if (Object.keys(before).some((k) => !(k in target))) return null;
+
+  const lines = (m[1] ?? '').split(/\r?\n/);
+  for (const [key, value] of Object.entries(target)) {
+    if (isDeepStrictEqual(value, before[key])) continue;
+    if (!SURGICAL_KEY_RE.test(key)) return null;
+    const rendered = yaml
+      .dump({ [key]: value }, { lineWidth: -1, noRefs: true })
+      .replace(/\n+$/, '')
+      .split('\n');
+    const keyRe = new RegExp(`^${key}[ \\t]*:`);
+    const hits = lines.flatMap((l, i) => (keyRe.test(l) ? [i] : []));
+    if (hits.length > 1) return null;
+    if (hits.length === 0) {
+      lines.push(...rendered);
+      continue;
+    }
+    const start = hits[0]!;
+    let end = start + 1;
+    // The value's extent: indented continuation lines and column-0 sequence items.
+    while (end < lines.length && /^([ \t]|-([ \t]|$))/.test(lines[end]!)) end++;
+    lines.splice(start, end - start, ...rendered);
+  }
+
+  const out = `---${eol}${lines.join(eol)}${eol}---${eol}${body}`;
+  const check = parseNote(out);
+  if (check.body !== body || !isDeepStrictEqual(check.frontmatter, target)) return null;
+  return out;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

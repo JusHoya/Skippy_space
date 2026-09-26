@@ -55,14 +55,24 @@ test('ObsidianRestClient: every method returns {ok:false} against an unbound por
   assert.equal(read.ok, false);
   if (!read.ok) assert.equal(typeof read.error, 'string');
 
-  const patch = await client.patchFrontmatter('10_Atomic/x.md', 'status', 'active');
-  assert.equal(patch.ok, false);
-
-  const append = await client.appendBlock('40_Daily/today.md', '- a line');
-  assert.equal(append.ok, false);
-
   const search = await client.search('plasma confinement');
   assert.equal(search.ok, false);
+});
+
+test('ObsidianRestClient is read-only: no REST write methods exist (E3-3)', () => {
+  const client = unboundClient() as unknown as Record<string, unknown>;
+  for (const m of ['patchFrontmatter', 'appendBlock', 'writeFile', 'putFile', 'deleteFile']) {
+    assert.equal(client[m], undefined, `${m} must not exist; vault writes go through VaultBroker`);
+  }
+});
+
+test('ObsidianRestClient.readFile refuses short-name and hidden paths before the wire', async () => {
+  const client = unboundClient();
+  for (const p of ['OBSIDI~1/workspace.json', '.obsidian/workspace.json', '../x.md']) {
+    const r = await client.readFile(p);
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /Vault path rejected/, p);
+  }
 });
 
 test('ObsidianRestClient: no API key → unavailable, methods degrade without network', async () => {

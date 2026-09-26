@@ -10,17 +10,27 @@
 //      `:` (so no NTFS alternate data streams like `note.md:evil`); `..`
 //      traversal; Windows-invalid characters; segments ending in a dot or space
 //      (Win32 strips those, which aliases names); reserved device names
-//      (`CON`, `nul.md`, `COM1`...); and, by default, dot-prefixed segments
-//      (`.git`, `.obsidian`, `.skippy` are control directories, not notes; G0
-//      denied paths).
+//      (`CON`, `nul.md`, `COM1`...); 8.3 short-name segments (anything with
+//      `~<digit>`, e.g. `OBSIDI~1`, which NTFS resolves to `.obsidian`); and, by
+//      default, dot-prefixed segments (`.git`, `.obsidian`, `.skippy` are
+//      control directories, not notes; G0 denied paths).
 //
 //   2. REAL (`resolveContained`, async): resolve the vault root with native
 //      realpath, then find the nearest EXISTING ancestor of the target and
 //      realpath it. If a junction, symlink or other reparse point anywhere in the
 //      chain resolves outside the real vault root, reject. A dangling link
 //      (lstat succeeds, realpath fails) cannot be safely contained, so it is
-//      rejected too. When the target itself exists it must not be a link and must
-//      be a regular file. Comparison is case-insensitive on win32.
+//      rejected too. The REAL path (native realpath returns long names and the
+//      on-disk case) is re-derived relative to the real root and the same
+//      hidden-segment and reserved-name rules are applied to its segments, so
+//      neither a short-name alias nor an in-vault junction can reach `.git` or
+//      `.obsidian`. When the target itself exists it must not be a link, must be
+//      a regular file, and must have a single link (a hardlink could alias a
+//      file outside the vault). Comparison is case-insensitive on win32.
+//
+// `ensureContainedParentDir` creates missing parent directories one level at a
+// time beneath the REAL parent, re-proving containment after each level, so a
+// junction planted before the mkdir cannot make it create directories outside.
 //
 // `recheckContained` repeats step 2 under the writer's lock, immediately before
 // the write, to narrow the window for a junction swap. See vault-broker.ts for
@@ -48,6 +58,9 @@ export type VaultPathViolation =
   | 'dangling_link'
   | 'target_is_link'
   | 'target_not_file'
+  | 'short_name'
+  | 'hardlinked_target'
+  | 'parent_not_directory'
   | 'root_changed';
 
 export class VaultPathError extends Error {
@@ -73,6 +86,8 @@ export interface VaultPathOptions {
   allowNonFileTarget?: boolean;
   /** Accept an existing target that is itself a link, provided it resolves inside. Default false. */
   allowLinkTarget?: boolean;
+  /** Accept an existing regular file with more than one hard link. Default false. */
+  allowHardlinkTarget?: boolean;
 }
 
 const MAX_REL_LEN = 1024;
@@ -83,6 +98,10 @@ const INVALID_SEGMENT_CHARS_RE = /[<>"|?*]/;
 // Win32 device names, with or without an extension (`nul.md` is still NUL).
 // Includes the superscript-digit COM/LPT variants and the console devices.
 const RESERVED_RE = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)(\..*)?$/i;
+
+// An 8.3 short name (`OBSIDI~1`, `LONGNA~2.MD`). Fail closed: any segment with
+// `~<digit>` is rejected, since NTFS may resolve it to a different long name.
+const SHORT_NAME_RE = /~\d/;
 
 const IS_WIN = process.platform === 'win32';
 
@@ -123,6 +142,7 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
     // Win32 silently strips trailing dots/spaces (`foo.` -> `foo`, `.. ` -> `..`).
     if (/[. ]$/.test(seg)) throw new VaultPathError('trailing_dot_space', input);
     if (RESERVED_RE.test(seg)) throw new VaultPathError('reserved_name', input);
+    if (SHORT_NAME_RE.test(seg)) throw new VaultPathError('short_name', input);
     if (!opts.allowHidden && seg.startsWith('.')) {
       throw new VaultPathError('hidden_segment', input);
     }
@@ -173,6 +193,8 @@ export interface ContainedPath {
   abs: string;
   /** Whether the target existed (as a regular file) at resolution time. */
   exists: boolean;
+  /** The options it was resolved with; `recheckContained` re-applies them. */
+  opts?: VaultPathOptions;
 }
 
 /**
@@ -183,6 +205,30 @@ export async function realVaultRoot(vaultRoot: string): Promise<string> {
   const abs = path.resolve(vaultRoot);
   await fs.mkdir(abs, { recursive: true });
   return fs.realpath(abs);
+}
+
+/**
+ * Apply the segment rules to a REAL path: re-derive it relative to the real
+ * root and reject hidden (unless allowed) and reserved-name segments. Native
+ * realpath yields long names, so this is what stops an 8.3 alias or an in-vault
+ * junction from reaching `.git`/`.obsidian`/`.skippy`.
+ */
+function assertRealSegments(
+  realRoot: string,
+  real: string,
+  input: string,
+  opts: VaultPathOptions,
+): void {
+  const rel = path.relative(realRoot, real);
+  if (rel === '') return;
+  for (const seg of rel.split(/[\\/]+/)) {
+    if (RESERVED_RE.test(seg)) {
+      throw new VaultPathError('reserved_name', input, `real path segment "${seg}"`);
+    }
+    if (!opts.allowHidden && seg.startsWith('.')) {
+      throw new VaultPathError('hidden_segment', input, `real path segment "${seg}"`);
+    }
+  }
 }
 
 /**
@@ -220,12 +266,20 @@ async function assertRealContainment(
     if (!isPathInside(realRoot, real)) {
       throw new VaultPathError('escapes_root', input, `${cur} resolves to ${real}`);
     }
+    assertRealSegments(realRoot, real, input, opts);
     if (cur === abs) {
       if (st.isSymbolicLink() && !opts.allowLinkTarget) {
         throw new VaultPathError('target_is_link', input, 'the target is a symlink or junction');
       }
       if (!opts.allowNonFileTarget && !st.isSymbolicLink() && !st.isFile()) {
         throw new VaultPathError('target_not_file', input);
+      }
+      if (!opts.allowHardlinkTarget && st.isFile() && st.nlink > 1) {
+        throw new VaultPathError(
+          'hardlinked_target',
+          input,
+          `the target has ${st.nlink} hard links and may alias a file outside the vault`,
+        );
       }
       return true;
     }
@@ -250,7 +304,55 @@ export async function resolveContained(
   // Lexical sanity: the joined path must sit under the real root.
   if (!isPathInside(realRoot, abs)) throw new VaultPathError('escapes_root', untrustedRelPath);
   const exists = await assertRealContainment(realRoot, abs, untrustedRelPath, opts);
-  return { rel, vaultRoot, realRoot, abs, exists };
+  return { rel, vaultRoot, realRoot, abs, exists, opts: { ...opts } };
+}
+
+async function assertRootUnchanged(cp: ContainedPath): Promise<void> {
+  const realRootNow = await fs.realpath(cp.realRoot).catch(() => null);
+  if (realRootNow === null || cmpKey(realRootNow) !== cmpKey(cp.realRoot)) {
+    throw new VaultPathError('root_changed', cp.rel, `vault root no longer resolves to ${cp.realRoot}`);
+  }
+}
+
+/**
+ * Create the target's missing parent directories one level at a time and
+ * return the REAL parent directory (FR-SEC-02; red-team E3-4). Each level is
+ * created beneath the real path of the level above it, then its own real path
+ * is re-proven inside the vault and rule-checked before the next level is
+ * created. A junction swapped in after resolution is therefore detected at the
+ * first level it affects and nothing is created beneath it (`mkdir -p` would
+ * follow it and build the whole chain outside the vault).
+ */
+export async function ensureContainedParentDir(cp: ContainedPath): Promise<string> {
+  const opts = cp.opts ?? {};
+  await assertRootUnchanged(cp);
+  let cur = cp.realRoot;
+  for (const seg of cp.rel.split('/').slice(0, -1)) {
+    const next = path.join(cur, seg);
+    try {
+      await fs.mkdir(next);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    let real: string;
+    try {
+      real = await fs.realpath(next);
+    } catch (err) {
+      if (isMissing(err)) {
+        throw new VaultPathError('dangling_link', cp.rel, `${next} is an unresolvable reparse point`);
+      }
+      throw err;
+    }
+    if (!isPathInside(cp.realRoot, real)) {
+      throw new VaultPathError('escapes_root', cp.rel, `${next} resolves to ${real}`);
+    }
+    assertRealSegments(cp.realRoot, real, cp.rel, opts);
+    if (!(await fs.stat(real)).isDirectory()) {
+      throw new VaultPathError('parent_not_directory', cp.rel, `${real} is not a directory`);
+    }
+    cur = real;
+  }
+  return cur;
 }
 
 /** Result shape of `containmentPathGuard` (structurally tool-policy's PathGuardResult). */
@@ -300,8 +402,10 @@ export async function containmentPathGuard(
       const safeRel = normalizeVaultRelPath(rel, { allowHidden: true });
       const abs = path.join(realRoot, ...safeRel.split('/'));
       await assertRealContainment(realRoot, abs, target, {
+        allowHidden: true,
         allowNonFileTarget: true,
         allowLinkTarget: true,
+        allowHardlinkTarget: true, // pnpm stores hardlink package files
       });
       return { ok: true };
     } catch (err) {
@@ -314,13 +418,11 @@ export async function containmentPathGuard(
 /**
  * Re-prove containment at write time (under the caller's lock): the vault root
  * must still resolve to the same real path, and the target's nearest existing
- * ancestor must still resolve inside it. Returns whether the target exists now.
+ * ancestor must still resolve inside it and pass the segment rules, under the
+ * options the path was resolved with. Returns whether the target exists now.
  */
 export async function recheckContained(cp: ContainedPath, target = cp.abs): Promise<boolean> {
-  const realRootNow = await fs.realpath(cp.realRoot).catch(() => null);
-  if (realRootNow === null || cmpKey(realRootNow) !== cmpKey(cp.realRoot)) {
-    throw new VaultPathError('root_changed', cp.rel, `vault root no longer resolves to ${cp.realRoot}`);
-  }
+  await assertRootUnchanged(cp);
   if (!isPathInside(cp.realRoot, target)) throw new VaultPathError('escapes_root', cp.rel);
-  return assertRealContainment(cp.realRoot, target, cp.rel);
+  return assertRealContainment(cp.realRoot, target, cp.rel, cp.opts ?? {});
 }

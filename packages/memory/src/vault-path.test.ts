@@ -91,6 +91,10 @@ const LEXICAL_CASES: Array<[string, VaultPathViolation]> = [
   ['.obsidian/plugins/x.md', 'hidden_segment'],
   ['.git/config', 'hidden_segment'],
   ['.skippy/replays/x.md', 'hidden_segment'],
+  // E3-1: 8.3 short names alias hidden/control dirs (OBSIDI~1 == .obsidian).
+  ['OBSIDI~1/workspace.md', 'short_name'],
+  ['GIT~1/hooks/pre-commit.md', 'short_name'],
+  ['20_Topics/LONGNA~2.MD', 'short_name'],
   ['a/<b>.md', 'invalid_char'],
   ['a/b?.md', 'invalid_char'],
   ['', 'empty'],
@@ -257,4 +261,26 @@ test('containmentPathGuard allows in-root files, dirs and new paths; rejects esc
   assert.deepEqual(await containmentPathGuard(path.join(evil, 'y'), [vault, evil], base), {
     ok: true,
   });
+});
+
+// ── E3-1: rules apply to the REAL (long-name, junction-resolved) segments ───
+
+test('resolveContained rejects an in-vault junction onto .git (real segments are rule-checked)', async () => {
+  const { vault } = await sandbox();
+  await fs.mkdir(path.join(vault, '.git', 'hooks'), { recursive: true });
+  fsSync.symlinkSync(path.join(vault, '.git', 'hooks'), path.join(vault, 'notes'), 'junction');
+  await assert.rejects(resolveContained(vault, 'notes/pre-commit.md'), rejects('hidden_segment'));
+  // recheck (the write-time gate) applies the same rule.
+  await fs.mkdir(path.join(vault, 'swap'));
+  const cp = await resolveContained(vault, 'swap/x.md');
+  await fs.rmdir(path.join(vault, 'swap'));
+  fsSync.symlinkSync(path.join(vault, '.git'), path.join(vault, 'swap'), 'junction');
+  await assert.rejects(recheckContained(cp), rejects('hidden_segment'));
+});
+
+test('resolveContained rejects a hardlinked target by default (E3-6)', async () => {
+  const { vault, evil } = await sandbox();
+  await fs.writeFile(path.join(evil, 'secret.md'), 'outside');
+  fsSync.linkSync(path.join(evil, 'secret.md'), path.join(vault, 'x.md'));
+  await assert.rejects(resolveContained(vault, 'x.md'), rejects('hardlinked_target'));
 });

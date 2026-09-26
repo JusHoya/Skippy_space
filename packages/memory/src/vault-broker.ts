@@ -1,7 +1,25 @@
 // vault-broker.ts — the single vault write broker (FR-WIKI-02, FR-SEC-02; A03).
 //
-// Every write into the vault converges here: MCP tools, the memory jobs, the
-// daily-note generator and the Letta archival mirror. Three operations:
+// Every agent-originated NOTE write converges here: the MCP vault tools
+// (obsidian_write_note, obsidian_patch_frontmatter, obsidian_append_block —
+// the last two no longer go to the Obsidian REST API, which is read-only for
+// us), the memory jobs (distill/link/lint), ingest's source note, the
+// daily-note generator and the Letta archival mirror.
+//
+// Remaining writers into the vault tree that do NOT go through the broker:
+//   - ingest's content-addressed originals store and its `.note.json` commit
+//     markers under `60_Sources/originals/` (ingest/originals.ts), and the
+//     `*.ingest-error.json` sidecars next to inbox drops (ingest/errors.ts):
+//     binary/JSON payloads, not notes, written with write-file-atomic;
+//   - `realVaultRoot` creating the configured vault root directory itself;
+//   - the legacy absolute-path writers in atomic.ts (no production callers;
+//     kept for atomic.test.ts);
+//   - git autocommit (scripts/git-autocommit.mjs, shell git_autocommit.rs)
+//     writes only repository metadata, never note content;
+//   - humans and the Obsidian app itself (external; detected via the hash
+//     compare below, never locked out).
+//
+// Four operations:
 //
 //   createNote(path, frontmatter, body)
 //     New notes only; never overwrites. §8.3 frontmatter is validated and the
@@ -16,12 +34,32 @@
 //     re-hash immediately before the atomic replace (write-file-atomic).
 //     `agent_log` and `daily` notes are append-only; updating them, or changing
 //     a note's type to or from those types, throws `AppendOnlyViolationError`.
+//     YAML is parsed without the timestamp type, so unknown dates keep their
+//     type and spelling, and only the frontmatter lines of changed keys are
+//     rewritten (comments and untouched values survive). Known limitation: when
+//     that surgical edit cannot be proven equivalent by re-parsing (anchors,
+//     multi-line flow collections, ...), the note is re-serialized canonically
+//     and YAML comments in its frontmatter are dropped.
+//
+//   patchFrontmatter(path, expectedHash, key, value)
+//     `updateNote` for one key. The key must be a plain lowercase snake_case
+//     name and never `id`/`created_at`/`updated_at`/`type` (so no encoded or
+//     case-folded alias of a protected key can slip through).
 //
 //   appendNote(path, text, { init })
-//     Only for `agent_log` / `daily`. Appends through an O_APPEND handle; the
-//     handle is checked to be a regular file with a single link, so a hardlink
-//     cannot redirect the append outside the vault. With `init`, a missing note
-//     is created with its header and the first section under the same lock.
+//     Only for `agent_log` / `daily` notes with valid §8.3 frontmatter. Appends
+//     through an O_APPEND handle; the handle is checked to be a regular file
+//     with a single link, so a hardlink cannot redirect the append outside the
+//     vault. With `init`, a missing note is created with its header and the
+//     first section under the same lock; without it a missing note is
+//     `not_found` (an append never creates a frontmatter-less note).
+//
+// Reads (readNote and the reads inside every operation) go through a handle
+// that must be a single-link regular file: a hardlink to a file outside the
+// vault is rejected with VaultPathError('hardlinked_target'), never read.
+// Missing parent directories are created one level at a time with a real-path
+// containment check per level (ensureContainedParentDir), and the lock is keyed
+// on the canonical real path, so aliases of one note share one lock.
 //
 // Operational outcomes (`locked`, `exists`, `not_found`, `conflict`) are
 // returned, matching the non-throwing WriteResult style of atomic.ts. Security
@@ -44,8 +82,16 @@ import writeFileAtomic from 'write-file-atomic';
 import { lock } from 'proper-lockfile';
 
 import { assertNoRelativeMdLinks } from './atomic.js';
-import { parseNote, serializeNote, type NoteFrontmatterInput } from './frontmatter.js';
 import {
+  parseNote,
+  serializeNote,
+  serializeNotePreserving,
+  validateFrontmatter,
+  type NoteFrontmatterInput,
+} from './frontmatter.js';
+import {
+  VaultPathError,
+  ensureContainedParentDir,
   recheckContained,
   resolveContained,
   type ContainedPath,
@@ -80,6 +126,64 @@ export class NoteIdentityError extends Error {
   constructor(readonly notePath: string, detail: string) {
     super(`Note identity violation on "${notePath}": ${detail}`);
     this.name = 'NoteIdentityError';
+  }
+}
+
+/** A frontmatter key that `patchFrontmatter` may never set (identity, type, stamps). */
+export class ProtectedFrontmatterKeyError extends Error {
+  readonly code = 'VAULT_PROTECTED_KEY';
+  constructor(readonly notePath: string, readonly key: string) {
+    super(
+      `Frontmatter key ${JSON.stringify(key)} on "${notePath}" cannot be patched: keys must be ` +
+        `lowercase snake_case and not one of ${PROTECTED_PATCH_KEYS.join('/')}`,
+    );
+    this.name = 'ProtectedFrontmatterKeyError';
+  }
+}
+
+/** An existing note whose frontmatter is not valid §8.3 (e.g. an append target). */
+export class NoteFrontmatterError extends Error {
+  readonly code = 'VAULT_INVALID_FRONTMATTER';
+  constructor(readonly notePath: string, detail: string) {
+    super(`Note "${notePath}" does not carry valid §8.3 frontmatter: ${detail}`);
+    this.name = 'NoteFrontmatterError';
+  }
+}
+
+const PROTECTED_PATCH_KEYS: readonly string[] = ['id', 'created_at', 'updated_at', 'type'];
+const PATCH_KEY_RE = /^[a-z][a-z0-9_]*$/;
+
+/**
+ * Throw unless `key` is a plain lowercase snake_case name outside the protected
+ * set. Fail closed: `%`-encoded, case-folded (`ID`), dotted or prototype keys
+ * never reach the merge, whatever a downstream decoder would make of them.
+ */
+export function assertPatchableFrontmatterKey(notePath: string, key: unknown): asserts key is string {
+  if (typeof key !== 'string' || !PATCH_KEY_RE.test(key) || PROTECTED_PATCH_KEYS.includes(key)) {
+    throw new ProtectedFrontmatterKeyError(notePath, String(key));
+  }
+}
+
+/**
+ * Read a note through a handle that must be a single-link regular file, so a
+ * hardlink (or a file swapped for one after the path check) can never make us
+ * read, hash or return the bytes of a file outside the vault.
+ */
+async function readRegularFile(target: string, rel: string): Promise<Buffer> {
+  const handle = await fs.open(target, 'r');
+  try {
+    const st = await handle.stat();
+    if (!st.isFile()) throw new VaultPathError('target_not_file', rel);
+    if (st.nlink > 1) {
+      throw new VaultPathError(
+        'hardlinked_target',
+        rel,
+        `the note has ${st.nlink} hard links and may alias a file outside the vault`,
+      );
+    }
+    return await handle.readFile();
+  } finally {
+    await handle.close();
   }
 }
 
@@ -123,7 +227,7 @@ export interface NoteSnapshot {
   absPath: string;
   raw: string;
   hash: string;
-  /** Parsed frontmatter (a private copy; YAML timestamps normalized to ISO strings). */
+  /** Parsed frontmatter (a private copy; YAML timestamps stay the strings as written). */
   frontmatter: Record<string, unknown>;
   /** Body exactly as parsed (fence stripped). */
   body: string;
@@ -171,7 +275,14 @@ function normalizeFrontmatter(fm: Record<string, unknown>): Record<string, unkno
 
 function sameValue(a: unknown, b: unknown): boolean {
   const norm = (v: unknown) => (v instanceof Date ? v.toISOString() : v);
-  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+  if (JSON.stringify(norm(a)) === JSON.stringify(norm(b))) return true;
+  // The same instant spelled differently (`...00Z` vs `...00.000Z`) is no change.
+  if (typeof norm(a) === 'string' && typeof norm(b) === 'string') {
+    const ta = Date.parse(norm(a) as string);
+    const tb = Date.parse(norm(b) as string);
+    return !Number.isNaN(ta) && ta === tb;
+  }
+  return false;
 }
 
 /**
@@ -204,7 +315,7 @@ export class VaultBroker {
   async readNote(relPath: string): Promise<NoteSnapshot | null> {
     const cp = await this.resolve(relPath);
     if (!cp.exists) return null;
-    const raw = await fs.readFile(cp.abs);
+    const raw = await readRegularFile(cp.abs, cp.rel);
     return this.snapshot(cp, raw);
   }
 
@@ -222,19 +333,24 @@ export class VaultBroker {
   }
 
   /**
-   * Create the target's parent directories (proven contained first), then run
-   * `fn` under an exclusive lock keyed on the REAL parent directory, so two
-   * lexical aliases of one file share a lock. `fn` receives the real target.
+   * Create the target's missing parent directories one contained level at a
+   * time, then run `fn` under an exclusive lock keyed on the canonical REAL
+   * path (real parent + the file's on-disk name when it exists), so lexical,
+   * case and junction aliases of one note share one lock. `fn` receives it.
    */
   private async withLock<T>(
     cp: ContainedPath,
     fn: (target: string, assertLockHeld: () => void) => Promise<T>,
   ): Promise<T | { lockedOut: true }> {
-    await fs.mkdir(path.dirname(cp.abs), { recursive: true });
+    const realParent = await ensureContainedParentDir(cp);
     // Re-prove containment now that any missing directories exist.
     await recheckContained(cp);
-    const realParent = await fs.realpath(path.dirname(cp.abs));
-    const target = path.join(realParent, path.basename(cp.abs));
+    let target = path.join(realParent, path.basename(cp.abs));
+    if (await recheckContained(cp, target)) {
+      // Existing regular file (not a link, single link): use its native real
+      // path, which carries the on-disk long name and case.
+      target = await fs.realpath(target);
+    }
 
     let compromised: unknown = null;
     let release: () => Promise<void>;
@@ -280,7 +396,7 @@ export class VaultBroker {
 
     const out = await this.withLock(cp, async (target, assertLockHeld) => {
       if (await recheckContained(cp, target)) {
-        const current = await fs.readFile(target);
+        const current = await readRegularFile(target, cp.rel);
         return {
           ok: false as const,
           path: cp.rel,
@@ -321,7 +437,7 @@ export class VaultBroker {
       if (!(await recheckContained(cp, target))) {
         return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
       }
-      const bytes = await fs.readFile(target);
+      const bytes = await readRegularFile(target, cp.rel);
       const snap = this.snapshot(cp, bytes);
       if (snap.hash !== expectedHash) {
         return {
@@ -371,15 +487,18 @@ export class VaultBroker {
 
       const body = patch.body ?? snap.body;
       if (patch.body !== undefined) assertNoRelativeMdLinks(body, cp.rel);
-      const contents = serializeNote(merged, body); // validates §8.3 (id must exist)
+      // Validates §8.3 (id must exist); keeps the authored frontmatter text
+      // (comments, quoting, untouched values) wherever that is provably exact.
+      const contents = serializeNotePreserving(snap.raw, merged, body);
 
       // Immediately before the replace: re-prove containment, make sure the lock
       // is still ours, and re-hash to catch an external writer that ignores it.
       await recheckContained(cp, target);
       assertLockHeld();
-      const latest = hashContent(await fs.readFile(target));
+      const latestBytes = await readRegularFile(target, cp.rel);
+      const latest = hashContent(latestBytes);
       if (latest !== snap.hash) {
-        const raw = await fs.readFile(target, 'utf8');
+        const raw = latestBytes.toString('utf8');
         return { ok: false, path: cp.rel, absPath, reason: 'conflict', currentHash: latest, current: raw };
       }
       await writeFileAtomic(target, contents);
@@ -393,6 +512,23 @@ export class VaultBroker {
       };
     });
     return 'lockedOut' in out ? this.locked(cp) : out;
+  }
+
+  /**
+   * Compare-and-swap edit of ONE frontmatter key (the local replacement for the
+   * Obsidian REST frontmatter PATCH; red-team E3-3). The key must pass
+   * `assertPatchableFrontmatterKey`; append-only notes throw
+   * `AppendOnlyViolationError`; the merged frontmatter must validate as §8.3.
+   */
+  async patchFrontmatter(
+    relPath: string,
+    expectedHash: string,
+    key: string,
+    value: unknown,
+  ): Promise<BrokerResult> {
+    assertPatchableFrontmatterKey(relPath, key);
+    if (value === undefined) throw new NoteFrontmatterError(relPath, `no value given for "${key}"`);
+    return this.updateNote(relPath, expectedHash, () => ({ frontmatter: { [key]: value } }));
   }
 
   /**
@@ -432,13 +568,15 @@ export class VaultBroker {
         return { ok: true, path: cp.rel, absPath, hash: hashContent(contents), created: true, changed: true };
       }
 
-      const snap = this.snapshot(cp, await fs.readFile(target));
+      const snap = this.snapshot(cp, await readRegularFile(target, cp.rel));
       if (!isAppendOnlyType(snap.frontmatter['type'])) {
         throw new AppendOnlyViolationError(
           cp.rel,
           `appendNote is only for ${APPEND_ONLY_TYPES.join('/')} notes (found type "${String(snap.frontmatter['type'] ?? 'none')}")`,
         );
       }
+      const valid = validateFrontmatter(snap.frontmatter);
+      if (!valid.ok) throw new NoteFrontmatterError(cp.rel, valid.errors.join('; '));
 
       await recheckContained(cp, target);
       assertLockHeld();

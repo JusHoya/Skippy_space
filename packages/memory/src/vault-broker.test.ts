@@ -20,6 +20,7 @@ import { lock } from 'proper-lockfile';
 import {
   AppendOnlyViolationError,
   NoteIdentityError,
+  ProtectedFrontmatterKeyError,
   VaultBroker,
   hashContent,
 } from './vault-broker.js';
@@ -297,7 +298,11 @@ test('appendNote refuses a hardlinked log (cannot append through to an outside f
   await fs.mkdir(path.join(vault, '50_Agents'));
   fsSync.linkSync(outside, path.join(vault, '50_Agents', 'agent_log.md'));
   const b = new VaultBroker(vault);
-  await assert.rejects(b.appendNote('50_Agents/agent_log.md', 'pwn'), AppendOnlyViolationError);
+  // Refused at resolution (E3-6); the O_APPEND handle check remains as a backstop.
+  await assert.rejects(
+    b.appendNote('50_Agents/agent_log.md', 'pwn'),
+    (e: unknown) => e instanceof VaultPathError && e.violation === 'hardlinked_target',
+  );
   assert.equal(await fs.readFile(outside, 'utf8'), header);
 });
 
@@ -377,4 +382,184 @@ test('hand-written notes with unquoted YAML timestamps keep their created_at', a
   assert.equal(after.frontmatter['id'], '01HZX900AADAXXYTEMPXATE010');
   assert.equal(after.frontmatter['custom_key'], 'keep me');
   assert.match(after.body, /Body by a human\./);
+});
+
+// ── M0 red-team regressions (E3-1, E3-3, E3-4, E3-5, E3-6) ───────────────────
+
+/** True iff NTFS generated the 8.3 short name `short` inside `dir`. */
+function hasShortName(dir: string, short: string): boolean {
+  return fsSync.existsSync(path.join(dir, short));
+}
+
+test('E3-1: 8.3 short names cannot reach .obsidian/.git/.skippy (C: temp vault)', async (t) => {
+  if (process.platform !== 'win32') return t.skip('8.3 short names are a win32/NTFS feature');
+  const { vault } = await sandbox(); // os.tmpdir() lives on C:
+  await fs.mkdir(path.join(vault, '.obsidian'));
+  await fs.mkdir(path.join(vault, '.git', 'hooks'), { recursive: true });
+  await fs.mkdir(path.join(vault, '.skippy', 'replays'), { recursive: true });
+  if (!hasShortName(vault, 'OBSIDI~1') || !hasShortName(vault, 'GIT~1') || !hasShortName(vault, 'SKIPPY~1')) {
+    return t.skip(`8.3 short-name generation is disabled on the volume holding ${vault} (fsutil 8dot3name)`);
+  }
+  const b = new VaultBroker(vault);
+  for (const bad of ['OBSIDI~1/workspace.md', 'GIT~1/hooks/pre-commit.md', 'SKIPPY~1/replays/x.md']) {
+    await assert.rejects(b.createNote(bad, concept(), 'x'), VaultPathError, bad);
+    await assert.rejects(b.appendNote(bad, 'x'), VaultPathError, bad);
+  }
+  assert.deepEqual(await listFiles(path.join(vault, '.obsidian')), []);
+  assert.deepEqual(await listFiles(path.join(vault, '.git', 'hooks')), []);
+  assert.deepEqual(await listFiles(path.join(vault, '.skippy', 'replays')), []);
+
+  // A short-name alias of an ordinary long-named folder is refused too, so one
+  // note can never be locked under two spellings.
+  await b.createNote('LongFolderName/n.md', concept(), 'x');
+  if (hasShortName(vault, 'LONGFO~1')) {
+    await assert.rejects(b.readNote('LONGFO~1/n.md'), VaultPathError);
+  }
+});
+
+test('E3-1: the lock is keyed on the canonical real path (case alias shares it)', async () => {
+  const { vault } = await sandbox();
+  const b = new VaultBroker(vault, { lockRetries: 0 });
+  await b.createNote('Topics/Plasma.md', concept(), 'x');
+  const snap = await b.readNote('Topics/Plasma.md');
+  assert.ok(snap);
+  const real = await fs.realpath(path.join(vault, 'Topics', 'Plasma.md'));
+  const release = await lock(real, { realpath: false });
+  try {
+    const alias = process.platform === 'win32' ? 'topics/PLASMA.md' : 'Topics/Plasma.md';
+    const res = await b.updateNote(alias, snap.hash, () => ({ body: 'y' }));
+    assert.equal(!res.ok && res.reason, 'locked');
+  } finally {
+    await release();
+  }
+});
+
+test('E3-4: missing dirs are created level by level; a junction swapped in before mkdir creates nothing outside', async () => {
+  const { vault, evil } = await sandbox();
+  class RacyBroker extends VaultBroker {
+    override async resolve(relPath: string) {
+      const cp = await super.resolve(relPath);
+      // Attacker plants a junction after resolution, before the broker's mkdir.
+      fsSync.symlinkSync(evil, path.join(vault, 'sub'), 'junction');
+      return cp;
+    }
+  }
+  const b = new RacyBroker(vault);
+  await assert.rejects(b.createNote('sub/deep/er/x.md', concept(), 'x'), VaultPathError);
+  assert.deepEqual(await listFiles(evil), [], 'no directory or file created outside the vault');
+});
+
+test('E3-5: unknown YAML dates keep their type and spelling; comments survive a body-only edit', async () => {
+  const { vault } = await sandbox();
+  const raw = [
+    '---',
+    'id: 01HZX900AADAXXYTEMPXATE011',
+    'title: Dated',
+    'created_at: 2026-05-14T00:00:00Z',
+    'updated_at: 2026-05-14T00:00:00Z',
+    'type: concept',
+    'status: active',
+    'authored_by: human',
+    '# keep this comment',
+    'due: 2026-10-01',
+    'nested:',
+    '  when: 2026-11-02',
+    '---',
+    '',
+    'Body.',
+    '',
+  ].join('\n');
+  await fs.writeFile(path.join(vault, 'd.md'), raw);
+  const b = new VaultBroker(vault, { now: () => new Date('2026-09-26T12:00:00.000Z') });
+  const snap = await b.readNote('d.md');
+  assert.ok(snap);
+  assert.equal(snap.frontmatter['due'], '2026-10-01', 'parsed as the written string, not a Date');
+
+  const res = await b.updateNote('d.md', snap.hash, () => ({ body: '\nNew body.\n' }));
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const text = await fs.readFile(path.join(vault, 'd.md'), 'utf8');
+  assert.match(text, /^due: 2026-10-01$/m);
+  assert.match(text, /^ {2}when: 2026-11-02$/m);
+  assert.match(text, /^# keep this comment$/m);
+  assert.match(text, /^created_at: 2026-05-14T00:00:00Z$/m);
+  assert.match(text, /^updated_at: ['"]?2026-09-26T12:00:00\.000Z['"]?$/m);
+  assert.match(text, /New body\./);
+
+  // A frontmatter edit keeps the dates as written as well.
+  const s2 = await b.readNote('d.md');
+  assert.ok(s2);
+  const r2 = await b.updateNote('d.md', s2.hash, () => ({ frontmatter: { status: 'canonical' } }));
+  assert.equal(r2.ok, true, JSON.stringify(r2));
+  const s3 = await b.readNote('d.md');
+  assert.ok(s3);
+  assert.equal(s3.frontmatter['due'], '2026-10-01');
+  assert.deepEqual(s3.frontmatter['nested'], { when: '2026-11-02' });
+  assert.equal(s3.frontmatter['status'], 'canonical');
+  assert.match(s3.raw, /^# keep this comment$/m);
+});
+
+test('E3-6: read/create/update refuse a hardlinked note (never read an outside file)', async () => {
+  const { vault, evil } = await sandbox();
+  const outside = path.join(evil, 'secret.md');
+  await fs.writeFile(outside, 'TOP SECRET');
+  await fs.mkdir(path.join(vault, '10_Atomic'));
+  fsSync.linkSync(outside, path.join(vault, '10_Atomic', 'x.md'));
+  const b = new VaultBroker(vault);
+  const isHardlink = (e: unknown) => e instanceof VaultPathError && e.violation === 'hardlinked_target';
+  await assert.rejects(b.readNote('10_Atomic/x.md'), isHardlink);
+  await assert.rejects(b.createNote('10_Atomic/x.md', concept(), 'x'), isHardlink);
+  await assert.rejects(
+    b.updateNote('10_Atomic/x.md', hashContent('TOP SECRET'), () => ({ body: 'y' })),
+    isHardlink,
+  );
+  await assert.rejects(b.appendNote('10_Atomic/x.md', 'y'), isHardlink);
+  assert.equal(await fs.readFile(outside, 'utf8'), 'TOP SECRET');
+});
+
+test('E3-3: patchFrontmatter is CAS, refuses protected/encoded keys and append-only notes', async () => {
+  const { vault } = await sandbox();
+  const b = new VaultBroker(vault);
+  await b.createNote('20_Topics/p.md', concept(), 'x');
+  const snap = await b.readNote('20_Topics/p.md');
+  assert.ok(snap);
+  for (const key of ['id', 'ID', 'Created_At', 'type', 'TYPE', '%69d', 'created%5Fat', '%74ype', 'updated_at', '__proto__', 'a.b', '']) {
+    await assert.rejects(
+      b.patchFrontmatter('20_Topics/p.md', snap.hash, key, 'x'),
+      ProtectedFrontmatterKeyError,
+      key,
+    );
+  }
+  const stale = await b.patchFrontmatter('20_Topics/p.md', hashContent('nope'), 'status', 'canonical');
+  assert.equal(!stale.ok && stale.reason, 'conflict');
+  const done = await b.patchFrontmatter('20_Topics/p.md', snap.hash, 'status', 'canonical');
+  assert.equal(done.ok, true, JSON.stringify(done));
+  const after = await b.readNote('20_Topics/p.md');
+  assert.ok(after);
+  assert.equal(after.frontmatter['status'], 'canonical');
+  assert.equal(after.frontmatter['id'], snap.frontmatter['id']);
+  // An invalid §8.3 value is refused before any write.
+  await assert.rejects(b.patchFrontmatter('20_Topics/p.md', after.hash, 'status', 'bogus'));
+  assert.equal((await b.readNote('20_Topics/p.md'))?.hash, after.hash);
+
+  // Append-only notes cannot be PATCHed.
+  const date = new Date(2026, 8, 26);
+  await generateDailyNote({ vaultRoot: vault, date });
+  const rel = dailyNoteRelPath(date);
+  const d = await b.readNote(rel);
+  assert.ok(d);
+  await assert.rejects(b.patchFrontmatter(rel, d.hash, 'status', 'active'), AppendOnlyViolationError);
+  assert.equal((await b.readNote(rel))?.hash, d.hash);
+});
+
+test('E3-3: appendNote needs an existing append-only note with valid §8.3 frontmatter', async () => {
+  const { vault } = await sandbox();
+  const b = new VaultBroker(vault);
+  const missing = await b.appendNote('50_Agents/new/agent_log.md', 'x');
+  assert.equal(!missing.ok && missing.reason, 'not_found');
+  await assert.rejects(fs.access(path.join(vault, '50_Agents', 'new', 'agent_log.md')));
+  await fs.writeFile(path.join(vault, 'bare.md'), 'no frontmatter\n');
+  await assert.rejects(b.appendNote('bare.md', 'x'), AppendOnlyViolationError);
+  await fs.writeFile(path.join(vault, 'half.md'), '---\ntype: agent_log\n---\n');
+  await assert.rejects(b.appendNote('half.md', 'x'));
+  assert.equal(await fs.readFile(path.join(vault, 'half.md'), 'utf8'), '---\ntype: agent_log\n---\n');
 });

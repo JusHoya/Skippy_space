@@ -13,6 +13,7 @@ import {
   ObsidianRestClient,
   LettaClient,
   VaultBroker,
+  VaultPathError,
   isAppendOnlyType,
   mirrorArchivalToVault,
   makeFrontmatter,
@@ -32,10 +33,29 @@ function fail(text: string): McpToolResult {
 
 // ── Obsidian tools (D1) ───────────────────────────────────────────────────────
 
+/**
+ * Read a note. With a `vaultRoot`, a `.md` note is read from the local vault
+ * through the broker (containment, 8.3/hidden/hardlink rules) and the result
+ * starts with a `sha256: <hash>` line — the `expected_hash` that
+ * obsidian_write_note / obsidian_patch_frontmatter need. Non-markdown files,
+ * or no vault root, fall back to the (read-only) REST client.
+ */
 export async function handleObsidianRead(
   client: ObsidianRestClient,
   args: { path: string },
+  vaultRoot?: string,
 ): Promise<McpToolResult> {
+  if (vaultRoot) {
+    try {
+      const snap = await new VaultBroker(vaultRoot).readNote(args.path);
+      if (snap === null) return fail(`obsidian_read_note: ${args.path} does not exist.`);
+      return ok(`sha256: ${snap.hash}\n\n${snap.raw}`);
+    } catch (err) {
+      if (!(err instanceof VaultPathError && err.violation === 'not_markdown')) {
+        return fail(`obsidian_read_note refused: ${String(err)}`);
+      }
+    }
+  }
   const r = await client.readFile(args.path);
   return r.ok
     ? ok(r.data)
@@ -53,24 +73,73 @@ export async function handleObsidianSearch(
   return ok(lines.length > 0 ? lines.join('\n') : 'No matches.');
 }
 
+// obsidian_patch_frontmatter / obsidian_append_block (M0 red-team E3-3):
+// these used to send PATCH/POST to the Obsidian Local REST API, which bypassed
+// every broker guarantee (lock, expected hash, append-only types, real-path
+// containment incl. 8.3 short names, §8.3 validation) and a protected-key
+// filter the plugin's URL-decoding defeated. They now write the local vault
+// through the VaultBroker only; REST is read-only. No vault root -> refuse.
+
+/** JSON when it parses (numbers, booleans, null, arrays), otherwise the raw string. */
+function parseFrontmatterValue(value: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return value;
+  }
+}
+
 export async function handleObsidianPatchFrontmatter(
-  client: ObsidianRestClient,
-  args: { path: string; key: string; value: string },
+  vaultRoot: string,
+  args: { path: string; key: string; value: string; expected_hash?: string | undefined },
 ): Promise<McpToolResult> {
-  const r = await client.patchFrontmatter(args.path, args.key, args.value);
-  return r.ok
-    ? ok(`Patched frontmatter "${args.key}" on ${args.path}.`)
-    : fail(`obsidian_patch_frontmatter failed: ${r.error}`);
+  if (!vaultRoot) {
+    return fail('obsidian_patch_frontmatter refused: no local vault root is configured to check the write.');
+  }
+  if (!args.expected_hash) {
+    return fail(
+      'obsidian_patch_frontmatter requires expected_hash: the sha256 of the version you read ' +
+        '(obsidian_read_note prints it). A mismatch is a conflict.',
+    );
+  }
+  try {
+    const r = await new VaultBroker(vaultRoot).patchFrontmatter(
+      args.path,
+      args.expected_hash,
+      args.key,
+      parseFrontmatterValue(args.value),
+    );
+    if (r.ok) return ok(`Patched frontmatter "${args.key}" on ${r.path} (sha256 ${r.hash}).`);
+    if (r.reason === 'conflict') {
+      return fail(
+        `obsidian_patch_frontmatter conflict: ${r.path} changed since the expected hash (current sha256 ${r.currentHash ?? 'unknown'}). Re-read, merge, and retry.`,
+      );
+    }
+    return fail(`obsidian_patch_frontmatter not completed (${r.reason}).`);
+  } catch (err) {
+    return fail(`obsidian_patch_frontmatter failed: ${String(err)}`);
+  }
 }
 
 export async function handleObsidianAppendBlock(
-  client: ObsidianRestClient,
+  vaultRoot: string,
   args: { path: string; markdown: string },
 ): Promise<McpToolResult> {
-  const r = await client.appendBlock(args.path, args.markdown);
-  return r.ok
-    ? ok(`Appended a block to ${args.path}.`)
-    : fail(`obsidian_append_block failed: ${r.error}`);
+  if (!vaultRoot) {
+    return fail('obsidian_append_block refused: no local vault root is configured to check the write.');
+  }
+  try {
+    const r = await new VaultBroker(vaultRoot).appendNote(args.path, args.markdown);
+    if (r.ok) return ok(`Appended a block to ${r.path} (sha256 ${r.hash}).`);
+    if (r.reason === 'not_found') {
+      return fail(
+        `obsidian_append_block: ${r.path} does not exist. Appends only extend existing agent_log/daily notes; create notes with obsidian_write_note.`,
+      );
+    }
+    return fail(`obsidian_append_block not completed (${r.reason}).`);
+  } catch (err) {
+    return fail(`obsidian_append_block failed: ${String(err)}`);
+  }
 }
 
 /**
