@@ -7,16 +7,15 @@
 // throws) and degrades to `isError` text when the backing service is offline —
 // the board mission continues with reduced capability, it never crashes.
 
-import * as path from 'node:path';
-
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 import {
   ObsidianRestClient,
   LettaClient,
+  VaultBroker,
+  isAppendOnlyType,
   mirrorArchivalToVault,
   makeFrontmatter,
-  writeNote,
   type NoteType,
 } from '@skippy/memory';
 
@@ -75,10 +74,22 @@ export async function handleObsidianAppendBlock(
 }
 
 /**
- * Create/overwrite a vault note atomically via the filesystem (works even when
- * the Obsidian app is closed — the fs is the source of truth, PRD §8.9). The
- * §8.3 frontmatter is built + validated and the wikilink-only guard runs inside
- * `writeNote`, so a relative `.md` link in the body is rejected.
+ * Create or edit a vault note via the filesystem (works even when the Obsidian
+ * app is closed — the fs is the source of truth, PRD §8.9). Every write goes
+ * through the `VaultBroker` (M0 WS-D; FR-SEC-02, FR-WIKI-02, assessment A03):
+ *
+ * - `path` is untrusted. Absolute, drive-relative, UNC/device, `..`, ADS,
+ *   reserved-name and dot-directory paths, and junction/symlink escapes, are
+ *   rejected as isError text before any I/O.
+ * - Without `expected_hash` the note is created and never overwrites. If it
+ *   exists, the error carries its current sha256.
+ * - With `expected_hash` the note is edited compare-and-swap: a hash mismatch is
+ *   a conflict (re-read and retry); `id`, `created_at` and unknown frontmatter
+ *   keys are preserved; `title`/`type`/`source` and the body are replaced.
+ * - `agent_log`/`daily` notes are append-only and cannot be written here.
+ *
+ * §8.3 frontmatter is validated and the wikilink-only guard runs in the broker,
+ * so a relative `.md` link in the body is rejected.
  */
 export async function handleObsidianWriteNote(
   vaultRoot: string,
@@ -88,20 +99,51 @@ export async function handleObsidianWriteNote(
     body: string;
     type?: string | undefined;
     source?: string | undefined;
+    expected_hash?: string | undefined;
   },
 ): Promise<McpToolResult> {
   try {
-    const fm = makeFrontmatter({
-      title: args.title,
-      type: (args.type ?? 'concept') as NoteType,
-      authored_by: 'board.sdk',
-      source: args.source ?? null,
-    });
-    const target = path.join(vaultRoot, args.path);
-    const r = await writeNote(target, fm, args.body);
-    return r.written
-      ? ok(`Wrote ${args.path}.`)
-      : fail(`obsidian_write_note not completed (${r.reason}).`);
+    const type = args.type ?? 'concept';
+    if (isAppendOnlyType(type)) {
+      return fail(
+        `obsidian_write_note cannot write "${type}" notes: agent_log/daily notes are append-only.`,
+      );
+    }
+    const broker = new VaultBroker(vaultRoot);
+
+    if (args.expected_hash === undefined) {
+      const fm = makeFrontmatter({
+        title: args.title,
+        type: type as NoteType,
+        authored_by: 'board.sdk',
+        source: args.source ?? null,
+      });
+      const r = await broker.createNote(args.path, fm, args.body);
+      if (r.ok) return ok(`Wrote ${r.path} (sha256 ${r.hash}).`);
+      if (r.reason === 'exists') {
+        return fail(
+          `obsidian_write_note: ${r.path} already exists (sha256 ${r.currentHash ?? 'unknown'}). ` +
+            'To edit it, resend with expected_hash set to the hash of the version you read; id and created_at are preserved.',
+        );
+      }
+      return fail(`obsidian_write_note not completed (${r.reason}).`);
+    }
+
+    const r = await broker.updateNote(args.path, args.expected_hash, () => ({
+      frontmatter: {
+        title: args.title,
+        ...(args.type !== undefined ? { type: args.type } : {}),
+        ...(args.source !== undefined ? { source: args.source } : {}),
+      },
+      body: args.body,
+    }));
+    if (r.ok) return ok(`Updated ${r.path} (sha256 ${r.hash}).`);
+    if (r.reason === 'conflict') {
+      return fail(
+        `obsidian_write_note conflict: ${r.path} changed since the expected hash (current sha256 ${r.currentHash ?? 'unknown'}). Re-read, merge, and retry.`,
+      );
+    }
+    return fail(`obsidian_write_note not completed (${r.reason}).`);
   } catch (err) {
     return fail(`obsidian_write_note failed: ${String(err)}`);
   }

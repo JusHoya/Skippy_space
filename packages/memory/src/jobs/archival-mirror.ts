@@ -7,25 +7,23 @@
 // it works even with every server offline. The agent-runtime caller wraps it in an
 // OTel span; we keep this module side-effect-pure (no tracing here).
 //
-// Each board gets one append-only `agent_log` note under `50_Agents/{board}/`. The
-// first write stamps a §8.3 frontmatter header (via writeNoteIfAbsent so a race or
-// a re-run never clobbers it); every write appends a timestamped `## ... — archival`
-// section through appendSection (append-only, PRD §8.5).
+// Each board gets one append-only `agent_log` note under `50_Agents/{board}/`.
+// Writes go through the vault broker's `appendNote` (M0 WS-D, FR-WIKI-02): the
+// first write creates the §8.3 header and the first section under one lock, so a
+// race can no longer leave a header-less log; later writes append only. The
+// board name is part of the path, so the broker's containment check rejects a
+// board like `../../x` (FR-SEC-02).
 //
-// WIKILINK GUARD: appendSection refuses relative `.md` markdown links (PRD §8.2).
+// WIKILINK GUARD: the broker refuses relative `.md` markdown links (PRD §8.2).
 // Archival text comes from agents and may contain them, so we neutralize relative
 // `.md` links before appending and retry once; if it still can't be written we
 // return {ok:false} cleanly. We never let the guard (or a lock) throw out of here.
 
 import * as path from 'node:path';
 
-import {
-  appendSection,
-  writeNoteIfAbsent,
-  WikilinkViolationError,
-  type WriteResult,
-} from '../atomic.js';
+import { WikilinkViolationError } from '../atomic.js';
 import { makeFrontmatter } from '../frontmatter.js';
+import { VaultBroker } from '../vault-broker.js';
 
 /** Outcome of a mirror attempt. `path` is the agent_log note targeted either way. */
 export interface MirrorResult {
@@ -49,66 +47,58 @@ export interface MirrorArchivalOptions {
  * Mirror one archival passage into the board's append-only `agent_log` note.
  *
  * - target: `{vaultRoot}/50_Agents/{board}/agent_log.md`.
- * - first write (file absent): stamp a §8.3 `agent_log` frontmatter header via
- *   writeNoteIfAbsent (idempotent — a concurrent create or a re-run won't clobber).
- * - every write: appendSection a `## {ts} — archival\n{text}` block (append-only).
+ * - first write (file absent): the broker creates the §8.3 `agent_log` header and
+ *   the first section atomically under the note's lock.
+ * - every write: append a `## {ts} — archival\n{text}` block (append-only).
  *
  * Never throws. A relative-`.md`-link in `text` is neutralized and retried once; a
- * lock contention returns {ok:false} (soft — the caller retries next cycle).
+ * lock contention returns {ok:false} (soft — the caller retries next cycle); a path
+ * the broker rejects returns {ok:false} with the reason.
  */
 export async function mirrorArchivalToVault(
   opts: MirrorArchivalOptions,
 ): Promise<MirrorResult> {
   const { board, text, vaultRoot } = opts;
   const ts = opts.ts ?? new Date().toISOString();
+  const rel = `50_Agents/${board}/agent_log.md`;
   const target = path.join(vaultRoot, '50_Agents', board, 'agent_log.md');
+  const broker = new VaultBroker(vaultRoot);
 
-  // ── 1) Ensure the header note exists (idempotent create). ──────────────────
-  // writeNoteIfAbsent is a no-op when the note already exists, so this is cheap on
-  // every-but-the-first call. makeFrontmatter throws only on an invalid schema —
-  // our inputs are fixed and valid, but we still guard so nothing escapes.
+  let init: { frontmatter: Record<string, unknown>; body: string };
   try {
-    const fm = makeFrontmatter({
-      type: 'agent_log',
-      status: 'active',
-      authored_by: `board.${board}`,
-      source: 'gen://letta-archival',
-      title: `${board} — agent log`,
-    });
-    const created: WriteResult = await writeNoteIfAbsent(
-      target,
-      fm,
-      `# ${board} — agent log\n`,
-    );
-    // `{written:false, reason:'locked'}` here just means someone else is creating
-    // it right now — the append below will still target the same path, and if the
-    // header isn't on disk yet appendSection will create a header-less file. That's
-    // acceptable: the section is the durable record; the frontmatter is a one-time
-    // nicety. We don't fail the mirror on a create-time lock.
-    void created;
+    init = {
+      frontmatter: makeFrontmatter({
+        type: 'agent_log',
+        status: 'active',
+        authored_by: `board.${board}`,
+        source: 'gen://letta-archival',
+        title: `${board} — agent log`,
+      }),
+      body: `# ${board} — agent log\n`,
+    };
   } catch (err) {
     // A malformed-frontmatter throw (shouldn't happen with fixed inputs) must not
     // crash the mirror — degrade to {ok:false} so the caller can retry/alert.
     return { ok: false, path: target, error: errMsg(err) };
   }
 
-  // ── 2) Append the timestamped archival section (append-only). ──────────────
-  const section = `## ${ts} — archival\n${text}`;
-  const first = await tryAppend(target, section);
+  const first = await tryAppend(broker, rel, `## ${ts} — archival\n${text}`, init);
   if (first.kind === 'ok') return { ok: true, path: target };
   if (first.kind === 'locked') {
     // Soft failure — the file is held by another writer; retry on the next cycle.
     return { ok: false, path: target, error: 'agent_log is locked; retry next cycle' };
   }
+  if (first.kind === 'error') return { ok: false, path: target, error: first.error };
 
   // first.kind === 'wikilink' — the text carried a relative .md link. Neutralize it
   // and retry ONCE. (PRD §8.2: wikilinks only; relative md links are forbidden.)
   const cleaned = `## ${ts} — archival\n${neutralizeRelativeMdLinks(text)}`;
-  const second = await tryAppend(target, cleaned);
+  const second = await tryAppend(broker, rel, cleaned, init);
   if (second.kind === 'ok') return { ok: true, path: target };
   if (second.kind === 'locked') {
     return { ok: false, path: target, error: 'agent_log is locked; retry next cycle' };
   }
+  if (second.kind === 'error') return { ok: false, path: target, error: second.error };
   // Still a violation after neutralization (shouldn't happen) — fail cleanly.
   return {
     ok: false,
@@ -124,26 +114,28 @@ export async function mirrorArchivalToVault(
 type AppendOutcome =
   | { kind: 'ok' }
   | { kind: 'locked' }
-  | { kind: 'wikilink' };
+  | { kind: 'wikilink' }
+  | { kind: 'error'; error: string };
 
 /**
- * appendSection wrapper that converts its outcomes into a small tagged union and
- * traps the WikilinkViolationError (the only thing appendSection throws for our
- * inputs) so the caller can decide to neutralize + retry. Any *other* throw is
- * re-raised — those are genuine I/O faults the caller's try/catch should see... but
- * since the public function must never throw, we trap everything and treat unknowns
- * as a soft 'locked' (retry-next-cycle) to be safe.
+ * broker.appendNote wrapper that converts its outcomes into a small tagged union.
+ * The WikilinkViolationError is trapped so the caller can neutralize + retry; path
+ * rejections, append-only violations and I/O faults become `error` (never thrown).
  */
-async function tryAppend(target: string, text: string): Promise<AppendOutcome> {
+async function tryAppend(
+  broker: VaultBroker,
+  rel: string,
+  text: string,
+  init: { frontmatter: Record<string, unknown>; body: string },
+): Promise<AppendOutcome> {
   try {
-    const res = await appendSection(target, text);
-    if (res.written) return { kind: 'ok' };
-    // The only non-written WriteResult reason appendSection emits is 'locked'.
-    return { kind: 'locked' };
+    const res = await broker.appendNote(rel, text, { init });
+    if (res.ok) return { kind: 'ok' };
+    if (res.reason === 'locked') return { kind: 'locked' };
+    return { kind: 'error', error: `agent_log append not completed (${res.reason})` };
   } catch (err) {
     if (err instanceof WikilinkViolationError) return { kind: 'wikilink' };
-    // Unexpected I/O error — degrade to a soft retry rather than throwing out.
-    return { kind: 'locked' };
+    return { kind: 'error', error: errMsg(err) };
   }
 }
 

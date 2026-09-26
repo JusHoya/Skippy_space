@@ -123,13 +123,14 @@ export function buildObsidianServer(vaultRoot: string, broker: McpBroker): McpSe
       ),
       tool(
         'obsidian_write_note',
-        'Create or overwrite a vault note atomically (frontmatter + body). Wikilinks only — relative .md links are rejected.',
+        'Create a vault note atomically (frontmatter + body) at a vault-relative .md path. To edit an existing note, pass expected_hash (the sha256 of the version you read); a mismatch is a conflict. id/created_at are preserved; agent_log/daily notes are append-only. Wikilinks only — relative .md links are rejected.',
         {
           path: z.string(),
           title: z.string(),
           body: z.string(),
           type: z.string().optional(),
           source: z.string().optional(),
+          expected_hash: z.string().optional(),
         },
         b('obsidian_write_note', (args) => handleObsidianWriteNote(vaultRoot, args)),
       ),

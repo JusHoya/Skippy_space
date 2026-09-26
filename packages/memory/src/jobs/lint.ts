@@ -16,7 +16,7 @@ import * as path from 'node:path';
 
 import { ulid } from 'ulid';
 
-import { writeNote } from '../atomic.js';
+import { VaultBroker } from '../vault-broker.js';
 import {
   makeFrontmatter,
   parseNote,
@@ -169,8 +169,13 @@ export async function runLint(opts: RunLintOptions): Promise<LintResult> {
     });
     const body = renderProposalBody({ date, orphans, sourceless, stale });
 
-    const res = await writeNote(proposalPath, fm, body);
-    if (!res.written) {
+    // Create-only through the broker: a proposal never overwrites a live note.
+    const res = await new VaultBroker(vaultRoot).createNote(
+      `_index/proposals/${proposalId}.md`,
+      fm,
+      body,
+    );
+    if (!res.ok) {
       throw new Error(
         `lint: could not write proposal ${proposalPath} (reason: ${res.reason})`,
       );

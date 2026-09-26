@@ -18,6 +18,8 @@
 // rejection that Node's fetch would otherwise throw; an https:// URL is still honored
 // if the caller sets one (and has the cert trusted / NODE_TLS_REJECT_UNAUTHORIZED).
 
+import { normalizeVaultRelPath } from './vault-path.js';
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Result type — mirrors the {ok}-discriminated style used across @skippy/memory.
 // ──────────────────────────────────────────────────────────────────────────────
@@ -94,7 +96,9 @@ export class ObsidianRestClient {
    * `vaultRelPath` is POSIX-style relative to the vault root, e.g. `10_Atomic/x.md`.
    */
   async readFile(vaultRelPath: string): Promise<RestResult<string>> {
-    const res = await this.request('GET', `/vault/${encodePath(vaultRelPath)}`, {
+    const safe = safeRestPath(vaultRelPath, false);
+    if (!safe.ok) return safe;
+    const res = await this.request('GET', `/vault/${encodePath(safe.data)}`, {
       // Ask for the raw markdown rather than the JSON note-wrapper.
       accept: 'text/markdown',
     });
@@ -114,7 +118,14 @@ export class ObsidianRestClient {
     key: string,
     value: unknown,
   ): Promise<RestResult<true>> {
-    const res = await this.request('PATCH', `/vault/${encodePath(vaultRelPath)}`, {
+    const safe = safeRestPath(vaultRelPath, true);
+    if (!safe.ok) return safe;
+    // FR-WIKI-02: identity keys never change on edit, and `type` is protected so
+    // a note cannot be moved into or out of the append-only types via PATCH.
+    if (PROTECTED_FRONTMATTER_KEYS.includes(key)) {
+      return { ok: false, error: `frontmatter key "${key}" is protected and cannot be patched` };
+    }
+    const res = await this.request('PATCH', `/vault/${encodePath(safe.data)}`, {
       contentType: 'application/json',
       headers: {
         Operation: 'replace',
@@ -133,7 +144,9 @@ export class ObsidianRestClient {
    * Append-only — matches the §8.5 agent_log/daily semantics without re-reading.
    */
   async appendBlock(vaultRelPath: string, markdown: string): Promise<RestResult<true>> {
-    const res = await this.request('POST', `/vault/${encodePath(vaultRelPath)}`, {
+    const safe = safeRestPath(vaultRelPath, true);
+    if (!safe.ok) return safe;
+    const res = await this.request('POST', `/vault/${encodePath(safe.data)}`, {
       contentType: 'text/markdown',
       body: markdown,
     });
@@ -233,6 +246,23 @@ export interface SearchHit {
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/** Frontmatter keys REST PATCH may not touch (identity + append-only type). */
+const PROTECTED_FRONTMATTER_KEYS: readonly string[] = ['id', 'created_at', 'type'];
+
+/**
+ * Lexically validate a vault-relative path before it is put on the wire
+ * (FR-SEC-02). Without this, `../x` would be normalized by URL parsing into a
+ * different REST endpoint, and absolute/UNC/ADS forms would reach the plugin.
+ * Writes additionally require a `.md` target. Returns the canonical POSIX path.
+ */
+function safeRestPath(vaultRelPath: string, write: boolean): RestResult<string> {
+  try {
+    return { ok: true, data: normalizeVaultRelPath(vaultRelPath, { requireMarkdown: write }) };
+  } catch (err) {
+    return { ok: false, error: errMsg(err) };
+  }
+}
 
 /** Percent-encode a vault-relative path segment-wise (keep the `/` separators). */
 function encodePath(vaultRelPath: string): string {

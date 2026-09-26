@@ -15,13 +15,12 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import { writeNote } from '../atomic.js';
 import {
-  makeFrontmatter,
   parseNote,
   validateFrontmatter,
   type NoteFrontmatter,
 } from '../frontmatter.js';
+import { VaultBroker, hashContent } from '../vault-broker.js';
 import { makeVectorStore, type VectorStore } from '../vector-store.js';
 import type { JobEvent } from './types.js';
 
@@ -50,6 +49,10 @@ export interface LinkResult {
 interface LoadedNote {
   id: string;
   path: string;
+  /** Vault-relative POSIX path, for the write broker. */
+  rel: string;
+  /** sha256 of the bytes this snapshot was parsed from (compare-and-swap). */
+  hash: string;
   fm: NoteFrontmatter;
   body: string;
   /** Lowercase keyword set drawn from title + tags + body. */
@@ -70,7 +73,8 @@ function keywordSet(...parts: string[]): Set<string> {
 }
 
 /** Load + validate every `.md` note under a vault subdir. Skips invalid notes. */
-async function loadDir(dir: string): Promise<LoadedNote[]> {
+async function loadDir(vaultRoot: string, subdir: string): Promise<LoadedNote[]> {
+  const dir = path.join(vaultRoot, subdir);
   let entries: string[];
   try {
     entries = await fs.readdir(dir);
@@ -81,19 +85,21 @@ async function loadDir(dir: string): Promise<LoadedNote[]> {
   for (const name of entries) {
     if (!name.toLowerCase().endsWith('.md')) continue;
     const full = path.join(dir, name);
-    let raw: string;
+    let bytes: Buffer;
     try {
-      raw = await fs.readFile(full, 'utf8');
+      bytes = await fs.readFile(full);
     } catch {
       continue;
     }
-    const parsed = parseNote(raw);
+    const parsed = parseNote(bytes.toString('utf8'));
     const v = validateFrontmatter(parsed.frontmatter);
     if (!v.ok) continue;
     const tags = v.value.tags.join(' ');
     out.push({
       id: v.value.id,
       path: full,
+      rel: `${subdir}/${name}`,
+      hash: hashContent(bytes),
       fm: v.value,
       body: parsed.body,
       keywords: keywordSet(v.value.title, tags, parsed.body),
@@ -134,11 +140,9 @@ export async function runLink(opts: RunLinkOptions): Promise<LinkResult> {
   onJob?.({ job: 'link', phase: 'start' });
 
   try {
-    const atomic = (await loadDir(path.join(vaultRoot, '10_Atomic'))).slice(
-      0,
-      NODE_BUDGET,
-    );
-    const topics = await loadDir(path.join(vaultRoot, '20_Topics'));
+    const atomic = (await loadDir(vaultRoot, '10_Atomic')).slice(0, NODE_BUDGET);
+    const topics = await loadDir(vaultRoot, '20_Topics');
+    const broker = new VaultBroker(vaultRoot);
 
     // Optional semantic refinement — degrade silently when unavailable.
     const store = await tryVectorStore(vaultRoot);
@@ -179,25 +183,20 @@ export async function runLink(opts: RunLinkOptions): Promise<LinkResult> {
       if (missing.length === 0) continue;
 
       const additions = missing.map((id) => `- [[${id}]]`).join('\n');
-      const newBody = `${topic.body.replace(/\s+$/, '')}\n${additions}\n`;
 
-      // Bump updated_at by re-stamping the existing (already-valid) frontmatter.
-      const fm = makeFrontmatter({
-        id: topic.fm.id,
-        title: topic.fm.title,
-        type: topic.fm.type,
-        status: topic.fm.status,
-        authored_by: topic.fm.authored_by,
-        source: topic.fm.source,
-        tags: topic.fm.tags,
-        confidence: topic.fm.confidence,
-        distilled_from: topic.fm.distilled_from,
-        supersedes: topic.fm.supersedes,
-        contradicts: topic.fm.contradicts,
-      });
-
-      const res = await writeNote(topic.path, fm, newBody);
-      if (res.written) linksAdded += missing.length;
+      // Compare-and-swap through the broker: the page must still match the bytes
+      // we scored. `id`, `created_at`, unknown keys and the authored body are
+      // preserved and `updated_at` is bumped (FR-WIKI-02). A concurrent edit is a
+      // conflict; the page is picked up again on the next scheduled pass.
+      try {
+        const res = await broker.updateNote(topic.rel, topic.hash, (cur) => ({
+          body: `${cur.body.replace(/\s+$/, '')}\n${additions}\n`,
+        }));
+        if (res.ok) linksAdded += missing.length;
+      } catch {
+        // Append-only type or a relative .md link in the authored body: leave
+        // this page untouched rather than abort the whole pass.
+      }
     }
 
     onJob?.({ job: 'link', phase: 'complete', counts: { links: linksAdded } });
