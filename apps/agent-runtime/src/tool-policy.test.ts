@@ -522,3 +522,273 @@ test('an executor that cannot enforce the policy is ineligible', async () => {
   const ambientMcp = { ...CLAUDE_AGENT_SDK_CAPABILITIES, adapter: 'ambient-mcp', mcpAllowlist: false };
   assert.throws(() => assertExecutorEligible(policy, ambientMcp), ToolPolicyError);
 });
+
+// ── Red-team D2: path arguments are interpreted the way the CLI will ─────────
+//
+// The bundled CLI (claude-agent-sdk-win32-x64 0.3.162, claude.exe) resolves the
+// Grep/Glob `path` and the Read/Write/Edit `file_path` via one helper that
+// trims, expands `~` and `~/` to the executor's home, maps `/c/...` to `C:\...`
+// on Windows, then `path.resolve(cwd, p)`. Its `backfillObservableInput` only
+// expands `file_path`/`notebook_path`, so the PreToolUse hook sees a raw `~` on
+// Grep/Glob. The policy must therefore interpret (or refuse) every path-bearing
+// argument itself.
+
+const isWin = process.platform === 'win32';
+
+/** Run a call through the real native gate: PreToolUse hook, then canUseTool
+ * with the same tool-use id (the order the CLI uses). */
+async function gate(
+  policy: ExecutionPolicy,
+  tool: string,
+  input: Record<string, unknown>,
+  approver: Approver = approveAll,
+): Promise<{ hookDenied: boolean; canUse: PermissionResult }> {
+  const opts = buildClaudeSdkPermissionOptions(policy, { approver });
+  const hook = opts.hooks.PreToolUse?.[0]?.hooks[0];
+  assert.ok(hook);
+  const h = await hook(
+    { hook_event_name: 'PreToolUse', session_id: 's', transcript_path: 't', cwd: policy.cwd, tool_name: tool, tool_input: input, tool_use_id: 'tu_gate' },
+    'tu_gate',
+    { signal: new AbortController().signal },
+  );
+  const out = (h as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput;
+  const canUse = await opts.canUseTool(tool, input, { signal: new AbortController().signal, toolUseID: 'tu_gate' });
+  return { hookDenied: out?.permissionDecision === 'deny', canUse };
+}
+
+async function assertDeniedEverywhere(
+  policy: ExecutionPolicy,
+  tool: string,
+  input: Record<string, unknown>,
+  code: string,
+): Promise<void> {
+  const label = `${tool} ${JSON.stringify(input)}`;
+  const d = await evaluateToolCall(policy, { toolName: tool, input }, { approver: approveAll });
+  assert.equal(d.allow, false, `${label}: expected deny, got ${JSON.stringify(d)}`);
+  assert.equal((d as { code: string }).code, code, `${label}: code`);
+  const g = await gate(policy, tool, input);
+  assert.equal(g.hookDenied, true, `${label}: PreToolUse must deny natively`);
+  assert.equal(g.canUse.behavior, 'deny', `${label}: canUseTool must deny`);
+}
+
+async function assertAllowed(policy: ExecutionPolicy, tool: string, input: Record<string, unknown>): Promise<void> {
+  const d = await evaluateToolCall(policy, { toolName: tool, input }, { approver: approveAll });
+  assert.equal(d.allow, true, `${tool} ${JSON.stringify(input)}: expected allow, got ${JSON.stringify(d)}`);
+}
+
+function fsPolicy(wt: string): ExecutionPolicy {
+  return derivePolicy(
+    charter({ permission_mode: 'acceptEdits', tools: ['Read', 'Grep', 'Glob', 'Write', 'Edit', 'NotebookEdit', 'Agent'] }),
+    { worktreePath: wt },
+  );
+}
+
+test('D2: home-relative and env-var paths are refused on Grep/Glob/Read/Write (hook + canUseTool)', async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const policy = fsPolicy(wt);
+  const paths = [
+    '~',
+    '~/',
+    '~\\',
+    ' ~ ',
+    '~/.ssh',
+    '~\\.ssh',
+    '~/.ssh/id_rsa',
+    '~other',
+    '~other/.ssh/id_rsa',
+    '~+/x',
+    '%USERPROFILE%',
+    '%USERPROFILE%\\.ssh\\id_rsa',
+    '$HOME',
+    '$HOME/.ssh/id_rsa',
+    '${HOME}/.ssh',
+  ];
+  for (const p of paths) {
+    await assertDeniedEverywhere(policy, 'Grep', { pattern: 'API_KEY', path: p }, 'path_outside_roots');
+    await assertDeniedEverywhere(policy, 'Glob', { pattern: '*', path: p }, 'path_outside_roots');
+    await assertDeniedEverywhere(policy, 'Read', { file_path: p }, 'path_outside_roots');
+    await assertDeniedEverywhere(policy, 'Write', { file_path: p, content: 'x' }, 'path_outside_roots');
+    await assertDeniedEverywhere(policy, 'Edit', { file_path: p, old_string: 'a', new_string: 'b' }, 'path_outside_roots');
+  }
+  // `~` inside a later segment is a literal name, not a home reference.
+  await assertAllowed(policy, 'Read', { file_path: path.join(wt, 'a~b', '~', 'x.txt') });
+  // Plain in-root forms still work (the guard is not deny-everything).
+  await assertAllowed(policy, 'Grep', { pattern: 'API_KEY' });
+  await assertAllowed(policy, 'Grep', { pattern: 'API_KEY', path: 'src' });
+  await assertAllowed(policy, 'Grep', { pattern: 'API_KEY', path: ` ${wt} ` });
+  await assertAllowed(policy, 'Glob', { pattern: '**/*.ts', path: wt });
+  await assertAllowed(policy, 'Read', { file_path: path.join(wt, 'README.md') });
+});
+
+test('D2: Windows path forms are interpreted like the CLI or refused', { skip: !isWin }, async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const policy = fsPolicy(wt);
+  // CLI maps `/c/...` to `C:\...` (msys form): an in-root msys path is allowed,
+  // an out-of-root one is denied.
+  const msys = `/${wt[0]!.toLowerCase()}/${wt.slice(3).replace(/\\/g, '/')}/x.txt`;
+  await assertAllowed(policy, 'Read', { file_path: msys });
+  await assertDeniedEverywhere(policy, 'Read', { file_path: '/c/Windows/win.ini' }, 'path_outside_roots');
+  // Root-relative (depends on the executor's current drive), drive-relative,
+  // UNC/device, ADS and trailing-dot aliases are refused.
+  for (const p of [
+    '\\Windows\\win.ini',
+    '/Windows/win.ini',
+    '/cygdrive/c/Windows/win.ini',
+    'C:Windows\\win.ini',
+    '\\\\?\\C:\\Windows\\win.ini',
+    '\\\\.\\PhysicalDrive0',
+    '//server/share/x',
+    path.join(wt, 'a.txt:secret'),
+    path.join(wt, 'sub.', 'x.txt'),
+    path.join(wt, 'CON'),
+  ]) {
+    await assertDeniedEverywhere(policy, 'Read', { file_path: p }, 'path_outside_roots');
+    await assertDeniedEverywhere(policy, 'Grep', { pattern: 'x', path: p }, 'path_outside_roots');
+  }
+});
+
+test('D2: Glob patterns — braces, absolute patterns, `..` and pattern+path are all contained', async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const outside = await tmpDir('skippy-policy-outside-');
+  const policy = fsPolicy(wt);
+  const fwd = (p: string) => p.replace(/\\/g, '/');
+  const sysDir = isWin ? 'C:/Windows/System32' : '/etc';
+  const deniedPatterns: Array<Record<string, unknown>> = [
+    { pattern: `{${sysDir},src}/*.dll` }, // brace-first: every alternative is checked
+    { pattern: `{src,${sysDir}}/*` },
+    { pattern: `{src,{lib,${sysDir}}}/*` }, // nested
+    { pattern: `src/{a,../..}/*` }, // traversal hidden in an alternative
+    { pattern: `{src/*` }, // unbalanced: meaning unprovable
+    { pattern: `${sysDir}/*.dll` }, // absolute
+    { pattern: `${fwd(outside)}/**/*` },
+    { pattern: `${fwd(wt)}/../${path.basename(outside)}/*` },
+    { pattern: '../*' },
+    { pattern: 'src/../../*' },
+    { pattern: '**/../../*' },
+    { pattern: 'src/**/..' },
+    { pattern: '~/*' },
+    { pattern: '$HOME/*' },
+    { pattern: '%USERPROFILE%/*' },
+    { pattern: '*.ts', path: outside }, // pattern combined with an outside path
+    { pattern: `{../${path.basename(outside)},src}/*`, path: wt },
+    { pattern: 7 },
+    {},
+  ];
+  if (isWin) deniedPatterns.push({ pattern: '/c/Windows/*' }, { pattern: '\\Windows\\*' }, { pattern: 'C:*.dll' }, { pattern: '//host/share/*' });
+  for (const input of deniedPatterns) {
+    const d = await evaluateToolCall(policy, { toolName: 'Glob', input }, { approver: approveAll });
+    assert.equal(d.allow, false, `Glob ${JSON.stringify(input)} should be denied, got ${JSON.stringify(d)}`);
+    const g = await gate(policy, 'Glob', input);
+    assert.equal(g.canUse.behavior, 'deny', `Glob ${JSON.stringify(input)} canUseTool`);
+  }
+  for (const input of [
+    { pattern: '**/*.ts' },
+    { pattern: 'src/{a,b}/*.{ts,tsx}' },
+    { pattern: `${fwd(wt)}/src/**/*.ts` },
+    { pattern: `${wt}${path.sep}*.md` },
+    { pattern: '*.ts', path: path.join(wt, 'src') },
+    { pattern: 'a..b/*.ts' }, // `..` inside a name is not traversal
+  ]) {
+    await assertAllowed(policy, 'Glob', input);
+  }
+});
+
+test('D2: Grep glob filters cannot smuggle absolute, traversal or home forms', async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const policy = fsPolicy(wt);
+  for (const glob of ['../../*', '~/.ssh/*', isWin ? 'C:/Windows/**' : '/etc/**', '{*.ts,../../**}', '*.ts ../x/*', '$HOME/*']) {
+    await assertDeniedEverywhere(policy, 'Grep', { pattern: 'x', glob }, 'path_outside_roots');
+  }
+  for (const glob of ['*.{ts,tsx}', '*.ts *.js', '!**/node_modules/**', 'src/**/*.ts']) {
+    await assertAllowed(policy, 'Grep', { pattern: 'x', glob });
+  }
+});
+
+test('D2: unknown or malformed path-bearing fields fail closed', async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const outside = await tmpDir('skippy-policy-outside-');
+  const policy = fsPolicy(wt);
+  const inside = path.join(wt, 'a.txt');
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ['Read', { file_path: inside, path: outside }],
+    ['Read', { file_path: inside, dir: outside }],
+    ['Write', { file_path: inside, content: 'x', target_path: outside }],
+    ['Edit', { file_path: inside, old_string: 'a', new_string: 'b', cwd: outside }],
+    ['Glob', { pattern: '*', path: wt, cwd: outside }],
+    ['Grep', { pattern: 'x', paths: [outside] }],
+    ['NotebookEdit', { notebook_path: path.join(wt, 'n.ipynb'), new_source: 'x', file_path: outside }],
+    ['Agent', { description: 'd', prompt: 'p', cwd: outside }],
+    ['Grep', { pattern: 'x', path: [outside] }], // non-string path
+    ['Read', { file_path: { toString: () => outside } }],
+    ['Read', {}], // missing required path
+  ];
+  for (const [tool, input] of cases) {
+    const d = await evaluateToolCall(policy, { toolName: tool, input }, { approver: approveAll });
+    assert.equal(d.allow, false, `${tool} ${JSON.stringify(input)} should be denied`);
+    assert.equal((d as { code: string }).code, 'invalid_arguments', `${tool} ${JSON.stringify(input)} code`);
+    assert.equal((await gate(policy, tool, input)).canUse.behavior, 'deny');
+  }
+});
+
+test('D2: canUseTool never reuses a cached allow for a different input or tool', async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const outside = await tmpDir('skippy-policy-outside-');
+  const policy = fsPolicy(wt);
+  const opts = buildClaudeSdkPermissionOptions(policy, { approver: approveAll });
+  const hook = opts.hooks.PreToolUse?.[0]?.hooks[0];
+  assert.ok(hook);
+  const runHook = (tool: string, input: Record<string, unknown>, id: string) =>
+    hook(
+      { hook_event_name: 'PreToolUse', session_id: 's', transcript_path: 't', cwd: wt, tool_name: tool, tool_input: input, tool_use_id: id },
+      id,
+      { signal: new AbortController().signal },
+    );
+  const sig = () => new AbortController().signal;
+
+  // Hook allowed an in-root read; canUseTool is then asked about an outside read.
+  await runHook('Read', { file_path: path.join(wt, 'a.txt') }, 'tu_swap');
+  const swapped = await opts.canUseTool('Read', { file_path: path.join(outside, 'secret') }, { signal: sig(), toolUseID: 'tu_swap' });
+  assert.equal(swapped.behavior, 'deny', 'changed input must be re-evaluated');
+
+  // Same id, different tool name.
+  await runHook('Read', { file_path: path.join(wt, 'a.txt') }, 'tu_tool');
+  const otherTool = await opts.canUseTool('Write', { file_path: path.join(outside, 'x'), content: 'x' }, { signal: sig(), toolUseID: 'tu_tool' });
+  assert.equal(otherTool.behavior, 'deny', 'changed tool must be re-evaluated');
+
+  // Unchanged input (key order irrelevant) still reuses the hook decision.
+  await runHook('Read', { file_path: path.join(wt, 'a.txt'), limit: 5 }, 'tu_same');
+  const same = await opts.canUseTool('Read', { limit: 5, file_path: path.join(wt, 'a.txt') }, { signal: sig(), toolUseID: 'tu_same' });
+  assert.equal(same.behavior, 'allow');
+  if (same.behavior === 'allow') {
+    assert.deepEqual(same.updatedInput, { limit: 5, file_path: path.join(wt, 'a.txt') }, 'allow carries the evaluated input');
+  }
+});
+
+// ── Red-team D4: disallowed_tools is validated against the catalogue ─────────
+
+test('D4: misspelled or unknown disallowed_tools entries fail closed', async () => {
+  const cwd = await tmpDir('skippy-policy-cwd-');
+  for (const bad of [['edit', 'write'], ['Wirte'], ['bash'], ['mcp__obsidain'], ['mcp__obsidian__obsidian_nuke'], ['Bash(rm:*)'], ['*']]) {
+    assert.throws(
+      () => derivePolicy(charter({ tools: ['Read', 'Edit', 'Write'], disallowed_tools: bad }), { cwd }),
+      (e: unknown) => e instanceof ToolPolicyError && (e.code as string) === 'unknown_disallowed_tool',
+      JSON.stringify(bad),
+    );
+  }
+  for (const ok of [['Edit', 'Write'], ['Task', 'KillShell'], ['mcp__obsidian'], ['mcp__obsidian__*'], ['mcp__letta__letta_edit_core'], []]) {
+    assert.doesNotThrow(() => derivePolicy(charter({ tools: ['Read'], disallowed_tools: ok }), { cwd }), JSON.stringify(ok));
+  }
+  // Every shipped charter (boards, staff, skippy, task agents) still derives.
+  const tasksDir = path.join(REPO_ROOT, 'agent_space', 'tasks');
+  for (const f of readdirSync(tasksDir).filter((x) => x.endsWith('.md'))) {
+    const text = await fs.readFile(path.join(tasksDir, f), 'utf8');
+    const list = (key: string): string[] => {
+      const m = new RegExp(`^${key}:\\s*\\[([^\\]]*)\\]`, 'm').exec(text);
+      return m ? m[1]!.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    };
+    assert.doesNotThrow(
+      () => derivePolicy(charter({ tools: list('tools'), disallowed_tools: list('disallowed_tools') }), { cwd }),
+      `task charter ${f}`,
+    );
+  }
+});

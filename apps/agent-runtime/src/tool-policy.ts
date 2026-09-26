@@ -35,7 +35,15 @@
 // atomic.ts). Here the vault scope is an *authorization* check on the
 // vault-relative argument; the worktree write roots use the pluggable
 // `PathGuard` hook (default: lexical + real-ancestor containment).
+//
+// Built-in tool arguments (red-team D2/D4 fixes): every catalogued built-in
+// has an exact input-field allowlist; every path argument is interpreted the
+// way the bundled CLI resolves it (see "Built-in tool arguments" below) and
+// environment-dependent forms (`~`, env vars, root-/drive-relative, UNC) are
+// refused; Glob patterns are checked per brace alternative; `disallowed_tools`
+// entries must name catalogued tools.
 
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
@@ -150,6 +158,7 @@ export type ToolPolicyErrorCode =
   | 'invalid_tools'
   | 'unknown_tool'
   | 'invalid_disallowed_tools'
+  | 'unknown_disallowed_tool'
   | 'invalid_mcp_servers'
   | 'unknown_authority_field'
   | 'invalid_context'
@@ -231,7 +240,29 @@ function stringList(
 }
 
 function canonicalTool(name: string): string {
-  return TOOL_ALIASES[name] ?? name;
+  return Object.hasOwn(TOOL_ALIASES, name) ? (TOOL_ALIASES[name] ?? name) : name;
+}
+
+/** Own-property class lookup (never the prototype chain: `toString` is not a tool). */
+function builtinClass(name: string): ActionClass | undefined {
+  return Object.hasOwn(BUILTIN_TOOL_CLASSES, name) ? BUILTIN_TOOL_CLASSES[name] : undefined;
+}
+
+/** True when a `disallowed_tools` entry names something the runtime can
+ * actually deny: an exact built-in/alias name, or a catalogued MCP server
+ * (`mcp__server`, `mcp__server__*`) or MCP tool (`mcp__server__tool`). */
+function isCataloguedDisallowEntry(d: string): boolean {
+  if (Object.hasOwn(BUILTIN_TOOL_CLASSES, d) || Object.hasOwn(TOOL_ALIASES, d)) return true;
+  if (!d.startsWith('mcp__')) return false;
+  const rest = d.slice('mcp__'.length);
+  const sep = rest.indexOf('__');
+  const server = sep === -1 ? rest : rest.slice(0, sep);
+  if (!Object.hasOwn(MCP_TOOL_CLASSES, server)) return false;
+  const tools = MCP_TOOL_CLASSES[server];
+  if (!tools) return false;
+  if (sep === -1) return true;
+  const tool = rest.slice(sep + 2);
+  return tool === '*' || Object.hasOwn(tools, tool);
 }
 
 function parsePermissionMode(charter: Charter): Exclude<CharterPermissionMode, 'default'> {
@@ -300,7 +331,7 @@ export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): Executi
 
   const requestedTools = stringList(charter, 'tools', 'invalid_tools');
   for (const t of requestedTools) {
-    if (!(t in BUILTIN_TOOL_CLASSES)) {
+    if (builtinClass(t) === undefined) {
       fail(
         'unknown_tool',
         charter,
@@ -309,6 +340,21 @@ export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): Executi
     }
   }
   const charterDisallowed = stringList(charter, 'disallowed_tools', 'invalid_disallowed_tools');
+  // Red-team D4: an entry that matches nothing (wrong case, typo, CLI rule
+  // syntax such as `Bash(rm:*)`) would silently deny nothing. Fail closed
+  // instead of guessing (no case-folding): the charter author must fix it.
+  for (const d of charterDisallowed) {
+    if (!isCataloguedDisallowEntry(d)) {
+      fail(
+        'unknown_disallowed_tool',
+        charter,
+        `disallowed_tools entry "${d}" matches no catalogued tool (exact names: ${[
+          ...Object.keys(BUILTIN_TOOL_CLASSES),
+          ...Object.keys(TOOL_ALIASES),
+        ].join(', ')}; or mcp__<server>, mcp__<server>__*, mcp__<server>__<tool>); refusing rather than denying nothing`,
+      );
+    }
+  }
   const disallowedCanonical = new Set(charterDisallowed.map(canonicalTool));
   const allowedTools = [...new Set(requestedTools)].filter((t) => !disallowedCanonical.has(t));
 
@@ -460,12 +506,357 @@ function withinVaultScope(policy: ExecutionPolicy, rel: string): boolean {
   return policy.vaultWriteScopes.some((scope) => cmp(rel).startsWith(cmp(scope)));
 }
 
-/** Leading non-glob portion of a glob pattern. */
-function globStaticPrefix(pattern: string): string {
-  const idx = pattern.search(/[*?[{]/);
-  const head = idx === -1 ? pattern : pattern.slice(0, idx);
-  const cut = Math.max(head.lastIndexOf('/'), head.lastIndexOf('\\'));
-  return cut === -1 ? '' : head.slice(0, cut + 1);
+// ──────────────────────────────────────────────────────────────────────────────
+// Built-in tool arguments (red-team D2; FR-SEC-01 argument validation,
+// FR-SEC-02 path forms)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Verified against the CLI bundled in @anthropic-ai/claude-agent-sdk-win32-x64
+// 0.3.162 (claude.exe, CLI 2.1.162). Its path helper (minified `GK`) is used
+// for Read/Write/Edit `file_path`, NotebookEdit `notebook_path`, Grep `path`
+// and Glob `path`:
+//   p = raw.trim(); '' -> cwd; '~' -> os.homedir(); '~/x' -> join(homedir, x);
+//   on Windows /^\/[a-z]\//i ('/c/x') -> 'C:\x'; isAbsolute(p) ? normalize(p)
+//   : resolve(cwd, p).
+// `backfillObservableInput` (what the PreToolUse hook sees) is applied only to
+// `file_path`/`notebook_path`, so Grep/Glob reach the hook with a raw `~`.
+// Glob (`Au7`) runs `rg --files --glob <pattern>` in `path`; when the pattern
+// is absolute it instead searches the pattern's static prefix (text before the
+// first of `*?[{`, cut at the last separator) and ignores `path`. Grep (`call`)
+// passes `glob` to `rg --glob` after splitting on whitespace and (outside
+// braces) commas. Neither expands environment variables (rg runs via
+// execFile, no shell).
+//
+// Rules, all fail closed:
+//   - Every catalogued built-in has an exact input-field allowlist; any other
+//     field (which could carry a path the guard never saw) is denied, as is a
+//     non-string value in a path field.
+//   - Path arguments are interpreted exactly as above, except that forms whose
+//     meaning depends on the executor's environment are refused rather than
+//     guessed: any leading `~` (`~`, `~/`, `~\`, `~user`; the executor's home
+//     is its env, not ours), `%VAR%` / `$VAR` / `${VAR}` / `$(...)`, UNC and
+//     device paths, and on Windows drive-relative (`C:x`), root-relative
+//     (`\x`, `/x`), colons after the drive (ADS/devices), segments ending in a
+//     dot or space (Win32 strips them) and reserved device names.
+//   - The interpreted absolute path (never the raw string) goes to the
+//     PathGuard, so a replacement guard cannot misread `~` either.
+//   - Glob patterns: every brace alternative (nested, capped) AND the raw
+//     pattern are checked; each must be free of the forms above and of `..`
+//     segments, and its static prefix — absolute, or resolved against `path`
+//     — must pass the PathGuard. Unbalanced braces are refused.
+//   - Grep `glob` filters must be relative and `..`-free in every alternative.
+
+/** Exact input fields per catalogued built-in (SDK `sdk-tools.d.ts` + the
+ * bundled CLI's zod schemas). Agent's `cwd` is deliberately absent: it would
+ * re-root the task agent outside the policy's interpretation base. */
+const BUILTIN_INPUT_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  Read: ['file_path', 'offset', 'limit', 'pages'],
+  Glob: ['pattern', 'path'],
+  Grep: [
+    'pattern',
+    'path',
+    'glob',
+    'output_mode',
+    '-B',
+    '-A',
+    '-C',
+    'context',
+    '-n',
+    '-i',
+    '-o',
+    'type',
+    'head_limit',
+    'offset',
+    'multiline',
+  ],
+  Edit: ['file_path', 'old_string', 'new_string', 'replace_all'],
+  MultiEdit: ['file_path', 'edits'],
+  Write: ['file_path', 'content'],
+  NotebookEdit: ['notebook_path', 'cell_id', 'new_source', 'cell_type', 'edit_mode'],
+  Bash: ['command', 'timeout', 'description', 'run_in_background', 'dangerouslyDisableSandbox'],
+  PowerShell: ['command', 'timeout', 'description', 'run_in_background', 'dangerouslyDisableSandbox'],
+  TaskOutput: ['task_id', 'block', 'timeout'],
+  TaskStop: ['task_id', 'shell_id'],
+  WebFetch: ['url', 'prompt'],
+  WebSearch: ['query', 'allowed_domains', 'blocked_domains'],
+  Agent: ['description', 'prompt', 'subagent_type', 'model', 'run_in_background', 'name', 'team_name', 'mode', 'isolation'],
+  TodoWrite: ['todos'],
+};
+
+/** The single path-bearing field of each write-class built-in. */
+const WRITE_PATH_FIELD: Readonly<Record<string, string>> = {
+  Write: 'file_path',
+  Edit: 'file_path',
+  MultiEdit: 'file_path',
+  NotebookEdit: 'notebook_path',
+};
+
+export type PathInterpretation = { ok: true; path: string } | { ok: false; reason: string };
+
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+const ENV_VAR_FORM = /%[^%\\/]+%|\$(?:\{|\(|[A-Za-z_])/;
+const WIN_RESERVED_NAME = /^(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)(?:\..*)?$/i;
+/** Exactly the CLI's static-prefix cut set (Glob `b3f`), so the directory we
+ * guard is the directory rg is handed. */
+const GLOB_META = /[*?[{]/;
+const MAX_BRACE_ALTERNATIVES = 256;
+
+function onWindows(): boolean {
+  return process.platform === 'win32';
+}
+
+/**
+ * Why `p` cannot be interpreted without guessing, or null. `names` also
+ * checks per-segment Win32 aliasing (literal paths, not glob patterns).
+ */
+function pathAmbiguity(p: string, names: boolean): string | null {
+  if (CONTROL_CHARS.test(p)) return 'control characters (including NUL) are not permitted';
+  if (p.startsWith('~')) {
+    return "home-relative paths (~, ~/, ~\\, ~user) are expanded against the executor's own home directory; use an absolute path";
+  }
+  if (ENV_VAR_FORM.test(p)) {
+    return 'environment-variable references (%VAR%, $VAR, ${VAR}, $(...)) are not permitted; use an absolute path';
+  }
+  if (/^[\\/]{2}/.test(p)) return 'UNC/device paths are not permitted';
+  if (onWindows()) {
+    if (/^[a-zA-Z]:(?![\\/])/.test(p)) return 'drive-relative paths are not permitted';
+    if (/^[\\/]/.test(p)) return "root-relative paths depend on the executor's current drive; use a drive-qualified path";
+    if (p.includes(':', /^[a-zA-Z]:/.test(p) ? 2 : 0)) {
+      return 'a colon after the drive prefix (alternate data stream / device) is not permitted';
+    }
+    if (names) {
+      for (const seg of p.split(/[\\/]/)) {
+        if (seg === '' || seg === '.' || seg === '..') continue;
+        if (/[. ]$/.test(seg)) return `segment "${seg}" ends in a dot or space (Win32 strips it, aliasing another name)`;
+        if (WIN_RESERVED_NAME.test(seg)) return `segment "${seg}" is a reserved device name`;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Interpret a built-in tool's path argument the way the bundled CLI will
+ * (trim, msys `/c/` form, resolve against `base`), refusing every form whose
+ * meaning depends on the executor's environment. Returns an absolute path.
+ */
+export function interpretToolPath(raw: unknown, base: string): PathInterpretation {
+  if (typeof raw !== 'string') return { ok: false, reason: 'path must be a string' };
+  let p = raw.trim();
+  if (p === '') return { ok: true, path: path.resolve(base) };
+  if (onWindows() && /^\/[a-z]\//i.test(p)) {
+    p = `${p.charAt(1).toUpperCase()}:\\${p.slice(3).replace(/\//g, '\\')}`;
+  }
+  const why = pathAmbiguity(p, true);
+  if (why) return { ok: false, reason: why };
+  return { ok: true, path: path.isAbsolute(p) ? path.normalize(p) : path.resolve(base, p) };
+}
+
+/**
+ * Expand `{a,b}` alternatives (nested). Returns null when braces are
+ * unbalanced or the expansion exceeds MAX_BRACE_ALTERNATIVES: an unprovable
+ * pattern is refused, not approximated.
+ */
+export function expandBraces(pattern: string): string[] | null {
+  const open = pattern.indexOf('{');
+  if (open === -1) return pattern.includes('}') ? null : [pattern];
+  if (pattern.slice(0, open).includes('}')) return null;
+  let depth = 0;
+  let close = -1;
+  const commas: number[] = [];
+  for (let i = open; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        close = i;
+        break;
+      }
+    } else if (c === ',' && depth === 1) commas.push(i);
+  }
+  if (close === -1) return null;
+  const pre = pattern.slice(0, open);
+  const post = pattern.slice(close + 1);
+  const parts: string[] = [];
+  let start = open + 1;
+  for (const c of commas) {
+    parts.push(pattern.slice(start, c));
+    start = c + 1;
+  }
+  parts.push(pattern.slice(start, close));
+  const out: string[] = [];
+  for (const part of parts) {
+    const sub = expandBraces(pre + part + post);
+    if (sub === null) return null;
+    out.push(...sub);
+    if (out.length > MAX_BRACE_ALTERNATIVES) return null;
+  }
+  return out;
+}
+
+function hasDotDotSegment(p: string): boolean {
+  return p.split(/[\\/]/).some((s) => s === '..');
+}
+
+/** Directory rg will enumerate for one glob alternative: the text before the
+ * first glob metacharacter, cut after the last separator (the CLI's Glob
+ * `b3f` split), or the whole literal when there is no metacharacter. */
+function globRootFor(alt: string, searchBase: string): string {
+  const idx = alt.search(GLOB_META);
+  let prefix: string;
+  if (idx === -1) {
+    prefix = alt;
+  } else {
+    const head = alt.slice(0, idx);
+    const cut = Math.max(head.lastIndexOf('/'), head.lastIndexOf('\\'));
+    prefix = cut === -1 ? '' : head.slice(0, cut + 1);
+  }
+  if (path.isAbsolute(alt)) return path.normalize(prefix === '' ? alt : prefix);
+  return path.resolve(searchBase, prefix === '' ? '.' : prefix);
+}
+
+type ArgCheck = { ok: true } | { ok: false; code: DenyCode; reason: string };
+
+const argOk: ArgCheck = { ok: true };
+
+/** Exact-field allowlist for a catalogued built-in. */
+function checkInputFields(canonical: string, input: Record<string, unknown>): ArgCheck {
+  const known = BUILTIN_INPUT_FIELDS[canonical];
+  if (!known) return { ok: false, code: 'invalid_arguments', reason: `no input schema is catalogued for ${canonical}` };
+  for (const k of Object.keys(input)) {
+    if (!known.includes(k)) {
+      return {
+        ok: false,
+        code: 'invalid_arguments',
+        reason: `unknown input field "${k}" for ${canonical}; the policy cannot prove it does not carry a path`,
+      };
+    }
+  }
+  return argOk;
+}
+
+/** Interpret one path argument and run it through the PathGuard. */
+async function checkPathArg(
+  label: string,
+  raw: string,
+  roots: readonly string[],
+  base: string,
+  guard: PathGuard,
+): Promise<ArgCheck> {
+  const r = interpretToolPath(raw, base);
+  if (!r.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" refused: ${r.reason}` };
+  const g = await guard(r.path, roots, base);
+  if (!g.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${g.reason}` };
+  return argOk;
+}
+
+/** Glob `pattern` (+ optional `path`) must stay inside the read roots. */
+async function checkGlobPattern(
+  pattern: string,
+  searchBase: string,
+  roots: readonly string[],
+  guard: PathGuard,
+): Promise<ArgCheck> {
+  const bad = (reason: string): ArgCheck => ({ ok: false, code: 'path_outside_roots', reason: `glob pattern "${pattern}" refused: ${reason}` });
+  const alts = expandBraces(pattern);
+  if (alts === null) return bad(`unbalanced braces or more than ${MAX_BRACE_ALTERNATIVES} alternatives`);
+  for (const alt of new Set([pattern, ...alts])) {
+    const why = pathAmbiguity(alt, false);
+    if (why) return bad(`alternative "${alt}": ${why}`);
+    if (hasDotDotSegment(alt)) return bad(`alternative "${alt}" contains a ".." segment`);
+    const root = globRootFor(alt, searchBase);
+    const g = await guard(root, roots, searchBase);
+    if (!g.ok) return bad(`alternative "${alt}" searches ${root}: ${g.reason}`);
+  }
+  return argOk;
+}
+
+/** Grep `glob` is an rg filter relative to the search root: every
+ * alternative must be relative and free of `..`/home/env/device forms. */
+function checkGrepGlob(glob: string): ArgCheck {
+  const bad = (reason: string): ArgCheck => ({ ok: false, code: 'path_outside_roots', reason: `grep glob "${glob}" refused: ${reason}` });
+  const tokens: string[] = [];
+  for (const t of glob.split(/\s+/)) {
+    if (t === '') continue;
+    if (t.includes('{') && t.includes('}')) tokens.push(t);
+    else tokens.push(...t.split(',').filter(Boolean));
+  }
+  for (const token of tokens) {
+    const body = token.startsWith('!') ? token.slice(1) : token;
+    const alts = expandBraces(body);
+    if (alts === null) return bad(`"${token}" has unbalanced braces or too many alternatives`);
+    for (const alt of new Set([body, ...alts])) {
+      const why = pathAmbiguity(alt, false);
+      if (why) return bad(`"${alt}": ${why}`);
+      if (path.isAbsolute(alt) || /^[a-zA-Z]:/.test(alt)) return bad(`"${alt}" is absolute`);
+      if (hasDotDotSegment(alt)) return bad(`"${alt}" contains a ".." segment`);
+    }
+  }
+  return argOk;
+}
+
+/** All path-bearing arguments of a read-class built-in (Read/Glob/Grep). */
+async function checkReadArgs(
+  policy: ExecutionPolicy,
+  canonical: string,
+  input: Record<string, unknown>,
+  guard: PathGuard,
+): Promise<ArgCheck> {
+  const roots = policy.readRoots;
+  const base = policy.cwd;
+  const pathField = (k: string): { present: boolean; value?: string; bad?: ArgCheck } => {
+    if (!Object.hasOwn(input, k) || input[k] === undefined) return { present: false };
+    const v = input[k];
+    if (typeof v !== 'string') {
+      return { present: true, bad: { ok: false, code: 'invalid_arguments', reason: `${canonical} \`${k}\` must be a string` } };
+    }
+    return { present: true, value: v };
+  };
+  switch (canonical) {
+    case 'Read': {
+      const f = pathField('file_path');
+      if (f.bad) return f.bad;
+      if (!f.present || f.value === undefined || f.value.trim() === '') {
+        return { ok: false, code: 'invalid_arguments', reason: 'Read requires a non-empty file_path' };
+      }
+      return checkPathArg('file_path', f.value, roots, base, guard);
+    }
+    case 'Glob': {
+      const pattern = input['pattern'];
+      if (typeof pattern !== 'string' || pattern === '') {
+        return { ok: false, code: 'invalid_arguments', reason: 'Glob requires a string pattern' };
+      }
+      const p = pathField('path');
+      if (p.bad) return p.bad;
+      let searchBase = base;
+      if (p.value !== undefined) {
+        const c = await checkPathArg('path', p.value, roots, base, guard);
+        if (!c.ok) return c;
+        const r = interpretToolPath(p.value, base);
+        if (r.ok) searchBase = r.path;
+      }
+      return checkGlobPattern(pattern, searchBase, roots, guard);
+    }
+    case 'Grep': {
+      if (typeof input['pattern'] !== 'string') {
+        return { ok: false, code: 'invalid_arguments', reason: 'Grep requires a string pattern' };
+      }
+      const p = pathField('path');
+      if (p.bad) return p.bad;
+      if (p.value !== undefined) {
+        const c = await checkPathArg('path', p.value, roots, base, guard);
+        if (!c.ok) return c;
+      }
+      const g = pathField('glob');
+      if (g.bad) return g.bad;
+      if (g.value !== undefined) return checkGrepGlob(g.value);
+      return argOk;
+    }
+    default:
+      return { ok: false, code: 'invalid_arguments', reason: `no read-argument rule for ${canonical}` };
+  }
 }
 
 function approvalNeeded(
@@ -517,16 +908,20 @@ export async function evaluateToolCall(
     if (!policy.mcpServers.includes(mcp.server)) {
       return deny('mcp_server_not_allowed', `MCP server "${mcp.server}" is not in ${policy.agentId}'s charter`);
     }
-    const cls = MCP_TOOL_CLASSES[mcp.server]?.[mcp.tool];
+    const serverTools = Object.hasOwn(MCP_TOOL_CLASSES, mcp.server) ? MCP_TOOL_CLASSES[mcp.server] : undefined;
+    const cls = serverTools && Object.hasOwn(serverTools, mcp.tool) ? serverTools[mcp.tool] : undefined;
     if (!cls) return deny('unknown_tool', `MCP tool "${name}" is not a catalogued tool`);
     actionClass = cls;
   } else {
-    const cls = BUILTIN_TOOL_CLASSES[canonical];
+    const cls = builtinClass(canonical);
     if (!cls) return deny('unknown_tool', `tool "${name}" is not a catalogued tool`);
     if (!policy.allowedTools.includes(canonical)) {
       return deny('not_granted', `tool "${name}" is not granted by ${policy.agentId}'s charter`, cls);
     }
     actionClass = cls;
+    // Hard limit: no input field the policy does not understand (D2).
+    const fields = checkInputFields(canonical, input);
+    if (!fields.ok) return deny(fields.code, fields.reason, cls);
   }
 
   if (
@@ -542,35 +937,21 @@ export async function evaluateToolCall(
   let networkPreapproved = false;
   switch (actionClass) {
     case 'read': {
-      const targets: string[] = [];
-      for (const k of ['file_path', 'path', 'notebook_path']) {
-        const v = str(input, k);
-        if (v !== undefined && v !== '') targets.push(v);
-      }
-      if (canonical === 'Glob') {
-        const pattern = str(input, 'pattern') ?? '';
-        const prefix = globStaticPrefix(pattern);
-        if (prefix !== '' || pattern.includes('..')) {
-          const base = str(input, 'path') ?? policy.cwd;
-          targets.push(path.resolve(base, prefix === '' ? pattern : prefix));
-        }
-      }
-      for (const t of targets) {
-        const r = await guard(t, policy.readRoots, policy.cwd);
-        if (!r.ok) return deny('path_outside_roots', `read of "${t}" denied: ${r.reason}`, actionClass);
-      }
+      const r = await checkReadArgs(policy, canonical, input, guard);
+      if (!r.ok) return deny(r.code, r.reason, actionClass);
       break;
     }
     case 'write': {
-      const target = str(input, 'file_path') ?? str(input, 'notebook_path');
-      if (target === undefined || target === '') {
-        return deny('invalid_arguments', `${name} requires a file path`, actionClass);
+      const field = WRITE_PATH_FIELD[canonical];
+      const target = field === undefined ? undefined : input[field];
+      if (typeof target !== 'string' || target.trim() === '') {
+        return deny('invalid_arguments', `${name} requires a string ${field ?? 'file path'}`, actionClass);
       }
       if (policy.writeRoots.length === 0) {
         return deny('path_outside_roots', `no write root assigned to ${policy.agentId} (read-only execution)`, actionClass);
       }
-      const r = await guard(target, policy.writeRoots, policy.cwd);
-      if (!r.ok) return deny('path_outside_roots', `write to "${target}" denied: ${r.reason}`, actionClass);
+      const r = await checkPathArg(field ?? 'path', target, policy.writeRoots, policy.cwd, guard);
+      if (!r.ok) return deny(r.code, r.reason, actionClass);
       break;
     }
     case 'exec': {
@@ -682,22 +1063,21 @@ function contains(root: string, target: string): boolean {
 }
 
 /**
- * Default containment: rejects NUL, Windows device/UNC/drive-relative forms,
- * resolves `..`, and compares both lexical and real-ancestor forms
- * case-insensitively on Windows. WS-D's FR-SEC-02 broker can replace it.
+ * Default containment: interprets the target with `interpretToolPath` (so a
+ * raw `~`, env-var, UNC/device, drive-relative or root-relative form is
+ * refused even when the guard is called directly), resolves `..`, and compares
+ * both lexical and real-ancestor forms case-insensitively on Windows.
+ * `evaluateToolCall` always hands a guard the interpreted absolute path.
+ * WS-D's FR-SEC-02 broker can replace it.
  */
 export const defaultPathGuard: PathGuard = (target, roots, base) => {
   if (typeof target !== 'string' || target === '' || target.includes('\0')) {
     return Promise.resolve({ ok: false, reason: 'empty or NUL-containing path' });
   }
-  if (/^[\\/]{2}/.test(target)) {
-    return Promise.resolve({ ok: false, reason: 'UNC/device paths are not permitted' });
-  }
-  if (/^[a-zA-Z]:(?![\\/])/.test(target)) {
-    return Promise.resolve({ ok: false, reason: 'drive-relative paths are not permitted' });
-  }
+  const interpreted = interpretToolPath(target, base);
+  if (!interpreted.ok) return Promise.resolve({ ok: false, reason: interpreted.reason });
   if (roots.length === 0) return Promise.resolve({ ok: false, reason: 'no roots assigned' });
-  const lexical = path.resolve(base, target);
+  const lexical = interpreted.path;
   const real = realish(lexical);
   const ok = roots.some((root) => {
     const r = path.resolve(root);
@@ -792,21 +1172,48 @@ export interface SdkEnforcementHooks extends EnforcementHooks {
   onDecision?: (e: PolicyAuditEvent) => void;
 }
 
+/** Canonical (sorted-key) JSON of a value; throws on cycles/BigInt. */
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'undefined';
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`)
+    .join(',')}}`;
+}
+
+/** Hash identifying exactly which call a cached decision was made for. An
+ * unhashable input gets a unique value, so it can never match (re-evaluate). */
+function callFingerprint(toolName: string, input: unknown, subagentId: string | undefined): string {
+  try {
+    return createHash('sha256')
+      .update(canonicalJson({ toolName, input, subagentId: subagentId ?? null }))
+      .digest('hex');
+  } catch {
+    return `unhashable:${randomUUID()}`;
+  }
+}
+
 /**
  * Build the SDK permission options for `policy`. Every tool call is decided by
- * `evaluateToolCall` exactly once per tool-use id: the PreToolUse hook decides
- * (and denies natively); `canUseTool` reuses that decision when the CLI also
- * asks, or decides itself if the hook did not run.
+ * `evaluateToolCall`: the PreToolUse hook decides (and denies natively);
+ * `canUseTool` reuses that decision only when the tool-use id AND the
+ * fingerprint of (tool name, input, subagent) match what the hook evaluated,
+ * and otherwise decides afresh.
  */
 export function buildClaudeSdkPermissionOptions(
   policy: ExecutionPolicy,
   hooks: SdkEnforcementHooks = {},
 ): ClaudeSdkPermissionOptions {
-  const decided = new Map<string, PolicyDecision>();
-  const remember = (id: string | undefined, d: PolicyDecision): void => {
+  // Keyed by tool-use id, and only reused when the tool name, input and
+  // subagent are byte-identical (canonical JSON hash) to what the hook
+  // evaluated. Anything else is re-evaluated, never a stale allow (D2).
+  const decided = new Map<string, { fingerprint: string; decision: PolicyDecision }>();
+  const remember = (id: string | undefined, fingerprint: string, d: PolicyDecision): void => {
     if (!id) return;
     if (decided.size > 1024) decided.clear();
-    decided.set(id, d);
+    decided.set(id, { fingerprint, decision: d });
   };
 
   // An evaluation error is a denial, never a pass-through.
@@ -829,7 +1236,11 @@ export function buildClaudeSdkPermissionOptions(
       input,
       subagentId: hookInput.agent_id,
     });
-    remember(hookInput.tool_use_id ?? toolUseID, decision);
+    remember(
+      hookInput.tool_use_id ?? toolUseID,
+      callFingerprint(hookInput.tool_name, input, hookInput.agent_id),
+      decision,
+    );
     hooks.onDecision?.({ agentId: policy.agentId, toolName: hookInput.tool_name, decision, via: 'PreToolUse' });
     if (decision.allow) return {}; // defer to the normal permission flow (canUseTool)
     return {
@@ -842,8 +1253,10 @@ export function buildClaudeSdkPermissionOptions(
   };
 
   const canUseTool: CanUseTool = async (toolName, input, options): Promise<PermissionResult> => {
-    let decision = decided.get(options.toolUseID);
+    const cached = decided.get(options.toolUseID);
     decided.delete(options.toolUseID);
+    let decision =
+      cached && cached.fingerprint === callFingerprint(toolName, input, options.agentID) ? cached.decision : undefined;
     if (!decision) {
       decision = await safeEvaluate({ toolName, input, subagentId: options.agentID });
       hooks.onDecision?.({ agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
@@ -857,7 +1270,7 @@ export function buildClaudeSdkPermissionOptions(
         };
   };
 
-  const builtins = policy.allowedTools.filter((t) => t in BUILTIN_TOOL_CLASSES);
+  const builtins = policy.allowedTools.filter((t) => builtinClass(t) !== undefined);
   return {
     permissionMode: policy.sdkPermissionMode,
     allowDangerouslySkipPermissions: false,
