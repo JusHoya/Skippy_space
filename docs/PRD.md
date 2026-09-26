@@ -338,6 +338,8 @@ Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled
 | OQ-11 | Ceiling for "ordinary use" of subscription lanes | At most ~1 subscription orchestrator turn per minute, only while the owner is active; back off at 70%/85% of a 5-hour window |
 | OQ-12 | Specialist model portfolio and residency | One resident LLM per machine; specialists load on demand through a multiplexer and unload when idle. See the [model plan](MODEL-AND-CLUSTER-PLAN.md) |
 | OQ-13 | Validation disposition before tasks carry acceptance criteria (FR-RUN-01) | Until M1 adds criteria, a live executor's terminal success records `validation: not_defined` and may be `succeeded`; `failed` validation always forces nonsuccess. Demo (`SKIPPY_DEMO_MODE=1`) records are `simulated`, disabled/missing-key runs are `blocked`, and legacy `result: success` reads as `unverified` |
+| OQ-14 | Approval channel for `ask` charters (FR-SEC-01, FR-SEC-03) | Until FR-SEC-03 approval records exist, approval-required actions (write, exec, network outside allowlist, core-memory edits) are denied by the default approver; SDK boards can read, search and append to memory only |
+| OQ-15 | Is Obsidian Local REST ever a vault write path? (FR-WIKI-01/02) | No: REST is read/search only; all vault writes go through the local VaultBroker (lock, hash CAS, containment, append-only rules) |
 
 ### Owner decisions, 2026-09-26
 
