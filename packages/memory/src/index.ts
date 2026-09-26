@@ -12,6 +12,9 @@
 
 export * from './frontmatter.js';
 export * from './atomic.js';
+// M0 WS-D (FR-SEC-02, FR-WIKI-02) — vault path containment + the single write broker.
+export * from './vault-path.js';
+export * from './vault-broker.js';
 export * from './ulid.js';
 export * from './daily.js';
 // Phase 3 (WS2) — graceful-degradation client layer.
