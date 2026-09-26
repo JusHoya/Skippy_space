@@ -21,6 +21,7 @@
     "lint": "pnpm -r lint",
     "format": "prettier --write .",
     "autocommit": "node scripts/git-autocommit.mjs --once",
+    "test:scripts": "node --test scripts/*.test.mjs",
     "test:visual": "playwright test",
     "test:visual:ui": "playwright test --ui",
     "test:visual:headed": "playwright test --headed",
