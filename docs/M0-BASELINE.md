@@ -70,7 +70,10 @@ The following were **not** run and no claim is made beyond what's stated:
 - **Native PTY/sidecar/IPC tests** — Reason: requires running Tauri app + sidecar; not exercised by `cargo check`/`cargo test` alone. `cargo test --lib` covers Rust unit tests (envelope, git_autocommit) only.
 - **Tauri app startup** (`pnpm tauri dev` or packaged build launching a window) — Reason: requires display and native integration. Not run.
 - **Installer / clean-install verification** — Reason: no installer built. Not run.
-- **GitHub CI execution** — Reason: the fixed workflow has not yet run on `github-actions` runners. YAML syntax validated locally; CI will execute once branch is pushed.
+- **GitHub CI execution** — Reason: the fixed workflow has not yet run on `github-actions` runners. Earlier runs of the previous configuration failed at `pnpm/action-setup` ("Multiple versions of pnpm specified"); `gh run list` showed no successful run. YAML syntax validated locally; CI will execute once the branch is pushed.
+- **Linux test execution** — Reason: the `ts` job targets `ubuntu-latest`, but no Linux run has happened locally or on GitHub. All results above are Windows 11 only.
+- **Live SDK/CLI tool-policy enforcement** — Reason: no credentials used. Enforcement (no permission bypass, `canUseTool`/PreToolUse deny, path guard, MCP broker) is proven at hook, callback and broker level with a mocked SDK, not through a live Claude CLI subprocess. PRD §6.2 still requires a live denied-write proof before an executor is qualified.
+- **Real symlink tests (2 skipped in `packages/memory`)** — Reason: creating file/dir symlinks needs Developer Mode or SeCreateSymbolicLinkPrivilege. Junction tests cover the same reparse-point escape and pass.
 - **Live provider qualification** (real Letta, Obsidian REST, OTel/Langfuse, live LLM calls) — Reason: intentional; all test suites exercise mocked/degraded paths only. Live tests are opt-in and never part of CI.
 - **UI behavior of outcome display and walker despawn** — Reason: no UI test runner in scope. Typecheck and build only; no interaction tests.
 - **E4-5 unsupported-drop wiring in `apps/agent-runtime/src/memory-jobs.ts`** — Reason: verified by code reading only; functional tests would require live drop + ingest flow.

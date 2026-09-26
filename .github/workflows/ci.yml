@@ -40,6 +40,7 @@ jobs:
       # sidecar via a resources glob; build it before cargo touches the
       # shell crate or `cargo check`/`cargo test` fail on a missing glob match.
       - run: pnpm build:runtime
+      - run: pnpm --filter @skippy/ui build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
