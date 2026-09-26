@@ -18,11 +18,23 @@ import * as path from 'node:path';
 
 import { watch, type FSWatcher } from 'chokidar';
 
+import { INGEST_ERROR_SUFFIX } from './ingest/errors.js';
+import { extensionOf, isSupportedExtension } from './ingest/extractors.js';
+
 export interface WatchInboxOptions {
   /** Absolute path to the vault root (folder containing `00_Inbox/`). */
   vaultRoot: string;
-  /** Called once per stable added file, with its absolute path. */
+  /** Called once per stable added file with a DECLARED extractor, with its absolute path. */
   onFile: (absPath: string) => void;
+  /**
+   * Called once per stable added file whose extension has no declared
+   * extractor (FR-WIKI-03: "unsupported formats stay intact with errors").
+   * The file is reported here instead of being handed to `onFile` — it is
+   * never read as UTF-8 or enqueued for extraction by the watcher. (Calling
+   * `runIngest` directly on such a file still writes the same explicit
+   * `.ingest-error.json` sidecar; this callback is the watcher-level report.)
+   */
+  onUnsupported?: (absPath: string, ext: string) => void;
   /** Override the watched directory (defaults to `<vaultRoot>/00_Inbox`). */
   dir?: string;
 }
@@ -32,12 +44,17 @@ export interface InboxWatcher {
   close(): Promise<void>;
 }
 
-/** Matcher: ignore dotfiles, `.git`, `.obsidian`, and `*.tmp` (and our lockfiles). */
+/**
+ * Matcher: ignore dotfiles, `.git`, `.obsidian`, `*.tmp`/`*.lock`, and our own
+ * `.ingest-error.json` sidecars (so a written error report is never itself
+ * re-enqueued as a new drop).
+ */
 function shouldIgnore(p: string): boolean {
   const base = path.basename(p);
   if (base.startsWith('.')) return true; // dotfiles + dotdirs (.git, .obsidian, .smart-env)
   if (base.endsWith('.tmp')) return true;
   if (base.endsWith('.lock')) return true;
+  if (base.endsWith(INGEST_ERROR_SUFFIX)) return true;
   // Defensive: catch nested .git/.obsidian segments regardless of basename.
   const norm = p.replace(/\\/g, '/');
   if (/\/\.git\//.test(norm) || /\/\.obsidian\//.test(norm)) return true;
@@ -78,6 +95,23 @@ export function watchInbox(opts: WatchInboxOptions): InboxWatcher {
         const abs = path.resolve(addedPath);
         if (seen.has(abs)) return; // debounce duplicate add events
         seen.add(abs);
+
+        // FR-WIKI-03: only declared-supported extensions are enqueued for
+        // extraction. Anything else is reported, not processed — never read
+        // as UTF-8, never handed to the ingest pipeline by the watcher.
+        if (!isSupportedExtension(abs)) {
+          const ext = extensionOf(abs);
+          // eslint-disable-next-line no-console
+          console.warn(`[vault-watcher] unsupported extension "${ext}" for ${abs}; not enqueued.`);
+          try {
+            opts.onUnsupported?.(abs, ext);
+          } catch (err) {
+            // eslint-disable-next-line no-console
+            console.error('[vault-watcher] onUnsupported handler threw:', err);
+          }
+          return;
+        }
+
         try {
           opts.onFile(abs);
         } catch (err) {
