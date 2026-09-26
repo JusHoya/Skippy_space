@@ -16,9 +16,14 @@ import * as fsSync from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { LettaClient, VaultBroker, parseNote } from '@skippy/memory';
+import { LettaClient, VaultBroker, containmentPathGuard, parseNote } from '@skippy/memory';
 
 import { handleObsidianWriteNote, handleLettaAppend } from './mcp-handlers.js';
+import type { PathGuard } from './tool-policy.js';
+
+// Compile-time proof that the memory containment adapter plugs into WS-C's
+// tool-policy hook (`EnforcementHooks.pathGuard`) without a wrapper.
+const vaultPathGuard: PathGuard = containmentPathGuard;
 
 process.env.LETTA_DISABLED = '1';
 
@@ -166,4 +171,12 @@ test('letta_append_archival cannot escape the vault through the board name', asy
   assert.match(textOf(r), /vault mirror failed/);
   await assert.rejects(fs.access(path.join(base, 'escape')));
   await assert.rejects(fs.access(path.resolve(vault, '..', '..', 'escape')));
+});
+
+test('containmentPathGuard satisfies tool-policy PathGuard and rejects a junction escape', async () => {
+  const { vault, evil } = await sandbox();
+  fsSync.symlinkSync(evil, path.join(vault, 'j'), 'junction');
+  assert.deepEqual(await vaultPathGuard('notes/a.md', [vault], vault), { ok: true });
+  const r = await vaultPathGuard('j/a.md', [vault], vault);
+  assert.equal(r.ok, false);
 });

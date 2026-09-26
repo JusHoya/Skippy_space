@@ -45,8 +45,8 @@ import * as path from 'node:path';
 
 import { ulid } from 'ulid';
 
-import { writeNote } from '../atomic.js';
 import { makeFrontmatter, parseNote, validateFrontmatter } from '../frontmatter.js';
+import { VaultBroker } from '../vault-broker.js';
 import { getExtractor, InvalidEncodingError } from '../ingest/extractors.js';
 import { writeIngestError } from '../ingest/errors.js';
 import {
@@ -253,8 +253,14 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
         },
       });
 
-      const res = await writeNote(sourceNotePath, fm, body);
-      if (!res.written) {
+      // WS-D: create-only through the vault broker (containment + lock + atomic
+      // write; a fresh ULID path never collides, and nothing is ever clobbered).
+      const res = await new VaultBroker(vaultRoot).createNote(
+        `60_Sources/${sourceId}.md`,
+        fm,
+        body,
+      );
+      if (!res.ok) {
         throw new Error(
           `ingest: could not write source note ${sourceNotePath} (reason: ${res.reason})`,
         );

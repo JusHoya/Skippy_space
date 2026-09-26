@@ -69,6 +69,10 @@ export interface VaultPathOptions {
   allowHidden?: boolean;
   /** Require a `.md` final segment. Default false; the note broker sets true. */
   requireMarkdown?: boolean;
+  /** Accept an existing target that is a directory (not just a regular file). Default false. */
+  allowNonFileTarget?: boolean;
+  /** Accept an existing target that is itself a link, provided it resolves inside. Default false. */
+  allowLinkTarget?: boolean;
 }
 
 const MAX_REL_LEN = 1024;
@@ -190,6 +194,7 @@ async function assertRealContainment(
   realRoot: string,
   abs: string,
   input: string,
+  opts: VaultPathOptions = {},
 ): Promise<boolean> {
   let cur = abs;
   for (;;) {
@@ -216,10 +221,12 @@ async function assertRealContainment(
       throw new VaultPathError('escapes_root', input, `${cur} resolves to ${real}`);
     }
     if (cur === abs) {
-      if (st.isSymbolicLink()) {
+      if (st.isSymbolicLink() && !opts.allowLinkTarget) {
         throw new VaultPathError('target_is_link', input, 'the target is a symlink or junction');
       }
-      if (!st.isFile()) throw new VaultPathError('target_not_file', input);
+      if (!opts.allowNonFileTarget && !st.isSymbolicLink() && !st.isFile()) {
+        throw new VaultPathError('target_not_file', input);
+      }
       return true;
     }
     return false;
@@ -242,8 +249,66 @@ export async function resolveContained(
   const abs = path.join(realRoot, ...rel.split('/'));
   // Lexical sanity: the joined path must sit under the real root.
   if (!isPathInside(realRoot, abs)) throw new VaultPathError('escapes_root', untrustedRelPath);
-  const exists = await assertRealContainment(realRoot, abs, untrustedRelPath);
+  const exists = await assertRealContainment(realRoot, abs, untrustedRelPath, opts);
   return { rel, vaultRoot, realRoot, abs, exists };
+}
+
+/** Result shape of `containmentPathGuard` (structurally tool-policy's PathGuardResult). */
+export type ContainmentGuardResult = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Adapter with the shape of agent-runtime tool-policy's `PathGuard`
+ * `(target, roots, base) => Promise<{ok} | {ok:false, reason}>`, so the WS-C
+ * tool broker can use the same FR-SEC-02 containment as the vault broker.
+ *
+ * `target` may be absolute or relative to `base`. The raw string is screened
+ * for NUL/control chars, UNC/device prefixes, drive-relative forms and NTFS
+ * ADS (a colon anywhere but the drive letter). It is then allowed if it lies
+ * inside ANY root, lexically and by the real (junction/symlink-resolved)
+ * nearest existing ancestor, with every segment below the root passing the
+ * lexical gate. Hidden segments, directories and in-root link targets are
+ * allowed, since built-in tools read and write ordinary worktrees.
+ * Never throws.
+ */
+export async function containmentPathGuard(
+  target: string,
+  roots: readonly string[],
+  base: string,
+): Promise<ContainmentGuardResult> {
+  if (typeof target !== 'string' || target.length === 0) return { ok: false, reason: 'empty path' };
+  if (CONTROL_RE.test(target)) return { ok: false, reason: 'control character in path' };
+  if (/^[\\/]{2}/.test(target)) return { ok: false, reason: 'UNC/device paths are not permitted' };
+  if (/^[A-Za-z]:(?![\\/])/.test(target)) {
+    return { ok: false, reason: 'drive-relative paths are not permitted' };
+  }
+  const afterDrive = /^[A-Za-z]:[\\/]/.test(target) ? target.slice(2) : target;
+  if (afterDrive.includes(':')) return { ok: false, reason: 'NTFS alternate data streams are not permitted' };
+  if (roots.length === 0) return { ok: false, reason: 'no roots assigned' };
+
+  const lexical = path.resolve(base, target);
+  const reasons: string[] = [];
+  for (const root of roots) {
+    const rootAbs = path.resolve(root);
+    if (!isPathInside(rootAbs, lexical)) {
+      reasons.push(`outside ${root}`);
+      continue;
+    }
+    try {
+      const realRoot = await fs.realpath(rootAbs);
+      const rel = path.relative(rootAbs, lexical);
+      if (rel === '') return { ok: true };
+      const safeRel = normalizeVaultRelPath(rel, { allowHidden: true });
+      const abs = path.join(realRoot, ...safeRel.split('/'));
+      await assertRealContainment(realRoot, abs, target, {
+        allowNonFileTarget: true,
+        allowLinkTarget: true,
+      });
+      return { ok: true };
+    } catch (err) {
+      reasons.push(err instanceof Error ? err.message : String(err));
+    }
+  }
+  return { ok: false, reason: `path not contained: ${reasons.join('; ')}` };
 }
 
 /**

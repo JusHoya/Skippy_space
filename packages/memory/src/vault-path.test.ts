@@ -17,6 +17,7 @@ import * as path from 'node:path';
 
 import {
   VaultPathError,
+  containmentPathGuard,
   isPathInside,
   normalizeVaultRelPath,
   recheckContained,
@@ -214,4 +215,46 @@ test('recheckContained catches a directory swapped for an escaping junction afte
   await fs.rmdir(path.join(vault, 'swap'));
   fsSync.symlinkSync(evil, path.join(vault, 'swap'), 'junction');
   await assert.rejects(recheckContained(cp), rejects('escapes_root'));
+});
+
+// ── PathGuard adapter (for agent-runtime tool-policy) ────────────────────────
+
+test('containmentPathGuard allows in-root files, dirs and new paths; rejects escapes', async () => {
+  const { base, vault, evil } = await sandbox();
+  await fs.mkdir(path.join(vault, 'src'));
+  await fs.writeFile(path.join(vault, 'src', 'a.ts'), 'x');
+  fsSync.symlinkSync(evil, path.join(vault, 'j'), 'junction');
+  fsSync.symlinkSync(path.join(vault, 'src'), path.join(vault, 'inner'), 'junction');
+  const roots = [vault];
+  const ok = async (t: string) =>
+    assert.deepEqual(await containmentPathGuard(t, roots, vault), { ok: true }, t);
+  const no = async (t: string) => {
+    const r = await containmentPathGuard(t, roots, vault);
+    assert.equal(r.ok, false, `${t} should be rejected`);
+  };
+  await ok('src/a.ts');
+  await ok(path.join(vault, 'src', 'a.ts'));
+  await ok('src'); // directory target (Glob/Grep)
+  await ok('.gitignore'); // hidden files are ordinary in a worktree
+  await ok('new/dir/file.ts');
+  await ok('inner'); // in-root junction target
+  await ok(vault);
+  await no('../vault-evil/x.md');
+  await no(path.join(evil, 'x.md')); // prefix-sibling absolute path
+  await no('j/x.md'); // junction escape
+  await no('j/new/x.md');
+  await no('C:x.md');
+  await no('\\\\?\\' + path.join(vault, 'src', 'a.ts'));
+  await no('\\\\server\\share\\x');
+  await no('src/a.ts:ads');
+  await no('src/nul.ts');
+  await no('a\u0000b');
+  assert.deepEqual(await containmentPathGuard('x', [], vault), {
+    ok: false,
+    reason: 'no roots assigned',
+  });
+  // Allowed if inside ANY root.
+  assert.deepEqual(await containmentPathGuard(path.join(evil, 'y'), [vault, evil], base), {
+    ok: true,
+  });
 });

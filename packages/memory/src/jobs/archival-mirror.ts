@@ -146,7 +146,7 @@ const RELATIVE_MD_LINK_G =
   /\[([^\]]*)\]\(\s*(?!https?:\/\/)[^)]*\.md(?:[)#?][^)]*)?\)/gi;
 
 /**
- * Neutralize relative `.md` markdown links so appendSection's guard passes. We keep
+ * Neutralize relative `.md` markdown links so the broker's wikilink guard passes. We keep
  * the human-readable label and drop the link target, turning `[see](./foo.md)` into
  * `see` (a bare wikilink would mis-target, so we don't fabricate one). Absolute
  * http(s) links are untouched.

@@ -12,9 +12,9 @@
 // overwrites without an expected-hash check or identity preservation. New code
 // MUST write through `VaultBroker` (vault-broker.ts), which layers containment,
 // compare-and-swap and append-only enforcement over the same write-file-atomic +
-// proper-lockfile primitives. The only remaining caller of these legacy writers
-// is `jobs/ingest.ts` (owned by WS-E, migrating to the broker). The wikilink
-// guard below is shared with the broker.
+// proper-lockfile primitives. No production code calls these legacy writers any
+// more (atomic.test.ts still covers them); the wikilink guard below is shared
+// with the broker.
 
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
