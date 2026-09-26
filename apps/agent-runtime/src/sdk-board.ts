@@ -29,7 +29,7 @@
 // board runs read-only (no built-in write root).
 
 import type { ExecutorTerminal, ModelId } from '@skippy/shared';
-import type { McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
+import type { McpServerConfig, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { resolveExecutionGate } from './execution-gate.js';
@@ -101,6 +101,133 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
 }
 
 /**
+ * Map one `result` message from the SDK stream to an executor terminal
+ * status (D1, FR-RUN-01, G0 — fail closed).
+ *
+ * `terminal_reason` (see `TerminalReason` in `@anthropic-ai/claude-agent-sdk`
+ * sdk.d.ts, `'blocking_limit' | 'rapid_refill_breaker' | 'prompt_too_long' |
+ * 'image_error' | 'model_error' | 'aborted_streaming' | 'aborted_tools' |
+ * 'stop_hook_prevented' | 'hook_stopped' | 'tool_deferred' | 'max_turns' |
+ * 'completed'`) mapping implemented here:
+ *
+ *   | condition                                             | outcome     | reason code            |
+ *   |--------------------------------------------------------|-------------|-------------------------|
+ *   | non-empty `permission_denials`                        | blocked     | policy_refused          |
+ *   | `api_error_status` present (not null)                 | failed      | provider_error          |
+ *   | `terminal_reason` in {hook_stopped, stop_hook_prevented}| blocked     | policy_refused          |
+ *   | `terminal_reason === 'tool_deferred'` or                | blocked     | approval_required       |
+ *   |   `deferred_tool_use` present                          |             |                         |
+ *   | `terminal_reason === 'aborted_tools'`                  | interrupted | tool_execution_aborted  |
+ *   | subtype `'success'`, `!is_error`, and                  | succeeded   | —                       |
+ *   |   `terminal_reason` absent or `'completed'`            |             |                         |
+ *   | anything else (error subtype, `is_error` on a          | failed      | executor_error          |
+ *   |   success subtype, `model_error`, `prompt_too_long`,   |             |                         |
+ *   |   `max_turns`, or any other/unknown terminal_reason)   |             |                         |
+ *
+ * `terminal_reason` absence is treated as normal completion: the field is
+ * optional in the SDK's own type and the SDK does not backfill it on every
+ * ordinary success (verified against the installed
+ * @anthropic-ai/claude-agent-sdk sdk.d.ts `SDKResultSuccess` type, which
+ * declares it `terminal_reason?: TerminalReason`).
+ *
+ * The checks above run in this order regardless of `subtype`, so a `blocked`
+ * or `provider_error` signal on an already-`error_*` subtype result still
+ * gets its more specific reason code instead of the generic
+ * `executor_error` catch-all.
+ */
+function mapSdkResultMessage(msg: SDKResultMessage, boardId: string): SdkBoardResult {
+  const costUsd = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : undefined;
+  const withCost = (r: SdkBoardResult): SdkBoardResult => {
+    if (costUsd !== undefined) r.costUsd = costUsd;
+    return r;
+  };
+
+  const denials = msg.permission_denials ?? [];
+  if (denials.length > 0) {
+    return withCost({
+      status: 'blocked',
+      reason: {
+        code: 'policy_refused',
+        message: `Board ${boardId} executor was denied ${denials.length} tool call(s) by policy.`,
+        detail: denials.map((d) => d.tool_name).join(', '),
+      },
+    });
+  }
+
+  if (msg.subtype === 'success' && msg.api_error_status !== undefined && msg.api_error_status !== null) {
+    return withCost({
+      status: 'failed',
+      reason: {
+        code: 'provider_error',
+        message: `Board ${boardId} executor hit a provider API error (status ${msg.api_error_status}).`,
+        detail: String(msg.api_error_status),
+      },
+    });
+  }
+
+  const terminalReason = msg.terminal_reason;
+
+  if (terminalReason === 'hook_stopped' || terminalReason === 'stop_hook_prevented') {
+    return withCost({
+      status: 'blocked',
+      reason: {
+        code: 'policy_refused',
+        message: `Board ${boardId} executor was stopped by a policy hook (${terminalReason}).`,
+        detail: terminalReason,
+      },
+    });
+  }
+
+  const deferred = msg.subtype === 'success' ? msg.deferred_tool_use : undefined;
+  if (terminalReason === 'tool_deferred' || deferred) {
+    return withCost({
+      status: 'blocked',
+      reason: {
+        code: 'approval_required',
+        message: `Board ${boardId} executor deferred a tool call pending approval that has no channel yet.`,
+        detail: deferred ? `${deferred.name} (${deferred.id})` : terminalReason,
+      },
+    });
+  }
+
+  if (terminalReason === 'aborted_tools') {
+    return withCost({
+      status: 'interrupted',
+      reason: {
+        code: 'tool_execution_aborted',
+        message: `Board ${boardId} executor's tool calls were aborted mid-run.`,
+        detail: terminalReason,
+      },
+    });
+  }
+
+  const normalCompletion =
+    msg.subtype === 'success' &&
+    !msg.is_error &&
+    (terminalReason === undefined || terminalReason === 'completed');
+  if (normalCompletion) {
+    return withCost({ status: 'succeeded', summary: msg.result });
+  }
+
+  // Fail closed: an error subtype, a "success" subtype flagged is_error, or
+  // any other terminal_reason (model_error, prompt_too_long, max_turns,
+  // blocking_limit, rapid_refill_breaker, aborted_streaming, image_error, or
+  // an unrecognised future value) never becomes success.
+  const detail =
+    msg.subtype === 'success'
+      ? `success result flagged is_error: ${msg.result}${terminalReason ? ` (terminal_reason: ${terminalReason})` : ''}`
+      : [msg.subtype, terminalReason, ...(msg.errors ?? [])].filter(Boolean).join(': ');
+  return withCost({
+    status: 'failed',
+    reason: {
+      code: 'executor_error',
+      message: `Board ${boardId} executor ended with an error result (${msg.subtype}).`,
+      detail,
+    },
+  });
+}
+
+/**
  * Execute one board mission through the Claude Agent SDK and await its
  * terminal result. Dynamically imports the SDK so it never touches the
  * module-load path unless the live gate is open. Never throws: a policy
@@ -165,28 +292,25 @@ export async function executeBoardMissionViaSdk(
       },
     });
 
-    // Await the terminal `result` message. The last one observed wins.
+    // Await the terminal `result` message(s). Normally the last one observed
+    // wins, but a non-success result anywhere in the stream permanently
+    // disqualifies a later "success" from being reported (D1): once the
+    // stream has shown failure/blocked/interrupted, a subsequent success
+    // message cannot un-fail the mission.
     let terminal: SdkBoardResult | null = null;
+    let sawNonSuccessResult = false;
     for await (const msg of q) {
       if (msg.type !== 'result') continue;
-      const costUsd = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : undefined;
-      if (msg.subtype === 'success' && !msg.is_error) {
-        terminal = { status: 'succeeded', summary: msg.result };
-      } else {
-        const detail =
-          msg.subtype === 'success'
-            ? `success result flagged is_error: ${msg.result}`
-            : [msg.subtype, ...(msg.errors ?? [])].join(': ');
-        terminal = {
-          status: 'failed',
-          reason: {
-            code: 'executor_error',
-            message: `Board ${params.boardId} executor ended with an error result (${msg.subtype}).`,
-            detail,
-          },
-        };
+      const mapped = mapSdkResultMessage(msg, params.boardId);
+      if (mapped.status === 'succeeded' && sawNonSuccessResult) {
+        logger.warn({
+          msg: 'SDK board: later success result ignored after an earlier non-success result',
+          boardId: params.boardId,
+        });
+        continue;
       }
-      if (costUsd !== undefined) terminal.costUsd = costUsd;
+      terminal = mapped;
+      if (mapped.status !== 'succeeded') sawNonSuccessResult = true;
     }
 
     if (!terminal) {

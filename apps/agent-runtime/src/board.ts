@@ -358,6 +358,24 @@ export class Board {
         // Register before anything can throw so every accepted delegation is
         // guaranteed exactly one terminal record.
         this.inflight.set(env.delegationId, mode);
+
+        // D7: a delegation can be accepted and reach here after `shutdown()`
+        // has already flipped the phase (e.g. a queued accept resolving
+        // during teardown). Do not start live execution during shutdown —
+        // emit `interrupted` without touching the executor, exactly like the
+        // still-inflight delegations `shutdown()` itself interrupts.
+        if (this.phase === 'shutdown') {
+          record = nonSuccessRecord('interrupted', mode, {
+            code: 'shutdown',
+            message: `Board ${this.boardId} is shutting down; this delegation was never executed.`,
+          });
+          span.setAttribute('skippy.delegation.outcome', record.outcome);
+          span.setStatus({ code: SpanStatusCode.OK });
+          const emitted = this.emitTerminal(env.delegationId, record);
+          span.end();
+          return emitted;
+        }
+
         try {
           const gate = this.gate();
           mode = gate.kind === 'demo' ? 'demo' : 'live';

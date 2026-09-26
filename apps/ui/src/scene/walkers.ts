@@ -216,8 +216,15 @@ export function advanceWalkers(
 
 /**
  * Drive each walker beercan through its FSM. Per PRD §7.2 the walker is in
- * `working` state both while walking and after arrival (the welding loop
- * continues; only the world position distinguishes the two visually).
+ * `working` state both while walking and after arrival — the welding loop
+ * keeps playing at the pedestal, only the world position distinguishes the
+ * two visually. This is intentional *only* while the delegation is still
+ * live or has genuinely `succeeded`: a `working` beercan reads as "still on
+ * the job," so a walker must never be left ticking here once its delegation
+ * has reached a non-success terminal outcome (blocked/failed/cancelled/
+ * interrupted/simulated/unverified) — the caller (SceneRoot's delegation
+ * glue, D5) despawns it out of `specs`/`WALKER_REF_STORE` at that point
+ * instead of leaving it welding forever with nothing to show for it.
  */
 export function tickWalkerAnimations(
   t: number,

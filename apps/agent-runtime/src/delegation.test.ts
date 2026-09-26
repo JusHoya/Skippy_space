@@ -205,6 +205,22 @@ test('shutdown mid-run → interrupted; the late executor success is dropped', a
   assert.equal(all[0]?.reason?.code, 'shutdown');
 });
 
+test('D7: delegate() accepted after shutdown → interrupted(shutdown) without executing', async () => {
+  const { board, calls } = makeBoard(
+    () => ({ kind: 'live' }),
+    async () => ({ status: 'succeeded', summary: 'should never run' }),
+  );
+  await board.shutdown();
+  const env = await board.runAcceptedDelegation(mission('D-post-shutdown'));
+  assert.equal(calls(), 0, 'the executor must never run once the board has shut down');
+  assert.equal(env?.outcome, 'interrupted');
+  assert.equal(env?.mode, 'live');
+  assert.equal(env?.reason?.code, 'shutdown');
+  assert.equal(env?.validation, 'not_run');
+  assert.equal(completions('D-post-shutdown').length, 1);
+  assert.equal(captured.some((e) => e.type === 'delegation_state'), false, 'never reported running');
+});
+
 // ── G0 sweep: no non-live-success path yields `succeeded` ───────────────────
 
 test('G0: across every non-success path, zero succeeded records and all records satisfy invariants', async () => {

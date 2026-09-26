@@ -80,6 +80,14 @@ export const OUTCOME_REASON_CODES = [
   'cancelled_by_user',
   'legacy_unverified',
   'invalid_record',
+  // Added for the SDK executor's `terminal_reason` mapping (D1, FR-RUN-01):
+  // a tool call the executor deferred pending an approval channel that does
+  // not exist yet (`tool_deferred` / `deferred_tool_use`).
+  'approval_required',
+  // The executor's own tool calls were aborted mid-run (`terminal_reason:
+  // 'aborted_tools'`) — the run was cut short, not a hard provider/model
+  // failure, so it maps to `interrupted` rather than `failed`.
+  'tool_execution_aborted',
 ] as const;
 export const OutcomeReasonCodeSchema = z.enum(OUTCOME_REASON_CODES);
 export type OutcomeReasonCode = z.infer<typeof OutcomeReasonCodeSchema>;
