@@ -64,15 +64,38 @@
 //!      * `secret-content` — shared content rules hit the exact blob the
 //!        commit would contain (`cat-file --batch`, fetched in batches of at
 //!        most `maxScanBytes`; one char per byte and again with NULs stripped
-//!        for UTF-16), OR — for a path with ANY `filter` attribute (git-lfs,
-//!        custom clean filters, D2) — its working-tree bytes, i.e. the
-//!        pre-filter content the user wrote;
-//!      * `worktree-unscannable` — filtered path whose working-tree file
-//!        can't be read (missing, not a regular file, non-UTF-8 name);
-//!      * `changed-during-scan` — filtered path whose working-tree file no
-//!        longer cleans to the staged blob after the scan (`hash-object
-//!        --stdin-paths`), so the scanned bytes are not provably the
-//!        committed bytes.
+//!        for UTF-16), OR — for a PRE-FILTER path (below) — its working-tree
+//!        bytes, i.e. the content the user wrote;
+//!      * `worktree-unscannable` — pre-filter path whose working-tree file
+//!        can't be read as the bytes git cleaned (missing, not a regular file
+//!        — e.g. a real symlink —, non-UTF-8 name);
+//!      * `changed-during-scan` — pre-filter path whose scanned bytes do not
+//!        provably produce the staged blob (see 5b).
+//!
+//!    A PRE-FILTER path is EVERY candidate except an unfiltered mode-120000
+//!    entry under `core.symlinks=true` (a real symlink: git stores
+//!    `readlink()` and never runs a filter on it, so the blob scan is exact).
+//!    That covers any mode with a `filter` attribute (git-lfs, custom clean
+//!    filters, D2; 120000 included, EC5 D-A), every mode-120000 candidate
+//!    when `core.symlinks=false` (the Git for Windows default: the "symlink"
+//!    is a plain file whose bytes are stored, and `add` still runs the clean
+//!    filter on it), and every regular file whatever `check-attr` says now —
+//!    a `.gitattributes` flip between step 4's add and check-attr must not
+//!    decide whether the working-tree bytes get scanned (EC5 D-G).
+//!
+//!    5b. Scanned bytes == committed bytes (EC5 D-B/D-F). Each pre-filter
+//!    file is read ONCE; that buffer is scanned and then written, byte for
+//!    byte, into a private scratch work tree (plus copies of the real
+//!    `.gitattributes` of every ancestor directory). `git add` runs there
+//!    against a scratch index seeded exactly like the temp index was before
+//!    step 4's `add` (`read-tree HEAD`), so the clean filter, eol/autocrlf
+//!    handling and the index-dependent "CRLF already in index" rule are
+//!    applied to exactly the scanned bytes in the same context. Any path
+//!    whose scratch blob differs from the staged blob (or any failure of the
+//!    scratch add) is `changed-during-scan`. The file is never re-read, so a
+//!    key -> clean -> key flip between add, scan and verification cannot
+//!    pass, and an unchanged CRLF file under `core.autocrlf` is never
+//!    permanently excluded.
 //!
 //!    All are reported back as `skipped` paths (byte order) plus
 //!    `skipped_detail` (path, reason).
@@ -115,10 +138,16 @@
 //! `.git-credentials`, `secrets.*` except Markdown notes) plus a content scan
 //! for private-key armor (incl. PGP), AWS key ids and secret-key
 //! assignments, Anthropic/OpenAI/Stripe/GitHub/Slack/Google key shapes.
-//! Matches are skipped — left exactly as HEAD has them, or absent. Paths
-//! with a `filter` attribute are scanned both post-filter (the blob) and
-//! pre-filter (the working-tree bytes), so an LFS pointer or a reversible
-//! clean filter cannot smuggle a secret into history.
+//! Matches are skipped — left exactly as HEAD has them, or absent. Pre-filter
+//! paths are scanned both post-filter (the blob) and pre-filter (the
+//! working-tree bytes, proven to be the bytes behind the blob, 5b), so an LFS
+//! pointer, a reversible clean filter or a filtered symlink-as-file cannot
+//! smuggle a secret into history.
+//!
+//! Test seam: [`run_autocommit_report_with`] calls its hook with
+//! [`TickPhase::Added`] after step 4's add/write-tree and
+//! [`TickPhase::Scanned`] after the pre-filter reads, before 5b (Node:
+//! `runAutocommit(root, now, { onPhase })`). Production passes `None`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -146,7 +175,20 @@ const PENDING_MARKER_VERSION: u64 = 2;
 const SYNC_RETRY_ATTEMPTS: u32 = 3;
 const SYNC_RETRY_DELAY_MS: u64 = 20;
 const GITLINK_MODE: &str = "160000";
-const REGULAR_FILE_MODES: [&str; 2] = ["100644", "100755"];
+const SYMLINK_MODE: &str = "120000";
+const GITATTRIBUTES: &str = ".gitattributes";
+
+/// Test-seam checkpoints of one tick (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TickPhase {
+    /// Step 4's `add -A` / `write-tree` into the temp index are done.
+    Added,
+    /// The pre-filter working-tree reads are done; 5b has not run yet.
+    Scanned,
+}
+
+/// Optional per-phase callback (tests only; production passes `None`).
+pub(crate) type PhaseHook<'a> = Option<&'a (dyn Fn(TickPhase) + Sync)>;
 
 /// Why a changed vault path was withheld from the autocommit. The string
 /// forms are identical to the Node twin's `skippedDetail[].reason`.
@@ -718,75 +760,151 @@ async fn filtered_paths(root: &Path, paths: &[BPath], env: &[(&str, &OsStr)]) ->
     Ok(filtered)
 }
 
-/// Pre-filter scan of one working-tree file (D2). `None` when clean.
-async fn scan_worktree_file(root: &Path, path: &[u8]) -> Option<SkipReason> {
+/// Effective `core.symlinks` (git's built-in default is true).
+async fn core_symlinks(root: &Path) -> Result<bool> {
+    let v = git(root, &["config", "--type=bool", "--default=true", "--get", "core.symlinks"], &[])
+        .await
+        .context("git config core.symlinks failed")?;
+    Ok(v != "false")
+}
+
+/// Read one pre-filter working-tree file exactly ONCE and scan it (D2,
+/// D-A). `Ok(bytes)` when clean — the very buffer that was scanned, which 5b
+/// then proves is what the staged blob was cleaned from — else the reason.
+async fn read_and_scan_worktree_file(root: &Path, path: &[u8]) -> std::result::Result<Vec<u8>, SkipReason> {
     let Ok(rel) = std::str::from_utf8(path) else {
-        return Some(SkipReason::WorktreeUnscannable);
+        return Err(SkipReason::WorktreeUnscannable);
     };
     let full = root.join(rel);
     let Ok(meta) = tokio::fs::symlink_metadata(&full).await else {
-        return Some(SkipReason::WorktreeUnscannable);
+        return Err(SkipReason::WorktreeUnscannable);
     };
     if !meta.is_file() {
-        return Some(SkipReason::WorktreeUnscannable);
+        return Err(SkipReason::WorktreeUnscannable);
     }
     if meta.len() > max_scan_bytes() {
-        return Some(SkipReason::TooLargeToScan);
+        return Err(SkipReason::TooLargeToScan);
     }
     let Ok(bytes) = tokio::fs::read(&full).await else {
-        return Some(SkipReason::WorktreeUnscannable);
+        return Err(SkipReason::WorktreeUnscannable);
     };
     if bytes.len() as u64 > max_scan_bytes() {
-        return Some(SkipReason::TooLargeToScan);
+        return Err(SkipReason::TooLargeToScan);
     }
-    matches_secret_content(&bytes).then_some(SkipReason::SecretContent)
+    if matches_secret_content(&bytes) {
+        return Err(SkipReason::SecretContent);
+    }
+    Ok(bytes)
 }
 
-/// C-quote a raw path for line-based git stdin (`"..."`, octal escapes).
-fn c_quote(path: &[u8]) -> Vec<u8> {
-    let mut out = vec![b'"'];
-    for &c in path {
-        if c == b'"' || c == b'\\' {
-            out.push(b'\\');
-            out.push(c);
-        } else if c < 0x20 || c == 0x7f {
-            out.extend_from_slice(format!("\\{c:03o}").as_bytes());
-        } else {
-            out.push(c);
-        }
+/// Write scanned bytes to `<scratch>/<path>` (5b).
+async fn write_scratch_file(scratch: &Path, path: &[u8], bytes: &[u8]) -> std::io::Result<()> {
+    let rel = std::str::from_utf8(path).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dest = scratch.join(rel);
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
     }
-    out.push(b'"');
-    out
+    tokio::fs::write(&dest, bytes).await
 }
 
-/// Filtered paths whose working-tree file no longer cleans to its staged
-/// blob (re-run the clean filter via `hash-object --stdin-paths`, no -w).
-/// If git cannot hash them at all, every path counts as changed (fail
+/// 5b: the subset of `paths` (already written to `scratch` from their
+/// scanned buffers) whose scratch `git add` — seeded with `seed_index` (the
+/// temp index as it was before step 4's add; may not exist for an unborn
+/// HEAD) and the real `.gitattributes` of every ancestor directory — does NOT
+/// yield the staged blob. Any git failure makes every path unproven (fail
 /// closed).
-async fn changed_since_add(
+async fn unproven_paths(
     root: &Path,
+    git_dir: &Path,
+    scratch: &Path,
+    seed_index: &Path,
+    spec_file: &Path,
     paths: &[(BPath, String)],
-    env: &[(&str, &OsStr)],
 ) -> BTreeSet<BPath> {
     if paths.is_empty() {
         return BTreeSet::new();
     }
-    let mut input = Vec::new();
+    let mut dirs: BTreeSet<BPath> = BTreeSet::from([Vec::new()]);
     for (p, _) in paths {
-        input.extend_from_slice(&c_quote(p));
-        input.push(b'\n');
+        for (i, &b) in p.iter().enumerate() {
+            if b == b'/' {
+                dirs.insert(p[..i].to_vec());
+            }
+        }
     }
-    let Ok(out) = git_raw(root, &["hash-object", "--stdin-paths"], env, Some(&input)).await else {
-        return paths.iter().map(|(p, _)| p.clone()).collect();
-    };
-    let text = latin1(&out);
-    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
-    paths
-        .iter()
-        .enumerate()
-        .filter(|(i, (_, oid))| lines.len() != paths.len() || lines[*i] != oid)
-        .map(|(_, (p, _))| p.clone())
-        .collect()
+    for d in &dirs {
+        let mut rel = d.clone();
+        if !rel.is_empty() {
+            rel.push(b'/');
+        }
+        rel.extend_from_slice(GITATTRIBUTES.as_bytes());
+        let Ok(rel) = String::from_utf8(rel) else { continue };
+        let dest = scratch.join(&rel);
+        if dest.exists() {
+            continue; // a scanned candidate itself: its scanned bytes win
+        }
+        let src = root.join(&rel);
+        // git ignores a non-regular .gitattributes too; absent -> git falls
+        // back to the index copy, in both trees alike.
+        if tokio::fs::symlink_metadata(&src).await.is_ok_and(|m| m.is_file()) {
+            if let Some(parent) = dest.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::copy(&src, &dest).await;
+        }
+    }
+    let env = [
+        ("GIT_DIR", git_dir.as_os_str()),
+        ("GIT_WORK_TREE", scratch.as_os_str()),
+        ("GIT_INDEX_FILE", seed_index.as_os_str()),
+    ];
+    let staged = async {
+        let mut spec = Vec::new();
+        for (p, _) in paths {
+            spec.extend_from_slice(p);
+            spec.push(0);
+        }
+        tokio::fs::write(spec_file, &spec).await?;
+        let mut spec_arg = OsString::from("--pathspec-from-file=");
+        spec_arg.push(spec_file);
+        // fsmonitor off: never spawn a daemon for the scratch tree; longpaths
+        // on: the scratch prefix is longer than the repo root's, and a path
+        // that only fails there would otherwise be excluded forever.
+        let args: Vec<OsString> = vec![
+            "-c".into(),
+            "core.fsmonitor=false".into(),
+            "-c".into(),
+            "core.longpaths=true".into(),
+            "add".into(),
+            spec_arg,
+            "--pathspec-file-nul".into(),
+        ];
+        git_raw(scratch, &args, &env, None).await?;
+        let out = git_raw(scratch, &["ls-files", "-s", "-z", "--", VAULT_PATHSPEC], &env, None).await?;
+        let mut staged: BTreeMap<BPath, String> = BTreeMap::new();
+        for rec in split_z(&out) {
+            let (meta, path) = split_record(rec).ok_or_else(|| anyhow!("malformed ls-files record"))?;
+            if meta.len() < 3 {
+                bail!("malformed ls-files record");
+            }
+            if meta[2] == "0" {
+                staged.insert(path, meta[1].clone());
+            }
+        }
+        Ok::<_, anyhow::Error>(staged)
+    }
+    .await;
+    match staged {
+        Ok(staged) => paths
+            .iter()
+            .filter(|(p, oid)| staged.get(p) != Some(oid))
+            .map(|(p, _)| p.clone())
+            .collect(),
+        Err(e) => {
+            debug!("git_autocommit: scratch verification failed: {e:#}");
+            paths.iter().map(|(p, _)| p.clone()).collect()
+        }
+    }
 }
 
 /// Build the commit object for `tree` (parented on `head`, if any) and
@@ -1158,6 +1276,12 @@ async fn run_autocommit(root: &Path) -> Result<AutocommitOutcome> {
 /// Core algorithm, free of `EventBus` so it's directly unit-testable against
 /// real temporary git repos. See module docs for the full transaction.
 pub(crate) async fn run_autocommit_report(root: &Path) -> Result<AutocommitReport> {
+    run_autocommit_report_with(root, None).await
+}
+
+/// [`run_autocommit_report`] with the test seam: `hook` (if any) is called
+/// at each [`TickPhase`].
+pub(crate) async fn run_autocommit_report_with(root: &Path, hook: PhaseHook<'_>) -> Result<AutocommitReport> {
     let vault = root.join("vault");
     if !vault.exists() {
         return Ok(AutocommitReport {
@@ -1198,8 +1322,7 @@ pub(crate) async fn run_autocommit_report(root: &Path) -> Result<AutocommitRepor
     // D1: the temp index lives in a private dir under the OS temp dir (never
     // the git dir); the dir, index and any `.lock` go away whatever happens.
     let temp_dir = PrivateTempDir::new()?;
-    let temp_index = temp_dir.path().join("index");
-    let result = run_autocommit_inner(root, &git_dir, &temp_index, head.as_deref(), head_ref.as_deref()).await;
+    let result = run_autocommit_inner(root, &git_dir, temp_dir.path(), head.as_deref(), head_ref.as_deref(), hook).await;
     drop(temp_dir);
     let (outcome, skipped_detail) = result?;
     let skipped = skipped_detail.iter().map(|(p, _)| p.clone()).collect();
@@ -1209,10 +1332,14 @@ pub(crate) async fn run_autocommit_report(root: &Path) -> Result<AutocommitRepor
 async fn run_autocommit_inner(
     root: &Path,
     git_dir: &Path,
-    temp_index: &Path,
+    temp_dir: &Path,
     head: Option<&str>,
     head_ref: Option<&str>,
+    hook: PhaseHook<'_>,
 ) -> Result<(AutocommitOutcome, Vec<(String, SkipReason)>)> {
+    let temp_index = temp_dir.join("index");
+    let seed_index = temp_dir.join("seed-index"); // 5b: the temp index before add
+    let scratch = temp_dir.join("wt"); // 5b: scanned bytes, never re-read from the real tree
     let env = [("GIT_INDEX_FILE", temp_index.as_os_str())];
 
     let head_entries = tree_entries(root, head).await?;
@@ -1223,6 +1350,9 @@ async fn run_autocommit_inner(
         git(root, &["read-tree", head], &env)
             .await
             .context("git read-tree HEAD into temp index failed")?;
+        tokio::fs::copy(&temp_index, &seed_index)
+            .await
+            .context("failed to snapshot the seeded temp index")?;
     }
     // -A so deletions are captured; .gitignore respected; vault/ only.
     git(root, &["add", "-A", "--", VAULT_PATHSPEC], &env)
@@ -1231,6 +1361,9 @@ async fn run_autocommit_inner(
     let preliminary_tree = git(root, &["write-tree"], &env)
         .await
         .context("git write-tree from temp index failed")?;
+    if let Some(h) = hook {
+        h(TickPhase::Added);
+    }
     let prelim_entries = tree_entries(root, Some(&preliminary_tree)).await?;
     let all_changed = differing_paths(&head_entries, &prelim_entries);
 
@@ -1276,30 +1409,37 @@ async fn run_autocommit_inner(
         }
     }
 
-    // Pre-filter scan (D2): for regular files with any `filter` attribute,
-    // also scan the working-tree bytes and prove they still clean to the blob.
-    let regular: Vec<(BPath, String)> = to_scan
-        .iter()
-        .filter(|(p, _)| {
-            !reasons.contains_key(p)
-                && mode_of(&prelim_entries, p).is_some_and(|m| REGULAR_FILE_MODES.contains(&m.as_str()))
-        })
-        .cloned()
-        .collect();
-    let filtered = filtered_paths(root, &regular.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), &env).await?;
-    let mut scanned_filtered: Vec<(BPath, String)> = Vec::new();
-    for (p, oid) in &regular {
-        if !filtered.contains(p) {
+    // Pre-filter scan (D2, D-A, D-G): every remaining candidate except an
+    // unfiltered real symlink (core.symlinks=true). Each file is read once;
+    // the scanned buffer goes to the scratch tree, and 5b proves it is what
+    // the staged blob holds.
+    let remaining: Vec<(BPath, String)> = to_scan.iter().filter(|(p, _)| !reasons.contains_key(p)).cloned().collect();
+    let is_symlink = |p: &BPath| mode_of(&prelim_entries, p).as_deref() == Some(SYMLINK_MODE);
+    let symlink_candidates: Vec<BPath> = remaining.iter().filter(|(p, _)| is_symlink(p)).map(|(p, _)| p.clone()).collect();
+    let filtered_links = filtered_paths(root, &symlink_candidates, &env).await?;
+    let real_symlinks = !symlink_candidates.is_empty() && core_symlinks(root).await?;
+    let mut scanned: Vec<(BPath, String)> = Vec::new();
+    for (p, oid) in &remaining {
+        if real_symlinks && is_symlink(p) && !filtered_links.contains(p) {
             continue;
         }
-        match scan_worktree_file(root, p).await {
-            Some(v) => {
-                reasons.insert(p.clone(), v);
+        match read_and_scan_worktree_file(root, p).await {
+            Err(reason) => {
+                reasons.insert(p.clone(), reason);
             }
-            None => scanned_filtered.push((p.clone(), oid.clone())),
+            Ok(bytes) => match write_scratch_file(&scratch, p, &bytes).await {
+                Ok(()) => scanned.push((p.clone(), oid.clone())),
+                Err(_) => {
+                    reasons.insert(p.clone(), SkipReason::ChangedDuringScan); // cannot prove it: fail closed
+                }
+            },
         }
     }
-    for p in changed_since_add(root, &scanned_filtered, &env).await {
+    if let Some(h) = hook {
+        h(TickPhase::Scanned);
+    }
+    let spec_file = temp_dir.join("verify-pathspec");
+    for p in unproven_paths(root, git_dir, &scratch, &seed_index, &spec_file, &scanned).await {
         reasons.insert(p, SkipReason::ChangedDuringScan);
     }
 
@@ -2641,7 +2781,7 @@ mod f5_regression_tests {
     }
 
     #[tokio::test]
-    async fn f5_d2_diff_and_text_attributes_alone_do_not_trigger_the_pre_filter_path() {
+    async fn f5_d2_diff_and_text_attributes_alone_never_cause_an_exclusion() {
         let r = Repo::new("attrs");
         r.write(".gitattributes", "vault/*.md diff=foo text\n");
         r.write("vault/n.md", "x\n");
@@ -2799,5 +2939,328 @@ mod f5_regression_tests {
             assert_eq!(r.show(":vault/n.md"), "C", "recovery must sync the index to new");
             assert_eq!(r.status(), "");
         }
+    }
+}
+
+/// EC5 round-4 red-team regressions (D-A filtered symlink entry, D-B
+/// scan/verify TOCTOU, D-F CRLF false exclusion, D-G attribute flip).
+/// Mirrors the Node twin's `EC5-D*` cases case for case. D-A and D-F fail on
+/// 75b245f; D-B and D-G leak on 75b245f once the same two-phase seam is
+/// patched in.
+#[cfg(test)]
+mod r4_regression_tests {
+    use super::{run_autocommit_report, run_autocommit_report_with, AutocommitOutcome, AutocommitReport, SkipReason, TickPhase};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+
+    const AWS_LINE: &str = "key = AKIAABCDEFGHIJKLMNOP\n";
+
+    struct Repo {
+        dir: PathBuf,
+    }
+
+    impl Repo {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("skippy-r4-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let r = Self { dir };
+            r.ok(&["init", "-q", "-b", "main"]);
+            r.ok(&["config", "user.name", "Skippy Test"]);
+            r.ok(&["config", "user.email", "skippy-test@example.invalid"]);
+            r.ok(&["config", "commit.gpgsign", "false"]);
+            r.ok(&["config", "core.hooksPath", ".no-hooks"]);
+            r
+        }
+
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        fn raw(&self, args: &[&str], input: Option<&[u8]>) -> Vec<u8> {
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["-c", "core.quotepath=false"])
+                .args(args)
+                .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("git spawn");
+            if let Some(data) = input {
+                use std::io::Write;
+                child.stdin.take().unwrap().write_all(data).unwrap();
+            }
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            out.stdout
+        }
+
+        fn ok(&self, args: &[&str]) -> String {
+            String::from_utf8_lossy(&self.raw(args, None)).trim().to_string()
+        }
+
+        /// Exact blob bytes (no trimming).
+        fn blob(&self, spec: &str) -> String {
+            String::from_utf8_lossy(&self.raw(&["cat-file", "-p", spec], None)).into_owned()
+        }
+
+        fn write(&self, rel: &str, contents: impl AsRef<[u8]>) {
+            let p = self.dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+
+        fn commit_all(&self, msg: &str) {
+            self.ok(&["add", "-A", "."]);
+            self.ok(&["commit", "-q", "-m", msg]);
+        }
+
+        fn head_tree(&self) -> Vec<String> {
+            String::from_utf8_lossy(&self.raw(&["ls-tree", "-r", "-z", "--name-only", "HEAD"], None))
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn status(&self) -> String {
+            self.ok(&["status", "--porcelain", "-uno"])
+        }
+
+        async fn tick(&self) -> AutocommitReport {
+            run_autocommit_report(self.path()).await.expect("autocommit ok")
+        }
+
+        fn rot_filter(&self) {
+            self.ok(&["config", "filter.rot.clean", "tr A-Za-z N-ZA-Mn-za-m"]);
+            self.ok(&["config", "filter.rot.smudge", "tr A-Za-z N-ZA-Mn-za-m"]);
+        }
+
+        /// Commit a mode-120000 entry at `path`, then check it out as a plain
+        /// file (core.symlinks=false, the Git for Windows default).
+        fn symlink_as_file(&self, path: &str, target: &str) -> String {
+            self.ok(&["config", "core.symlinks", "false"]);
+            let blob = String::from_utf8_lossy(&self.raw(&["hash-object", "-w", "--stdin"], Some(target.as_bytes())))
+                .trim()
+                .to_string();
+            self.ok(&["update-index", "--add", "--cacheinfo", &format!("120000,{blob},{path}")]);
+            self.ok(&["commit", "-q", "-m", &format!("symlink {path}")]);
+            self.ok(&["checkout", "--", path]);
+            assert!(
+                std::fs::symlink_metadata(self.dir.join(path)).unwrap().is_file(),
+                "core.symlinks=false must check the link out as a plain file"
+            );
+            blob
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn detail(rep: &AutocommitReport) -> Vec<(String, &'static str)> {
+        rep.skipped_detail.iter().map(|(p, r)| (p.clone(), r.as_str())).collect()
+    }
+
+    fn one(path: &str, reason: SkipReason) -> Vec<(String, &'static str)> {
+        vec![(path.to_string(), reason.as_str())]
+    }
+
+    #[tokio::test]
+    async fn r4_da_secret_in_a_filtered_symlink_as_file_entry_is_not_committed() {
+        let r = Repo::new("da-rot");
+        r.rot_filter();
+        r.write(".gitattributes", "vault/*.txt filter=rot\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        let before = r.symlink_as_file("vault/link.txt", "target.md");
+        r.symlink_as_file("vault/fine.txt", "other.md");
+        r.write("vault/link.txt", AWS_LINE);
+        r.write("vault/fine.txt", "harmless new link body\n");
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), one("vault/link.txt", SkipReason::SecretContent));
+        assert_eq!(
+            r.ok(&["ls-tree", "HEAD", "--", "vault/link.txt"]),
+            format!("120000 blob {before}\tvault/link.txt"),
+            "filtered symlink secret reached history"
+        );
+        assert!(!r.blob("HEAD:vault/link.txt").contains("NXVN"));
+        assert!(r.ok(&["ls-tree", "HEAD", "--", "vault/fine.txt"]).starts_with("120000 "), "a clean filtered symlink edit must still commit");
+        assert_eq!(r.blob("HEAD:vault/fine.txt"), "unezyrff arj yvax obql\n");
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y");
+    }
+
+    #[tokio::test]
+    async fn r4_da_secret_in_an_lfs_filtered_symlink_as_file_entry_never_reaches_history_or_an_lfs_pointer() {
+        let has_lfs = Command::new("git").args(["lfs", "version"]).output().is_ok_and(|o| o.status.success());
+        if !has_lfs {
+            eprintln!("SKIP r4_da lfs: git-lfs is not installed (the rot13 case covers the mechanism)");
+            return;
+        }
+        let r = Repo::new("da-lfs");
+        r.ok(&["lfs", "install", "--local"]);
+        r.write(".gitattributes", "vault/*.bin filter=lfs diff=lfs merge=lfs -text\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        let before = r.symlink_as_file("vault/link.bin", "target.bin");
+        r.write("vault/link.bin", format!("bin\0{AWS_LINE}"));
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), one("vault/link.bin", SkipReason::SecretContent));
+        assert_eq!(r.ok(&["ls-tree", "HEAD", "--", "vault/link.bin"]), format!("120000 blob {before}\tvault/link.bin"));
+        assert!(!r.blob("HEAD:vault/link.bin").contains("oid sha256:"), "HEAD references an LFS object for the secret");
+    }
+
+    #[tokio::test]
+    async fn r4_da_unfiltered_symlink_as_file_entry_is_scanned_and_still_commits_when_clean() {
+        let r = Repo::new("da-nofilter");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.symlink_as_file("vault/a.txt", "target-a.md");
+        r.symlink_as_file("vault/b.txt", "target-b.md");
+        r.write("vault/a.txt", "new-target.md");
+        r.write("vault/b.txt", AWS_LINE);
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), one("vault/b.txt", SkipReason::SecretContent));
+        assert_eq!(r.blob("HEAD:vault/a.txt"), "new-target.md");
+        assert_eq!(r.blob("HEAD:vault/b.txt"), "target-b.md");
+        assert_eq!(r.tick().await.outcome, AutocommitOutcome::NoOp, "the committed symlink-as-file must be stable");
+    }
+
+    #[tokio::test]
+    async fn r4_da_filtered_real_symlink_is_excluded_as_worktree_unscannable() {
+        let r = Repo::new("da-real");
+        r.rot_filter();
+        r.ok(&["config", "core.symlinks", "true"]);
+        r.write(".gitattributes", "vault/*.txt filter=rot\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file("n.md", r.dir.join("vault/link.txt"));
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink("n.md", r.dir.join("vault/link.txt"));
+        if let Err(e) = made {
+            eprintln!("SKIP r4_da real symlink: cannot create a real symlink here ({e}); needs Developer Mode on Windows");
+            return;
+        }
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), one("vault/link.txt", SkipReason::WorktreeUnscannable));
+        assert!(!r.head_tree().contains(&"vault/link.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn r4_db_key_clean_key_flip_between_add_scan_and_verify_is_excluded_never_committed() {
+        let r = Repo::new("db-flip");
+        r.rot_filter();
+        r.write(".gitattributes", "vault/*.txt filter=rot\n");
+        r.write("vault/s.txt", "clean note v0\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        let file = r.dir.join("vault/s.txt");
+        std::fs::write(&file, AWS_LINE).unwrap(); // what `add` cleans into the staged blob
+        let phases = Mutex::new(Vec::new());
+        let hook = |phase: TickPhase| {
+            phases.lock().unwrap().push(phase);
+            match phase {
+                TickPhase::Added => std::fs::write(&file, "clean note\n").unwrap(), // what the scan sees
+                TickPhase::Scanned => std::fs::write(&file, AWS_LINE).unwrap(),    // what a re-read would see
+            }
+        };
+        let rep = run_autocommit_report_with(r.path(), Some(&hook)).await.expect("autocommit ok");
+        assert_eq!(*phases.lock().unwrap(), vec![TickPhase::Added, TickPhase::Scanned]);
+        assert!(!r.blob("HEAD:vault/s.txt").contains("NXVN"), "rot13 secret reached history");
+        assert_eq!(r.ok(&["show", "HEAD:vault/s.txt"]), "pyrna abgr i0", "HEAD must still hold the rot13 of v0");
+        assert_eq!(detail(&rep), one("vault/s.txt", SkipReason::ChangedDuringScan));
+        assert_eq!(rep.outcome, AutocommitOutcome::NoOp);
+    }
+
+    #[tokio::test]
+    async fn r4_db_bytes_written_after_the_scan_never_change_what_is_committed() {
+        let r = Repo::new("db-after");
+        r.rot_filter();
+        r.write(".gitattributes", "vault/*.txt filter=rot\n");
+        r.write("vault/s.txt", "v0\n");
+        r.commit_all("init");
+        let file = r.dir.join("vault/s.txt");
+        std::fs::write(&file, "clean v1\n").unwrap();
+        let hook = |phase: TickPhase| {
+            if phase == TickPhase::Scanned {
+                std::fs::write(&file, AWS_LINE).unwrap();
+            }
+        };
+        let rep = run_autocommit_report_with(r.path(), Some(&hook)).await.expect("autocommit ok");
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert!(rep.skipped_detail.is_empty(), "{:?}", rep.skipped_detail);
+        assert_eq!(r.ok(&["show", "HEAD:vault/s.txt"]), "pyrna i1", "the scanned (clean v1) bytes must be what was committed");
+        let next = r.tick().await;
+        assert_eq!(detail(&next), one("vault/s.txt", SkipReason::SecretContent), "the later key write is caught next tick");
+    }
+
+    #[tokio::test]
+    async fn r4_dg_gitattributes_flip_between_add_and_check_attr_cannot_hide_a_filtered_secret() {
+        let r = Repo::new("dg-attrflip");
+        r.rot_filter();
+        r.write("vault/.gitattributes", "*.txt filter=rot\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/s.txt", AWS_LINE); // `add` cleans this through rot13
+        let attrs = r.dir.join("vault/.gitattributes");
+        let hook = |phase: TickPhase| {
+            if phase == TickPhase::Added {
+                std::fs::write(&attrs, "# filter removed\n").unwrap(); // check-attr now says "no filter"
+            }
+        };
+        let rep = run_autocommit_report_with(r.path(), Some(&hook)).await.expect("autocommit ok");
+        assert!(!r.head_tree().contains(&"vault/s.txt".to_string()), "rot13 secret reached history via an attribute flip");
+        assert_eq!(detail(&rep), one("vault/s.txt", SkipReason::SecretContent));
+    }
+
+    #[tokio::test]
+    async fn r4_dg_unfiltered_note_rewritten_mid_tick_is_deferred_then_committed_next_tick() {
+        let r = Repo::new("dg-defer");
+        r.write("vault/n.md", "v0\n");
+        r.commit_all("init");
+        r.write("vault/n.md", "v1\n");
+        let file = r.dir.join("vault/n.md");
+        let hook = |phase: TickPhase| {
+            if phase == TickPhase::Added {
+                std::fs::write(&file, "v2\n").unwrap();
+            }
+        };
+        let rep = run_autocommit_report_with(r.path(), Some(&hook)).await.expect("autocommit ok");
+        assert_eq!(detail(&rep), one("vault/n.md", SkipReason::ChangedDuringScan));
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "v0");
+        assert_eq!(r.tick().await.outcome, AutocommitOutcome::Committed);
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "v2");
+        assert_eq!(r.status(), "");
+    }
+
+    #[tokio::test]
+    async fn r4_df_unchanged_filtered_crlf_file_under_autocrlf_commits_on_the_first_tick() {
+        let r = Repo::new("df-crlf");
+        r.ok(&["config", "core.autocrlf", "false"]);
+        r.ok(&["config", "filter.cat.clean", "cat"]);
+        r.ok(&["config", "filter.cat.smudge", "cat"]);
+        r.write(".gitattributes", "vault/*.md filter=cat\n");
+        r.write("vault/n.md", "line1\r\nline2\r\n");
+        r.commit_all("init"); // HEAD blob keeps its CRLFs
+        r.ok(&["config", "core.autocrlf", "true"]);
+        r.write("vault/n.md", "line1\r\nline2\r\nline3\r\n");
+        let rep = r.tick().await;
+        assert!(rep.skipped_detail.is_empty(), "an unchanged CRLF file must not be reported changed-during-scan: {:?}", rep.skipped_detail);
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(r.blob("HEAD:vault/n.md"), "line1\r\nline2\r\nline3\r\n", "blob must match what `git add` stores");
+        assert_eq!(r.status(), "");
+        assert_eq!(r.tick().await.outcome, AutocommitOutcome::NoOp);
     }
 }
