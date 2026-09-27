@@ -8,6 +8,9 @@
 // FR-RUN-01 / G0: a board that spawns a task agent whose tool calls the
 // policy gate denies must end `blocked(policy_refused)`, even though the CLI
 // reports `permission_denials: []` and a `success` result for the parent.
+// EC1 D1: a task agent whose provider call fails (401/400) or is refused must
+// end the run `failed` (the CLI still reports a parent `success`). EC1 D2: a
+// main-thread call to a tool the charter withheld is `blocked`.
 
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -29,9 +32,12 @@ interface ToolUse {
   name: string;
   input: Record<string, unknown>;
 }
+/** How the task agent's first model call fails (EC1 D1), if at all. */
+type SubFailure = { http: number; body: unknown } | { refusal: true };
 interface Scenario {
   mainTools: ToolUse[];
   subTools: ToolUse[];
+  subFailure?: SubFailure;
 }
 
 let scenario: Scenario = { mainTools: [], subTools: [] };
@@ -46,6 +52,7 @@ const ENV_OVERRIDES = [
   'DISABLE_TELEMETRY',
   'DISABLE_AUTOUPDATER',
   'DISABLE_ERROR_REPORTING',
+  'CLAUDE_CODE_MAX_RETRIES',
 ] as const;
 
 function sse(res: http.ServerResponse, model: unknown, id: string, blocks: Array<Record<string, unknown>>, stop: string): void {
@@ -115,7 +122,13 @@ function startMock(): Promise<http.Server> {
       const toolBlocks = (tools: ToolUse[]): Array<Record<string, unknown>> =>
         tools.map((t, i) => ({ type: 'tool_use', id: `toolu_${i}_${++n}`, name: t.name, input: t.input }));
       const id = `msg_${++n}`;
-      if (isSub && !hasToolResult && scenario.subTools.length > 0) {
+      const fail = scenario.subFailure;
+      if (isSub && fail && 'http' in fail) {
+        res.writeHead(fail.http, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(fail.body));
+      } else if (isSub && fail && 'refusal' in fail) {
+        sse(res, j.model, id, [{ type: 'text', text: 'I refuse' }], 'refusal');
+      } else if (isSub && !hasToolResult && scenario.subTools.length > 0) {
         sse(res, j.model, id, toolBlocks(scenario.subTools), 'tool_use');
       } else if (isMain && !hasToolResult && scenario.mainTools.length > 0) {
         sse(res, j.model, id, toolBlocks(scenario.mainTools), 'tool_use');
@@ -145,6 +158,7 @@ before(async () => {
     DISABLE_TELEMETRY: '1',
     DISABLE_AUTOUPDATER: '1',
     DISABLE_ERROR_REPORTING: '1',
+    CLAUDE_CODE_MAX_RETRIES: '0',
   });
 });
 
@@ -197,4 +211,65 @@ test('live CLI (control): an allowed in-worktree Read with no denials → succee
   scenario = { mainTools: [{ name: 'Read', input: { file_path: path.join(tmp, 'work', 'inside.txt') } }], subTools: [] };
   const r = await executeBoardMissionViaSdk(mission());
   assert.equal(r.status, 'succeeded', JSON.stringify(r));
+});
+
+// ── EC1 D1: task-agent provider failures / refusal (parent still "success") ──
+
+const spawnTaskAgent: ToolUse = {
+  name: 'Agent',
+  input: { description: 'sub', prompt: `${SUB_MARK} go`, subagent_type: 'general-purpose' },
+};
+
+test('live CLI (D1 sub401): task agent gets 401 → failed(provider_error), not succeeded', { skip, timeout: 120_000 }, async () => {
+  scenario = {
+    mainTools: [spawnTaskAgent],
+    subTools: [],
+    subFailure: { http: 401, body: { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } } },
+  };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+  assert.match(r.status === 'failed' ? `${r.reason.message} ${r.reason.detail ?? ''}` : '', /task agent/);
+  assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /authentication_failed/);
+});
+
+test('live CLI (D1 sub400): task agent gets 400 → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
+  scenario = {
+    mainTools: [spawnTaskAgent],
+    subTools: [],
+    subFailure: { http: 400, body: { type: 'error', error: { type: 'invalid_request_error', message: 'mock error' } } },
+  };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+});
+
+test('live CLI (D1 subrefusal): task agent refused (stop_reason refusal) → failed(model_refused)', { skip, timeout: 120_000 }, async () => {
+  scenario = { mainTools: [spawnTaskAgent], subTools: [], subFailure: { refusal: true } };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'model_refused');
+});
+
+test('live CLI (D1 control): a task agent that finishes normally → succeeded', { skip, timeout: 120_000 }, async () => {
+  scenario = { mainTools: [spawnTaskAgent], subTools: [] };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'succeeded', JSON.stringify(r));
+});
+
+// ── EC1 D2: withheld tools ("No such tool available") are policy refusals ───
+
+test('live CLI (D2 unknowntool): main-thread WebSearch + NotebookEdit withheld by charter → blocked(policy_refused)', { skip, timeout: 120_000 }, async () => {
+  scenario = {
+    mainTools: [
+      { name: 'WebSearch', input: { query: 'x' } },
+      { name: 'NotebookEdit', input: {} },
+    ],
+    subTools: [],
+  };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'blocked', JSON.stringify(r));
+  assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
+  assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /WebSearch/);
+  assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /NotebookEdit/);
 });

@@ -54,6 +54,7 @@ import {
   buildClaudeSdkPermissionOptions,
   derivePolicy,
   filterMcpServers,
+  parseMcpToolName,
   type ClaudeSdkPermissionOptions,
   type ExecutionPolicy,
   type SdkEnforcementHooks,
@@ -164,6 +165,9 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  * Run-level tool denials that never reach `permission_denials` (task-agent /
  * subagent hook and canUseTool denials, N1) are applied on top of this per-
  * message mapping by `executeBoardMissionViaSdk` — see {@link DenialLedger}.
+ * Task-agent provider errors / refusals, which the CLI reports to the parent
+ * only as tool_result text under a `success` result (EC1 D1), are likewise
+ * applied on top — see {@link RunFailureLedger} and {@link RunStreamObserver}.
  *
  * `terminal_reason` absence is treated as normal completion: the field is
  * optional in the SDK's own type and the SDK does not backfill it on every
@@ -330,7 +334,17 @@ function denialToolName(d: unknown): string {
   return typeof name === 'string' && name.length > 0 ? name : '(unknown tool)';
 }
 
-type DenialSource = 'PreToolUse' | 'PermissionRequest' | 'canUseTool' | 'permission_denials' | 'policy-audit';
+type DenialSource =
+  | 'PreToolUse'
+  | 'PermissionRequest'
+  | 'canUseTool'
+  | 'permission_denials'
+  | 'policy-audit'
+  // `system/permission_denied` stream message (SDKPermissionDeniedMessage).
+  | 'permission_denied'
+  // A call to a tool the executor was never offered (EC1 D2): the CLI answers
+  // `is_error` "No such tool available" before the policy gate ever runs.
+  | 'unavailable_tool';
 
 interface ObservedDenial {
   toolName: string;
@@ -508,6 +522,410 @@ function applyRunDenials(base: SdkBoardResult, ledger: DenialLedger, boardId: st
   return out;
 }
 
+// ── run-level task-agent failure accounting (EC1 D1/D2, FR-RUN-01, G0) ──────
+//
+// Verified against the bundled CLI 2.1.162 (@anthropic-ai/claude-agent-sdk
+// 0.3.162) with a local mock Messages API: when a task agent (subagent) hits a
+// provider error (401/400) or a refusal, the parent run still ends with a
+// `success` result (`is_error: false`, `api_error_status: null`,
+// `permission_denials: []`), the `task_notification` says `status:
+// "completed"` and the Agent tool's `tool_result` is NOT flagged `is_error` —
+// the failure is only the CLI's text in that tool_result. The structured
+// signals that DO exist are:
+//
+//   1. The `StopFailure` hook fires for the task agent with `agent_id` and a
+//      typed `error: SDKAssistantMessageError` (`authentication_failed`,
+//      `invalid_request`, …). Registered by {@link withRunObservers}.
+//   2. With `forwardSubagentText: true`, the CLI forwards the task agent's
+//      synthetic terminal assistant message (`model: "<synthetic>"`) with
+//      `parent_tool_use_id` set and the typed top-level `error` field; for a
+//      refusal its `message.stop_reason` is `"refusal"` (the hook reports only
+//      `invalid_request`, so this is what classifies it `model_refused`).
+//      Without `forwardSubagentText` the CLI forwards only tool_use/tool_result
+//      blocks of a task agent, so neither message is visible.
+//   3. `task_notification` status `failed`/`stopped` and `task_updated`
+//      `patch.status` `failed`/`killed` for an agent task (not seen for the
+//      provider-error cases above, which report `completed`, but typed).
+//   4. An Agent tool `tool_result` with `is_error: true` on the main thread.
+//
+// No free-form text (model prose or CLI error text) is pattern-matched.
+// Normal forwarded subagent messages carry `stop_reason: null` (verified: a
+// sub turn that hit `max_tokens` and was recovered by the CLI is forwarded
+// with `null`), so only `refusal` or an `error` flag count — a recovered
+// truncation is not a failure.
+
+type RunFailureCode = 'provider_error' | 'model_refused' | 'executor_error';
+
+/** Higher wins when two signals describe the same task agent (e.g. the hook's
+ * `invalid_request` and the forwarded message's `stop_reason: refusal`). */
+const FAILURE_PRIORITY: Readonly<Record<RunFailureCode, number>> = {
+  model_refused: 3,
+  provider_error: 2,
+  executor_error: 1,
+};
+
+interface ObservedFailure {
+  code: RunFailureCode;
+  /** Human label for the task agent (id + type + description when known). */
+  agent: string;
+  /** Structured signals that reported it (deduplicated, in arrival order). */
+  signals: string[];
+}
+
+const MAX_FAILURES_IN_DETAIL = 10;
+
+/** SDKAssistantMessageError values that are not provider/API faults. */
+const NON_PROVIDER_ERRORS: ReadonlySet<string> = new Set(['max_output_tokens']);
+
+/** Map a typed `SDKAssistantMessageError` (+ stop reason) to a reason code. */
+function classifyTaskAgentError(error: unknown, stopReason?: unknown): RunFailureCode {
+  if (stopReason === 'refusal') return 'model_refused';
+  if (typeof error === 'string' && NON_PROVIDER_ERRORS.has(error)) return 'executor_error';
+  return 'provider_error';
+}
+
+/**
+ * Every task-agent (subagent) failure observed during one SDK run (EC1 D1).
+ * Keyed by task-agent id (the CLI's `task_id` == hook `agent_id`), so the hook
+ * and the forwarded message for the same agent count once, keeping the most
+ * specific reason code. Any entry fails the run (see {@link applyRunFailures}).
+ */
+export class RunFailureLedger {
+  private readonly byKey = new Map<string, ObservedFailure>();
+
+  record(key: string, f: ObservedFailure): void {
+    const prev = this.byKey.get(key);
+    if (!prev) {
+      this.byKey.set(key, { ...f, signals: [...f.signals] });
+      return;
+    }
+    const code = FAILURE_PRIORITY[f.code] > FAILURE_PRIORITY[prev.code] ? f.code : prev.code;
+    const signals = [...prev.signals];
+    for (const s of f.signals) if (!signals.includes(s)) signals.push(s);
+    this.byKey.set(key, { code, agent: prev.agent, signals });
+  }
+
+  list(): ObservedFailure[] {
+    return [...this.byKey.values()];
+  }
+
+  get size(): number {
+    return this.byKey.size;
+  }
+
+  toReason(boardId: string): { code: RunFailureCode; message: string; detail: string } {
+    const all = this.list();
+    const first = all[0]!;
+    const what: Record<RunFailureCode, string> = {
+      provider_error: 'hit a provider API error',
+      model_refused: 'was refused by the model',
+      executor_error: 'ended abnormally',
+    };
+    const shown = all
+      .slice(0, MAX_FAILURES_IN_DETAIL)
+      .map((f) => `${f.code} [task agent ${f.agent}]: ${f.signals.join('; ')}`);
+    if (all.length > shown.length) shown.push(`…and ${all.length - shown.length} more`);
+    return {
+      code: first.code,
+      message:
+        `Board ${boardId} task agent ${first.agent} ${what[first.code]}` +
+        (all.length > 1 ? ` (${all.length} task agents failed).` : '.'),
+      detail: shown.join(' | '),
+    };
+  }
+}
+
+/** Short, redaction-safe excerpt of CLI-provided text for diagnostics only. */
+function excerpt(v: unknown, max = 160): string | undefined {
+  if (typeof v !== 'string' || v.length === 0) return undefined;
+  return JSON.stringify(v.length > max ? `${v.slice(0, max)}…` : v);
+}
+
+function asRecord(v: unknown): Record<string, unknown> | undefined {
+  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+}
+
+/** Local mirror of tool-policy.ts's CLI alias table (kept private there). */
+const TOOL_NAME_ALIASES: Readonly<Record<string, string>> = {
+  Task: 'Agent',
+  BashOutput: 'TaskOutput',
+  KillShell: 'TaskStop',
+  KillBash: 'TaskStop',
+};
+const canonicalToolName = (n: string): string => TOOL_NAME_ALIASES[n] ?? n;
+
+interface TaskInfo {
+  toolUseId?: string;
+  description?: string;
+  subagentType?: string;
+  taskType?: string;
+}
+
+/**
+ * Watches every SDK stream message for task-agent failures (→ `failures`)
+ * and for calls to tools the executor was never offered (→ `denials`, D2).
+ * Stateless with respect to the result mapping: it only records.
+ */
+export class RunStreamObserver {
+  private readonly tasks = new Map<string, TaskInfo>();
+  private readonly taskByToolUse = new Map<string, string>();
+  /** tool_use id → tool name, main thread and task agents. */
+  private readonly toolNames = new Map<string, string>();
+  /** Tools the CLI offered (system/init `tools`), canonicalized. */
+  private offered: Set<string> | null = null;
+
+  constructor(
+    private readonly policy: Pick<ExecutionPolicy, 'allowedTools' | 'mcpServers'>,
+    private readonly failures: RunFailureLedger,
+    private readonly denials: DenialLedger,
+  ) {}
+
+  /** Key + label for a task agent referenced by id (hook `agent_id`, `task_id`). */
+  agentKey(agentId: string): { key: string; label: string } {
+    const t = this.tasks.get(agentId);
+    const extra = t ? [t.subagentType, t.description ? JSON.stringify(t.description) : undefined].filter(Boolean) : [];
+    return { key: agentId, label: extra.length > 0 ? `${agentId} (${extra.join(': ')})` : agentId };
+  }
+
+  /** Key + label for a task agent referenced by its spawning Agent tool_use id. */
+  private agentByToolUse(toolUseId: string): { key: string; label: string } {
+    const taskId = this.taskByToolUse.get(toolUseId);
+    return taskId ? this.agentKey(taskId) : { key: `tool_use:${toolUseId}`, label: `spawned by ${toolUseId}` };
+  }
+
+  private isAgentTask(taskId: string): boolean {
+    const t = this.tasks.get(taskId);
+    // Unknown task ids fail closed (treated as agent tasks); background shell
+    // tasks (`local_bash`) whose command exits non-zero are ordinary tool
+    // outcomes the agent may react to, not task-agent failures.
+    if (!t) return true;
+    return t.subagentType !== undefined || (t.taskType !== undefined && /agent/i.test(t.taskType));
+  }
+
+  private isOffered(name: string): boolean {
+    const canonical = canonicalToolName(name);
+    if (this.offered?.has(canonical)) return true;
+    if (this.policy.allowedTools.includes(canonical)) return true;
+    // MCP tools of an allowed server may be deferred (absent from init); the
+    // policy gate decides those, so they never count as "not offered".
+    const mcp = parseMcpToolName(name);
+    return mcp !== null && this.policy.mcpServers.includes(mcp.server);
+  }
+
+  observe(raw: unknown): void {
+    const msg = asRecord(raw);
+    if (!msg) return;
+    if (msg.type === 'system') this.observeSystem(msg);
+    else if (msg.type === 'assistant') this.observeAssistant(msg);
+    else if (msg.type === 'user') this.observeUser(msg);
+  }
+
+  private observeSystem(msg: Record<string, unknown>): void {
+    const str = (k: string): string | undefined => (typeof msg[k] === 'string' ? (msg[k] as string) : undefined);
+    switch (msg.subtype) {
+      case 'init': {
+        if (Array.isArray(msg.tools)) {
+          this.offered = new Set(msg.tools.filter((t): t is string => typeof t === 'string').map(canonicalToolName));
+        }
+        return;
+      }
+      case 'task_started': {
+        const taskId = str('task_id');
+        if (!taskId) return;
+        const info: TaskInfo = {};
+        const toolUseId = str('tool_use_id');
+        if (toolUseId) {
+          info.toolUseId = toolUseId;
+          this.taskByToolUse.set(toolUseId, taskId);
+        }
+        const description = str('description');
+        const subagentType = str('subagent_type');
+        const taskType = str('task_type');
+        if (description !== undefined) info.description = description;
+        if (subagentType !== undefined) info.subagentType = subagentType;
+        if (taskType !== undefined) info.taskType = taskType;
+        this.tasks.set(taskId, info);
+        return;
+      }
+      case 'task_notification': {
+        const taskId = str('task_id');
+        const status = msg.status;
+        if (!taskId || status === 'completed' || !this.isAgentTask(taskId)) return;
+        const { key, label } = this.agentKey(taskId);
+        this.failures.record(key, {
+          code: 'executor_error',
+          agent: label,
+          signals: [`task_notification status=${describeValue(status)}`],
+        });
+        return;
+      }
+      case 'task_updated': {
+        const taskId = str('task_id');
+        const status = asRecord(msg.patch)?.status;
+        if (!taskId || (status !== 'failed' && status !== 'killed') || !this.isAgentTask(taskId)) return;
+        const { key, label } = this.agentKey(taskId);
+        this.failures.record(key, { code: 'executor_error', agent: label, signals: [`task_updated status=${status}`] });
+        return;
+      }
+      case 'permission_denied': {
+        const toolName = str('tool_name') ?? '(unknown tool)';
+        const d: ObservedDenial = { toolName, source: 'permission_denied' };
+        const reason = str('decision_reason') ?? str('message');
+        const agentId = str('agent_id');
+        if (reason !== undefined) d.reason = reason;
+        if (agentId !== undefined) d.agentId = agentId;
+        this.denials.record(str('tool_use_id'), d);
+        return;
+      }
+      default:
+        return;
+    }
+  }
+
+  private observeAssistant(msg: Record<string, unknown>): void {
+    const message = asRecord(msg.message);
+    const content = Array.isArray(message?.content) ? (message.content as unknown[]) : [];
+    for (const b of content) {
+      const block = asRecord(b);
+      if (block?.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        this.toolNames.set(block.id, block.name);
+      }
+    }
+    // Task-agent terminal failure (signal 2). Main-thread assistant errors are
+    // covered by the result message mapping and are not recorded here.
+    const parent = msg.parent_tool_use_id;
+    if (typeof parent !== 'string' || parent.length === 0) return;
+    const error = msg.error;
+    const stopReason = message?.stop_reason;
+    const hasError = error !== undefined && error !== null;
+    if (!hasError && stopReason !== 'refusal') return;
+    const { key, label } = this.agentByToolUse(parent);
+    const signals = [
+      [
+        'assistant',
+        hasError ? `error=${describeValue(error)}` : '',
+        typeof stopReason === 'string' ? `stop_reason=${stopReason}` : '',
+        message?.model === '<synthetic>' ? 'model=<synthetic>' : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+    ];
+    const text = content
+      .map((b) => asRecord(b))
+      .find((b) => b?.type === 'text' && typeof b.text === 'string')?.text;
+    const ex = message?.model === '<synthetic>' ? excerpt(text) : undefined;
+    if (ex) signals.push(`cli: ${ex}`);
+    this.failures.record(key, { code: classifyTaskAgentError(error, stopReason), agent: label, signals });
+  }
+
+  private observeUser(msg: Record<string, unknown>): void {
+    const message = asRecord(msg.message);
+    const content = Array.isArray(message?.content) ? (message.content as unknown[]) : [];
+    const mainThread = msg.parent_tool_use_id === null || msg.parent_tool_use_id === undefined;
+    for (const b of content) {
+      const block = asRecord(b);
+      if (block?.type !== 'tool_result' || block.is_error !== true) continue;
+      const id = typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined;
+      const name = id ? this.toolNames.get(id) : undefined;
+      if (name === undefined) continue;
+      // D2: the CLI rejected a call to a tool it never offered ("No such tool
+      // available") before any policy hook ran — a policy refusal, not an
+      // ordinary tool error the agent may recover from.
+      if (!this.isOffered(name)) {
+        const d: ObservedDenial = { toolName: name, source: 'unavailable_tool', reason: 'tool not granted to this executor' };
+        if (!mainThread && typeof msg.parent_tool_use_id === 'string') {
+          const taskId = this.taskByToolUse.get(msg.parent_tool_use_id);
+          if (taskId) d.agentId = taskId;
+        }
+        this.denials.record(id, d);
+        continue;
+      }
+      // Signal 4: the board's own Agent tool call failed.
+      if (mainThread && canonicalToolName(name) === 'Agent' && id) {
+        const { key, label } = this.agentByToolUse(id);
+        this.failures.record(key, { code: 'executor_error', agent: label, signals: ['Agent tool_result is_error'] });
+      }
+    }
+  }
+}
+
+/**
+ * Add the run observers the SDK needs to surface task-agent failures:
+ * a `StopFailure` hook (signal 1) and `forwardSubagentText: true` (signal 2).
+ * Returned as part of the permission options object so the executor's query
+ * options literal is unchanged; neither affects tool authority (the hook
+ * always returns `{}` — it observes, never decides).
+ */
+export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
+  permission: T,
+  observer: RunStreamObserver,
+  failures: RunFailureLedger,
+): T & { forwardSubagentText: true } {
+  const stopFailure: HookCallback = (input) => {
+    try {
+      const rec = input as unknown as Record<string, unknown>;
+      const agentId = rec.agent_id;
+      // Main-thread StopFailure also ends the run with an error result, which
+      // mapSdkResultMessage handles; only task agents are recorded here.
+      if (typeof agentId === 'string' && agentId.length > 0) {
+        const { key, label } = observer.agentKey(agentId);
+        const code = classifyTaskAgentError(rec.error);
+        const signals = [`StopFailure error=${describeValue(rec.error)}`];
+        // For API errors the last message is the CLI's synthetic error text;
+        // otherwise it may be model prose, which is not copied into the detail.
+        const ex = code === 'provider_error' ? excerpt(rec.last_assistant_message) : undefined;
+        if (ex) signals.push(`cli: ${ex}`);
+        failures.record(key, { code, agent: label, signals });
+      }
+    } catch {
+      /* observing must never break the run; the stream signals remain */
+    }
+    return Promise.resolve({});
+  };
+  const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = { ...permission.hooks };
+  hooks.StopFailure = [...(hooks.StopFailure ?? []), { hooks: [stopFailure] }];
+  return { ...permission, hooks, forwardSubagentText: true };
+}
+
+/**
+ * Apply task-agent failures to the run's terminal status (EC1 D1): a run
+ * whose task agent failed is never `succeeded`. `succeeded`, `interrupted`
+ * and `cancelled` become `failed` with the task agent's reason; an already
+ * `failed` or `blocked` run keeps its code and gains the task-agent detail.
+ * Denials are applied afterwards by {@link applyRunDenials}, so a recorded
+ * denial still wins as `blocked(policy_refused)`.
+ */
+function applyRunFailures(base: SdkBoardResult, failures: RunFailureLedger, boardId: string): SdkBoardResult {
+  if (failures.size === 0) return base;
+  const reason = failures.toReason(boardId);
+  if (base.status === 'failed' || base.status === 'blocked') {
+    const out: SdkBoardResult = {
+      ...base,
+      reason: {
+        ...base.reason,
+        detail: `${base.reason.detail ?? base.reason.message} | task agents also failed: ${reason.detail}`,
+      },
+    };
+    return out;
+  }
+  if (base.status !== 'succeeded') {
+    reason.detail = `${reason.detail} | run also ended ${base.status}(${base.reason.code}): ${base.reason.detail ?? base.reason.message}`;
+  }
+  const out: SdkBoardResult = { status: 'failed', reason };
+  if (base.costUsd !== undefined) out.costUsd = base.costUsd;
+  return out;
+}
+
+/** Final run status: task-agent failures, then denials (denial wins). */
+function applyRunLedgers(
+  base: SdkBoardResult,
+  failures: RunFailureLedger,
+  denials: DenialLedger,
+  boardId: string,
+): SdkBoardResult {
+  return applyRunDenials(applyRunFailures(base, failures, boardId), denials, boardId);
+}
+
 /**
  * Execute one board mission through the Claude Agent SDK and await its
  * terminal result. Dynamically imports the SDK so it never touches the
@@ -548,6 +966,9 @@ export async function executeBoardMissionViaSdk(
   // Every deny the policy gate issues during this run, main thread and task
   // agents alike (N1); any entry makes the run `blocked`, never `succeeded`.
   const denials = new DenialLedger();
+  // Every task-agent failure observed in the stream (EC1 D1); any entry makes
+  // the run `failed`, never `succeeded` (a denial still wins as `blocked`).
+  const failures = new RunFailureLedger();
   // Hoisted so a stream that throws AFTER yielding a non-success result (the
   // SDK throws "returned an error result" after an is_error result) keeps
   // that result's specific reason instead of a generic provider_error.
@@ -570,7 +991,8 @@ export async function executeBoardMissionViaSdk(
         params.enforcement?.onDecision?.(e);
       },
     });
-    const permission = instrumentPermissionOptions(gate, denials);
+    const observer = new RunStreamObserver(policy, failures, denials);
+    const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
     const q = sdk.query({
       prompt: params.missionBrief,
       options: {
@@ -589,6 +1011,7 @@ export async function executeBoardMissionViaSdk(
     // message cannot un-fail the mission.
     let sawNonSuccessResult = false;
     for await (const msg of q) {
+      observer.observe(msg);
       if (msg.type !== 'result') continue;
       const reported: unknown = (msg as { permission_denials?: unknown }).permission_denials;
       if (Array.isArray(reported)) {
@@ -613,7 +1036,7 @@ export async function executeBoardMissionViaSdk(
     }
 
     if (!terminal) {
-      return applyRunDenials(
+      return applyRunLedgers(
         {
           status: 'failed',
           reason: {
@@ -621,11 +1044,12 @@ export async function executeBoardMissionViaSdk(
             message: `Board ${params.boardId} executor stream ended without a terminal result.`,
           },
         },
+        failures,
         denials,
         params.boardId,
       );
     }
-    return applyRunDenials(terminal, denials, params.boardId);
+    return applyRunLedgers(terminal, failures, denials, params.boardId);
   } catch (err) {
     logger.warn({
       msg: 'SDK board execution failed',
@@ -635,9 +1059,9 @@ export async function executeBoardMissionViaSdk(
     // A non-success result already observed is the more specific truth.
     const observed: SdkBoardResult | null = terminal;
     if (observed && observed.status !== 'succeeded') {
-      return applyRunDenials(observed, denials, params.boardId);
+      return applyRunLedgers(observed, failures, denials, params.boardId);
     }
-    return applyRunDenials(
+    return applyRunLedgers(
       {
         status: 'failed',
         reason: {
@@ -646,6 +1070,7 @@ export async function executeBoardMissionViaSdk(
           detail: String(err),
         },
       },
+      failures,
       denials,
       params.boardId,
     );

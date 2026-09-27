@@ -224,3 +224,54 @@ export function nonSuccessRecord(
 /** Outcomes a *reader* may report: terminal outcomes plus legacy `unverified`. */
 export const RECORDED_OUTCOMES = [...OUTCOMES, 'unverified'] as const;
 export type RecordedOutcome = (typeof RECORDED_OUTCOMES)[number];
+/** Reader-side schema (never a writer's): terminal outcomes + `unverified`. */
+export const RecordedOutcomeSchema = z.enum(RECORDED_OUTCOMES);
+
+/** A terminal record as a *reader* may receive it: the Rust shell downgrades
+ * a contract-violating record to `unverified` before forwarding it (EC1 D3). */
+export type ReceivedTerminalRecord = Omit<TerminalRecord, 'outcome'> & { outcome: RecordedOutcome };
+
+/** What a reader may display for a received terminal record. */
+export interface GuardedTerminalRecord {
+  outcome: RecordedOutcome;
+  mode: ExecutionMode;
+  validation: ValidationDisposition;
+  reason?: OutcomeReason;
+  /** Contract violations found; non-empty means the claim was NOT honoured. */
+  violations: string[];
+}
+
+/**
+ * Reader-side guard (EC1 D3, FR-RUN-01, G0 — defense in depth): a received
+ * terminal record that violates the outcome invariants (e.g. a live
+ * `succeeded` claiming `mode: "demo"`, or a failure without a reason) is shown
+ * as `unverified` with an `invalid_record` reason — never as the outcome it
+ * claims. A record already downgraded to `unverified` stays `unverified`.
+ */
+export function guardTerminalRecord(r: ReceivedTerminalRecord): GuardedTerminalRecord {
+  if (r.outcome === 'unverified') {
+    const out: GuardedTerminalRecord = { outcome: 'unverified', mode: r.mode, validation: 'not_run', violations: [] };
+    out.reason = r.reason ?? {
+      code: 'invalid_record',
+      message: 'Record was not verified; treated as unverified.',
+    };
+    return out;
+  }
+  const violations = terminalRecordViolations(r as TerminalRecord);
+  if (violations.length === 0) {
+    const out: GuardedTerminalRecord = { outcome: r.outcome, mode: r.mode, validation: r.validation, violations };
+    if (r.reason) out.reason = r.reason;
+    return out;
+  }
+  return {
+    outcome: 'unverified',
+    mode: r.mode,
+    validation: 'not_run',
+    reason: {
+      code: 'invalid_record',
+      message: 'Record violates the outcome contract; treated as unverified.',
+      detail: `claimed ${r.outcome}${r.reason ? `(${r.reason.code})` : ''}: ${violations.join('; ')}`,
+    },
+    violations,
+  };
+}
