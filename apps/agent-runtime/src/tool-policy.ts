@@ -22,7 +22,12 @@
 //      vault MCP tools). A root may not be a drive root, the user's home
 //      directory or an ancestor of it, a well-known credential location, a
 //      dot-directory directly under the home directory, or the profile's
-//      `AppData` (`Local`/`Roaming`/`LocalLow`) directory itself. Well-known
+//      `AppData` (`Local`/`Roaming`/`LocalLow`) directory itself, nor may it
+//      be, contain or lie inside the executor's own state directory (the
+//      base of the per-execution `CLAUDE_CONFIG_DIR`s, executor-env.ts;
+//      M0-G06 D1), and no read/write/search target inside that base is ever
+//      allowed (`executorStateRejection`, evaluated like the credential rule
+//      and again inside `defaultPathGuard`). Well-known
 //      credential locations (`.ssh/`, `.aws/`, `.env*`, `*.pem`, `*.key`,
 //      `id_rsa*`, `.npmrc`, `.netrc`, `.git-credentials`,
 //      `.claude/.credentials*`, `.codex/auth*`, the vault's
@@ -65,12 +70,18 @@
 //      own output shape replaces what the model sees (the CLI validates it
 //      with the tool's `outputSchema` and falls back to the original on
 //      mismatch). The gates FAIL CLOSED (M0-G07): the CLI turns a hook that
-//      throws into `{}` (no objection), so any unexpected error inside a gate
-//      is an explicit deny / withheld output, and the `onDecision` audit
-//      observer is invoked guarded — its failure never changes a decision.
-//      The executor's process environment is an allowlist (executor-env.ts,
-//      M0-G06, OQ-22) so ambient variables cannot swap the rg the OQ-18
-//      tree gate models.
+//      throws into `{}` (no objection), so no exception may escape a gate —
+//      the ENTIRE body of every hook and of `canUseTool`, input reads and
+//      catch-block reads included, is guarded, a non-object input is denied,
+//      and any unexpected error is an explicit deny / withheld output
+//      (`failClosedHookOutput`). The `onDecision` audit observer OBSERVES,
+//      it never decides: it receives a deep-frozen structured clone of the
+//      audit event, the gate's own output is computed from the live decision
+//      BEFORE the observer runs, and an observer that throws or rejects is
+//      contained. The executor's process environment is an allowlist and its
+//      config directory is ephemeral and private (executor-env.ts, M0-G06,
+//      OQ-22) so nothing ambient or agent-writable can swap the rg the OQ-18
+//      tree gate models or switch the hooks off.
 //   4. `assertExecutorEligible` refuses an adapter whose declared capabilities
 //      cannot enforce the policy.
 //   5. The in-process MCP tools dispatch through `authorizeMcpDispatch` (see
@@ -106,6 +117,7 @@ import type {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import type { Charter } from './charter.js';
+import { executorConfigBase } from './executor-env.js';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Vocabulary
@@ -463,7 +475,11 @@ const HOME_PROFILE_DIRS: readonly string[] = ['AppData', 'AppData/Local', 'AppDa
  * or after resolving reparse points. Such a root would put credential stores
  * in scope (F2 observation).
  */
-export function rootRejection(root: string, home: string = os.homedir()): string | null {
+export function rootRejection(
+  root: string,
+  home: string = os.homedir(),
+  executorState: string = executorConfigBase(),
+): string | null {
   if (typeof root !== 'string' || root.trim() === '') return 'root must be a non-empty string';
   if (!path.isAbsolute(root)) return 'root must be an absolute path';
   const interpreted = interpretToolPath(root, path.parse(path.resolve(root)).root);
@@ -473,9 +489,16 @@ export function rootRejection(root: string, home: string = os.homedir()): string
   const homeAbs = path.resolve(home);
   const forms = new Set([key(abs), key(realish(abs))]);
   const homeForms = new Set([key(homeAbs), key(realish(homeAbs))]);
+  const stateForms = new Set([key(path.resolve(executorState)), key(realish(path.resolve(executorState)))]);
   for (const r of forms) {
     const cred = credentialPathRejection(r);
     if (cred) return `a credential location may not be a root: ${cred}`;
+    for (const s of stateForms) {
+      // M0-G06 D1: a root that could reach the executor's config directory
+      // would let the board rewrite the next run's environment and policy.
+      if (r === s || contains(s, r)) return 'the executor state directory may not be a root';
+      if (contains(r, s)) return 'an ancestor of the executor state directory may not be a root';
+    }
     for (const h of homeForms) {
       if (r === h) return 'the user home directory may not be a root';
       if (contains(r, h)) return 'an ancestor of the user home directory may not be a root';
@@ -1304,6 +1327,24 @@ export function credentialTargetRejection(p: string): string | null {
   return viaReal ? `resolves to ${real}: ${viaReal}` : null;
 }
 
+/**
+ * Why the interpreted absolute path `p` — literally or through its real long
+ * path — lies inside (or is) the executor's state directory (the base of the
+ * per-execution `CLAUDE_CONFIG_DIR`s, executor-env.ts), or null. Evaluated
+ * like the credential rule, before and independently of the PathGuard, so a
+ * replacement guard cannot admit it either (M0-G06 D1).
+ */
+export function executorStateRejection(p: string, executorState: string = executorConfigBase()): string | null {
+  const state = path.resolve(executorState);
+  const stateForms = [state, realish(state)];
+  for (const form of [p, realish(p)]) {
+    for (const s of stateForms) {
+      if (contains(s, form)) return `${form} is inside the executor state directory ${s}`;
+    }
+  }
+  return null;
+}
+
 /** Interpret one path argument and run it through the PathGuard. */
 async function checkPathArg(
   label: string,
@@ -1316,6 +1357,8 @@ async function checkPathArg(
   if (!r.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" refused: ${r.reason}` };
   const cred = credentialTargetRejection(r.path);
   if (cred) return { ok: false, code: 'credential_path', reason: `${label} "${raw}" (${r.path}) denied: ${cred}` };
+  const state = executorStateRejection(r.path);
+  if (state) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${state}` };
   const g = await guard(r.path, roots, base);
   if (!g.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${g.reason}` };
   return argOk;
@@ -1344,6 +1387,8 @@ async function checkGlobPattern(
     const root = globRootFor(alt, searchBase);
     const rootCred = credentialTargetRejection(root);
     if (rootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${root}: ${rootCred}` };
+    const rootState = executorStateRejection(root);
+    if (rootState) return bad(`alternative "${alt}" searches ${root}: ${rootState}`);
     const g = await guard(root, roots, searchBase);
     if (!g.ok) return bad(`alternative "${alt}" searches ${root}: ${g.reason}`);
   }
@@ -1358,6 +1403,8 @@ async function checkGlobPattern(
   const rgRoot = path.resolve(cwd, split.baseDir);
   const rgRootCred = credentialTargetRejection(rgRoot);
   if (rgRootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${rgRoot}: ${rgRootCred}` };
+  const rgRootState = executorStateRejection(rgRoot);
+  if (rgRootState) return bad(`rg would search ${rgRoot}: ${rgRootState}`);
   const g = await guard(rgRoot, roots, cwd);
   if (!g.ok) return bad(`rg would search ${rgRoot}: ${g.reason}`);
   const why = searchTreeRejection(`glob pattern "${pattern}"`, rgRoot);
@@ -1684,6 +1731,10 @@ export const defaultPathGuard: PathGuard = (target, roots, base) => {
   if (roots.length === 0) return Promise.resolve({ ok: false, reason: 'no roots assigned' });
   const lexical = interpreted.path;
   const real = realish(lexical);
+  // M0-G06 D1: the executor's own state is never inside the roots, whatever
+  // the roots are (defense in depth below `rootRejection`).
+  const state = executorStateRejection(lexical);
+  if (state) return Promise.resolve({ ok: false, reason: state });
   const ok = roots.some((root) => {
     const r = path.resolve(root);
     return contains(r, lexical) && contains(realish(r), real);
@@ -1944,17 +1995,37 @@ export function redactSearchOutput(
 }
 
 export interface SdkEnforcementHooks extends EnforcementHooks {
-  /** Audit observer. It observes, never decides: a throw (or a rejected
-   * promise) is swallowed and cannot change the decision (M0-G07). */
+  /** Audit observer. It observes, never decides (M0-G07): it receives a
+   * deep-frozen structured clone of the event (mutating it throws in strict
+   * mode and changes nothing), the gate's output is computed from the live
+   * decision before the observer is invoked, and a throw (or a rejected
+   * promise, or a hostile thenable) is swallowed. */
   onDecision?: (e: PolicyAuditEvent) => void;
 }
 
-/** Invoke the audit observer; its failure never changes a decision. */
+/** Recursively freeze a plain data value (objects and arrays). */
+function deepFreeze<T>(v: T): T {
+  if (v !== null && typeof v === 'object' && !Object.isFrozen(v)) {
+    Object.freeze(v);
+    for (const child of Object.values(v as Record<string, unknown>)) deepFreeze(child);
+  }
+  return v;
+}
+
+/**
+ * Invoke the audit observer with a deep-frozen structured clone of `e`; its
+ * failure — or any attempt to mutate the event — never changes a decision.
+ * Callers compute their return value from the live decision BEFORE calling
+ * this, so even a clone failure cannot feed back into the gate.
+ */
 function notifyDecision(hooks: SdkEnforcementHooks, e: PolicyAuditEvent): void {
   try {
-    const r: unknown = (hooks.onDecision as ((e: PolicyAuditEvent) => unknown) | undefined)?.(e);
-    if (r && typeof (r as { then?: unknown }).then === 'function') {
-      (r as Promise<unknown>).then(undefined, () => undefined);
+    const observer = hooks.onDecision as ((e: PolicyAuditEvent) => unknown) | undefined;
+    if (typeof observer !== 'function') return;
+    const snapshot = deepFreeze(structuredClone(e));
+    const r: unknown = observer(snapshot);
+    if (r && typeof r === 'object' && typeof (r as { then?: unknown }).then === 'function') {
+      Promise.resolve(r).then(undefined, () => undefined);
     }
   } catch {
     /* an observer error is not a policy input */
@@ -1968,6 +2039,78 @@ function describeError(err: unknown): string {
   } catch {
     return '(unprintable error)';
   }
+}
+
+/** Own-property string read that cannot throw (hostile getters, non-objects). */
+function safeString(o: unknown, k: string): string | undefined {
+  try {
+    if (!o || typeof o !== 'object') return undefined;
+    const v = (o as Record<string, unknown>)[k];
+    return typeof v === 'string' ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Own-property read that cannot throw. */
+function safeGet(o: unknown, k: string): unknown {
+  try {
+    if (!o || typeof o !== 'object') return undefined;
+    return (o as Record<string, unknown>)[k];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Reason text carried by every fail-closed output. */
+const FAIL_CLOSED_PREFIX = 'Denied by Skippy tool policy (invalid_arguments): policy gate failed';
+
+/**
+ * The output a hook returns when it cannot decide (an exception, a
+ * non-object input, a hostile getter): never `{}` — the CLI reads `{}` as
+ * "no objection". Judged by `event`, the hook event the callback is
+ * REGISTERED for (the input may be unreadable); unknown → the most
+ * restrictive shape, a PreToolUse deny, which the CLI ignores for events it
+ * does not apply to:
+ *   PreToolUse        → `permissionDecision: 'deny'`
+ *   PermissionRequest → `decision: { behavior: 'deny' }`
+ *   PostToolUse       → `updatedToolOutput` withheld (tool judged guarded;
+ *                       Grep shape when unknown)
+ *   anything else     → PreToolUse-shaped deny
+ */
+export function failClosedHookOutput(event: string | undefined, input: unknown, err: unknown): Record<string, unknown> {
+  const why = `${FAIL_CLOSED_PREFIX}: ${describeError(err)}`;
+  if (event === 'PostToolUse') {
+    let tool: 'Grep' | 'Glob' = 'Grep';
+    let mode: unknown;
+    try {
+      if (canonicalTool(safeString(input, 'tool_name') ?? '') === 'Glob') tool = 'Glob';
+      mode = safeGet(safeGet(input, 'tool_response'), 'mode');
+    } catch {
+      /* keep the Grep default */
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        updatedToolOutput: withheldSearchReplacement(tool, mode),
+        additionalContext: SEARCH_REDACTION_NOTICE,
+      },
+    };
+  }
+  if (event === 'PermissionRequest') {
+    return { hookSpecificOutput: { hookEventName: 'PermissionRequest', decision: { behavior: 'deny', message: why } } };
+  }
+  return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: why } };
+}
+
+/** The `canUseTool` result when the callback cannot decide. */
+export function failClosedPermissionResult(options: unknown, err: unknown): PermissionResult {
+  const toolUseID = safeString(options, 'toolUseID');
+  return {
+    behavior: 'deny',
+    message: `${FAIL_CLOSED_PREFIX}: ${describeError(err)}`,
+    ...(toolUseID !== undefined ? { toolUseID } : {}),
+  };
 }
 
 /** Canonical (sorted-key) JSON of a value; throws on cycles/BigInt. */
@@ -2025,9 +2168,12 @@ export function buildClaudeSdkPermissionOptions(
 
   // FAIL CLOSED (M0-G07): the CLI turns a hook that throws into `{}` — a
   // pass-through, and for the auto-approved read tools `canUseTool` is never
-  // consulted — so no exception may escape a gate. Every observer call goes
-  // through `notifyDecision` (its failure cannot change the decision), and
-  // any unexpected error inside a gate is an explicit deny / withheld output.
+  // consulted — so no exception may escape a gate. The ENTIRE body of each
+  // gate runs inside one try (input reads included; the catch reads nothing
+  // unguarded), a non-object input is denied, every observer call goes
+  // through `notifyDecision` AFTER the gate's own output was computed (the
+  // observer sees a frozen clone and cannot change it), and any unexpected
+  // error is an explicit deny / withheld output.
   const preToolUseDeny = (decision: PolicyDecision & { allow: false }) => ({
     hookSpecificOutput: {
       hookEventName: 'PreToolUse' as const,
@@ -2038,89 +2184,84 @@ export function buildClaudeSdkPermissionOptions(
 
   const preToolUse: HookCallback = async (hookInput, toolUseID) => {
     try {
-      if (hookInput.hook_event_name !== 'PreToolUse') return {};
+      if (!hookInput || typeof hookInput !== 'object') throw new Error('hook input is not an object');
+      if (hookInput.hook_event_name !== 'PreToolUse') throw new Error(`unexpected hook event ${describeError(hookInput.hook_event_name)}`);
+      const toolName = hookInput.tool_name;
+      if (typeof toolName !== 'string') throw new Error('tool_name is not a string');
       const input =
         hookInput.tool_input && typeof hookInput.tool_input === 'object'
           ? (hookInput.tool_input as Record<string, unknown>)
           : {};
-      const decision = await safeEvaluate({
-        toolName: hookInput.tool_name,
-        input,
-        subagentId: hookInput.agent_id,
-      });
-      remember(
-        hookInput.tool_use_id ?? toolUseID,
-        callFingerprint(hookInput.tool_name, input, hookInput.agent_id),
-        decision,
-      );
-      notifyDecision(hooks, { agentId: policy.agentId, toolName: hookInput.tool_name, decision, via: 'PreToolUse' });
-      if (decision.allow) return {}; // defer to the normal permission flow (canUseTool)
-      return preToolUseDeny(decision);
+      const agentId = typeof hookInput.agent_id === 'string' ? hookInput.agent_id : undefined;
+      const decision = await safeEvaluate({ toolName, input, subagentId: agentId });
+      const id = typeof hookInput.tool_use_id === 'string' ? hookInput.tool_use_id : toolUseID;
+      remember(id, callFingerprint(toolName, input, agentId), decision);
+      // Computed from the live decision BEFORE the observer runs (D2).
+      const out = decision.allow ? {} : preToolUseDeny(decision); // allow: defer to canUseTool
+      notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'PreToolUse' });
+      return out;
     } catch (err) {
-      return preToolUseDeny({ allow: false, code: 'invalid_arguments', reason: `policy gate failed: ${describeError(err)}` });
+      return failClosedHookOutput('PreToolUse', hookInput, err);
     }
   };
 
   const postToolUse: HookCallback = async (hookInput) => {
-    const raw = hookInput as unknown as Record<string, unknown> | null | undefined;
-    const rawToolName = typeof raw?.['tool_name'] === 'string' ? raw['tool_name'] : '(unknown)';
-    let verdict: { replacement: Record<string, unknown>; reason: string } | null;
     try {
-      if (hookInput.hook_event_name !== 'PostToolUse') return {};
-      verdict = redactSearchOutput(policy, hookInput.tool_name, hookInput.tool_input, hookInput.tool_response);
+      if (!hookInput || typeof hookInput !== 'object') throw new Error('hook input is not an object');
+      if (hookInput.hook_event_name !== 'PostToolUse') throw new Error(`unexpected hook event ${describeError(hookInput.hook_event_name)}`);
+      const toolName = hookInput.tool_name;
+      if (typeof toolName !== 'string') throw new Error('tool_name is not a string');
+      const verdict = redactSearchOutput(policy, toolName, hookInput.tool_input, hookInput.tool_response);
+      if (!verdict) return {};
+      const out = {
+        hookSpecificOutput: {
+          hookEventName: 'PostToolUse' as const,
+          updatedToolOutput: verdict.replacement,
+          additionalContext: SEARCH_REDACTION_NOTICE,
+        },
+      };
+      notifyDecision(hooks, {
+        agentId: policy.agentId,
+        toolName,
+        decision: deny('credential_path', verdict.reason, 'read'),
+        via: 'PostToolUse',
+      });
+      return out;
     } catch (err) {
       // An output that could not be judged is withheld, never passed through.
-      let tool: 'Grep' | 'Glob' = 'Grep';
-      let mode: unknown;
-      try {
-        if (canonicalTool(rawToolName) === 'Glob') tool = 'Glob';
-        const res = raw?.['tool_response'];
-        if (res && typeof res === 'object') mode = (res as Record<string, unknown>)['mode'];
-      } catch {
-        /* keep the Grep default */
-      }
-      verdict = { replacement: withheldSearchReplacement(tool, mode), reason: `output could not be judged: ${describeError(err)}` };
+      return failClosedHookOutput('PostToolUse', hookInput, err);
     }
-    if (!verdict) return {};
-    notifyDecision(hooks, {
-      agentId: policy.agentId,
-      toolName: rawToolName,
-      decision: deny('credential_path', verdict.reason, 'read'),
-      via: 'PostToolUse',
-    });
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PostToolUse',
-        updatedToolOutput: verdict.replacement,
-        additionalContext: SEARCH_REDACTION_NOTICE,
-      },
-    };
   };
 
   const canUseTool: CanUseTool = async (toolName, input, options): Promise<PermissionResult> => {
     try {
-      const cached = decided.get(options.toolUseID);
-      decided.delete(options.toolUseID);
+      if (typeof toolName !== 'string') throw new Error('tool name is not a string');
+      if (!options || typeof options !== 'object') throw new Error('permission options are not an object');
+      const toolUseID = typeof options.toolUseID === 'string' ? options.toolUseID : undefined;
+      const agentID = typeof options.agentID === 'string' ? options.agentID : undefined;
+      const callInput = input && typeof input === 'object' ? input : {};
+      const cached = toolUseID !== undefined ? decided.get(toolUseID) : undefined;
+      if (toolUseID !== undefined) decided.delete(toolUseID);
       let decision =
-        cached && cached.fingerprint === callFingerprint(toolName, input, options.agentID) ? cached.decision : undefined;
+        cached && cached.fingerprint === callFingerprint(toolName, callInput, agentID) ? cached.decision : undefined;
+      let fresh = false;
       if (!decision) {
-        decision = await safeEvaluate({ toolName, input, subagentId: options.agentID });
-        notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
+        decision = await safeEvaluate({ toolName, input: callInput, subagentId: agentID });
+        fresh = true;
       }
-      return decision.allow
-        ? { behavior: 'allow', updatedInput: input, toolUseID: options.toolUseID }
+      // Computed from the live decision BEFORE the observer runs (D2).
+      const id = toolUseID !== undefined ? { toolUseID } : {};
+      const out: PermissionResult = decision.allow
+        ? { behavior: 'allow', updatedInput: callInput, ...id }
         : {
             behavior: 'deny',
             message: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
-            toolUseID: options.toolUseID,
+            ...id,
           };
+      if (fresh) notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
+      return out;
     } catch (err) {
-      const toolUseID = (options as { toolUseID?: unknown } | undefined)?.toolUseID;
-      return {
-        behavior: 'deny',
-        message: `Denied by Skippy tool policy (invalid_arguments): policy gate failed: ${describeError(err)}`,
-        ...(typeof toolUseID === 'string' ? { toolUseID } : {}),
-      };
+      return failClosedPermissionResult(options, err);
     }
   };
 
@@ -2182,6 +2323,8 @@ export async function authorizeMcpDispatch(
   } catch (err) {
     decision = deny('invalid_arguments', `policy evaluation failed: ${describeError(err)}`);
   }
+  // The returned decision is frozen and the observer sees its own clone (D2).
+  Object.freeze(decision);
   notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'mcp-broker' });
   return decision;
 }

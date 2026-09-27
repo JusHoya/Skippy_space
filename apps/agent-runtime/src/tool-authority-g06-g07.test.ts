@@ -21,7 +21,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 import type { Charter } from './charter.js';
-import { EXECUTOR_ENV_ALLOWLIST, buildClaudeExecutorEnv } from './executor-env.js';
+import {
+  EXECUTOR_ENV_ALLOWLIST,
+  buildClaudeExecutorEnv,
+  createExecutorConfigDir,
+  removeExecutorConfigDir,
+} from './executor-env.js';
 import { executeBoardMissionViaSdk, type ClaudeAgentSdkModule } from './sdk-board.js';
 import { authorizeMcpDispatch, buildClaudeSdkPermissionOptions, derivePolicy } from './tool-policy.js';
 
@@ -128,7 +133,7 @@ test('G06: query() gets an explicit allowlisted env that forces the embedded rg 
   for (const [k, v] of Object.entries(FORCED)) assert.equal(env[k], v, `${k} is forced`);
   assert.notEqual(env['CLAUDE_CONFIG_DIR'], HOSTILE['CLAUDE_CONFIG_DIR'], 'CLAUDE_CONFIG_DIR is the runtime-owned directory');
   assert.ok(path.isAbsolute(env['CLAUDE_CONFIG_DIR'] ?? ''), 'CLAUDE_CONFIG_DIR is absolute');
-  assert.ok(fs.existsSync(env['CLAUDE_CONFIG_DIR'] ?? ''), 'the runtime-owned config dir is created before launch');
+  assert.equal(fs.existsSync(env['CLAUDE_CONFIG_DIR'] ?? ''), false, 'the per-execution config dir is gone after the run (D1)');
   const upper = new Map(Object.entries(env).map(([k, v]) => [k.toUpperCase(), v]));
   for (const k of Object.keys(HOSTILE)) {
     const K = k.toUpperCase();
@@ -144,23 +149,29 @@ test('G06: query() gets an explicit allowlisted env that forces the embedded rg 
   assert.equal(upper.get('PATH'), process.env.PATH, 'PATH is carried');
 });
 
-test('G06: buildClaudeExecutorEnv folds case on Windows only and emits the canonical spelling', () => {
+test('G06: buildClaudeExecutorEnv folds case on Windows only and emits the canonical spelling', async () => {
   const src = { Path: 'P', systemroot: 'S', ripgrep_config_path: 'R', use_builtin_ripgrep: '0', HOME: 'H' };
-  const win = buildClaudeExecutorEnv(src, undefined, 'win32');
-  assert.equal(win['PATH'], 'P');
-  assert.equal(win['SystemRoot'], 'S');
-  assert.equal(win['HOME'], 'H');
-  assert.equal(win['USE_BUILTIN_RIPGREP'], '1');
-  assert.deepEqual(
-    Object.keys(win).filter((k) => /ripgrep_config|^path$|^systemroot$|^use_builtin_ripgrep$/.test(k)),
-    [],
-    'no source-cased duplicate or dropped key survives',
-  );
-  const posix = buildClaudeExecutorEnv(src, undefined, 'linux');
-  assert.equal(posix['PATH'], undefined, 'POSIX environments are case-sensitive: `Path` is not PATH');
-  assert.equal(posix['HOME'], 'H');
-  assert.equal(posix['USE_BUILTIN_RIPGREP'], '1');
-  assert.equal(Object.hasOwn(posix, 'ripgrep_config_path'), false);
+  const cfg = createExecutorConfigDir();
+  try {
+    const win = buildClaudeExecutorEnv(src, cfg, undefined, 'win32');
+    assert.equal(win['PATH'], 'P');
+    assert.equal(win['SystemRoot'], 'S');
+    assert.equal(win['HOME'], 'H');
+    assert.equal(win['USE_BUILTIN_RIPGREP'], '1');
+    assert.equal(win['CLAUDE_CONFIG_DIR'], cfg);
+    assert.deepEqual(
+      Object.keys(win).filter((k) => /ripgrep_config|^path$|^systemroot$|^use_builtin_ripgrep$/.test(k)),
+      [],
+      'no source-cased duplicate or dropped key survives',
+    );
+    const posix = buildClaudeExecutorEnv(src, cfg, undefined, 'linux');
+    assert.equal(posix['PATH'], undefined, 'POSIX environments are case-sensitive: `Path` is not PATH');
+    assert.equal(posix['HOME'], 'H');
+    assert.equal(posix['USE_BUILTIN_RIPGREP'], '1');
+    assert.equal(Object.hasOwn(posix, 'ripgrep_config_path'), false);
+  } finally {
+    assert.equal(await removeExecutorConfigDir(cfg), true);
+  }
 });
 
 // ── G07: a throwing observer never changes a decision ────────────────────────

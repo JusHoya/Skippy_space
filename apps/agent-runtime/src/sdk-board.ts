@@ -47,7 +47,7 @@ import type {
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { resolveExecutionGate } from './execution-gate.js';
-import { buildClaudeExecutorEnv } from './executor-env.js';
+import { buildClaudeExecutorEnv, createExecutorConfigDir, removeExecutorConfigDir } from './executor-env.js';
 import { logger } from './logger.js';
 import {
   CLAUDE_AGENT_SDK_CAPABILITIES,
@@ -55,6 +55,8 @@ import {
   assertExecutorEligible,
   buildClaudeSdkPermissionOptions,
   derivePolicy,
+  failClosedHookOutput,
+  failClosedPermissionResult,
   filterMcpServers,
   parseMcpToolName,
   type ClaudeSdkPermissionOptions,
@@ -77,8 +79,9 @@ export type ClaudeAgentSdkModule = Pick<typeof import('@anthropic-ai/claude-agen
 export interface ExecuteBoardMissionDeps {
   /** Defaults to a dynamic import of `@anthropic-ai/claude-agent-sdk`. */
   loadSdk?: () => Promise<ClaudeAgentSdkModule>;
-  /** TEST-ONLY: applied last over the executor's scrubbed environment
-   * (executor-env.ts). Production never passes it. */
+  /** TEST-ONLY: applied over the executor's scrubbed environment
+   * (executor-env.ts). Production never passes it. It cannot set
+   * `CLAUDE_CONFIG_DIR`: the per-execution directory is forced after it. */
   executorEnvOverrides?: Readonly<Record<string, string>>;
 }
 
@@ -500,29 +503,60 @@ function hookOutputDenial(event: string, out: unknown): { reason?: string } | nu
   return null;
 }
 
-function instrumentHook(cb: HookCallback, ledger: DenialLedger): HookCallback {
+/** `String(err)` that cannot itself throw. */
+function describeError(err: unknown): string {
+  try {
+    return String(err);
+  } catch {
+    return '(unprintable error)';
+  }
+}
+
+/** Own-property string read that cannot throw (hostile getters, non-objects). */
+function safeString(o: unknown, k: string): string | undefined {
+  try {
+    if (!o || typeof o !== 'object') return undefined;
+    const v = (o as Record<string, unknown>)[k];
+    return typeof v === 'string' ? v : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Wrap one hook so every deny it returns is recorded, and so that NOTHING
+ * escapes it (M0-G07 D3): the whole body — the input reads for accounting
+ * included — runs inside one try, and any exception (the inner hook's, or a
+ * hostile input's getter) yields the fail-closed output for the event
+ * (`failClosedHookOutput`: PreToolUse deny, PermissionRequest deny,
+ * PostToolUse withheld) instead of the `{}` the CLI makes of a throw.
+ */
+function instrumentHook(event: HookEvent, cb: HookCallback, ledger: DenialLedger): HookCallback {
+  const gates = event === 'PreToolUse' || event === 'PermissionRequest';
   return async (input, toolUseID, options) => {
-    const event = input.hook_event_name;
-    const rec = input as unknown as Record<string, unknown>;
-    const toolName = typeof rec.tool_name === 'string' ? rec.tool_name : `(${event} hook)`;
-    const id = typeof rec.tool_use_id === 'string' ? rec.tool_use_id : toolUseID;
-    const base: ObservedDenial = {
-      toolName,
-      source: event === 'PermissionRequest' ? 'PermissionRequest' : 'PreToolUse',
-    };
-    if (typeof rec.agent_id === 'string') base.agentId = rec.agent_id;
-    const gates = event === 'PreToolUse' || event === 'PermissionRequest';
-    let out: Awaited<ReturnType<HookCallback>>;
+    let base: ObservedDenial = { toolName: `(${event} hook)`, source: event === 'PermissionRequest' ? 'PermissionRequest' : 'PreToolUse' };
+    let id: string | undefined = typeof toolUseID === 'string' ? toolUseID : undefined;
     try {
-      out = await cb(input, toolUseID, options);
+      const toolName = safeString(input, 'tool_name');
+      if (toolName !== undefined) base = { ...base, toolName };
+      const agentId = safeString(input, 'agent_id');
+      if (agentId !== undefined) base.agentId = agentId;
+      id = safeString(input, 'tool_use_id') ?? id;
+      if (!input || typeof input !== 'object') throw new Error('hook input is not an object');
+      const out = await cb(input, toolUseID, options);
+      const denied = gates ? hookOutputDenial(event, out) : null;
+      if (denied) ledger.record(id, denied.reason !== undefined ? { ...base, reason: denied.reason } : base);
+      return out;
     } catch (err) {
-      // A policy gate that throws is never an allow for accounting purposes.
-      if (gates) ledger.record(id, { ...base, reason: `policy hook threw: ${String(err)}` });
-      throw err;
+      // A gate that throws is a deny — for accounting AND for the CLI.
+      const reason = `policy hook failed closed: ${describeError(err)}`;
+      try {
+        if (gates) ledger.record(id, { ...base, reason });
+      } catch {
+        /* accounting must not stop the deny */
+      }
+      return failClosedHookOutput(event, input, err) as Awaited<ReturnType<HookCallback>>;
     }
-    const denied = gates ? hookOutputDenial(event, out) : null;
-    if (denied) ledger.record(id, denied.reason !== undefined ? { ...base, reason: denied.reason } : base);
-    return out;
   };
 }
 
@@ -530,7 +564,9 @@ function instrumentHook(cb: HookCallback, ledger: DenialLedger): HookCallback {
  * Wrap the policy gate's `canUseTool` and permission hooks so that every
  * deny outcome — including those for calls inside spawned task agents
  * (`agentID` / `agent_id` set) — is recorded in `ledger`. The gate's
- * decisions and return values are passed through unchanged.
+ * decisions and return values are passed through unchanged; a wrapper that
+ * cannot complete (an exception anywhere, hostile inputs) returns an explicit
+ * deny, never throws (M0-G07 D3).
  */
 export function instrumentPermissionOptions(
   permission: ClaudeSdkPermissionOptions,
@@ -538,27 +574,35 @@ export function instrumentPermissionOptions(
 ): ClaudeSdkPermissionOptions {
   const inner = permission.canUseTool;
   const canUseTool: CanUseTool = async (toolName, input, options) => {
-    const base: ObservedDenial = { toolName, source: 'canUseTool' };
-    if (typeof options.agentID === 'string') base.agentId = options.agentID;
-    let result: Awaited<ReturnType<CanUseTool>>;
+    let base: ObservedDenial = { toolName: '(tool)', source: 'canUseTool' };
+    let toolUseID: string | undefined;
     try {
-      result = await inner(toolName, input, options);
+      base = { toolName: typeof toolName === 'string' ? toolName : '(tool)', source: 'canUseTool' };
+      const agentID = safeString(options, 'agentID');
+      if (agentID !== undefined) base.agentId = agentID;
+      toolUseID = safeString(options, 'toolUseID');
+      const result = await inner(toolName, input, options);
+      if (!result || typeof result !== 'object') throw new Error('permission callback returned a non-object');
+      if (result.behavior !== 'allow') {
+        const message = (result as { message?: unknown }).message;
+        ledger.record(toolUseID, typeof message === 'string' ? { ...base, reason: message } : base);
+      }
+      return result;
     } catch (err) {
-      ledger.record(options.toolUseID, { ...base, reason: `permission callback threw: ${String(err)}` });
-      throw err;
+      try {
+        ledger.record(toolUseID, { ...base, reason: `permission callback failed closed: ${describeError(err)}` });
+      } catch {
+        /* accounting must not stop the deny */
+      }
+      return failClosedPermissionResult(options, err);
     }
-    if (result.behavior !== 'allow') {
-      const message = (result as { message?: unknown }).message;
-      ledger.record(options.toolUseID, typeof message === 'string' ? { ...base, reason: message } : base);
-    }
-    return result;
   };
   const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {};
   for (const [event, matchers] of Object.entries(permission.hooks) as Array<
     [HookEvent, HookCallbackMatcher[] | undefined]
   >) {
     if (!matchers) continue;
-    hooks[event] = matchers.map((m) => ({ ...m, hooks: m.hooks.map((cb) => instrumentHook(cb, ledger)) }));
+    hooks[event] = matchers.map((m) => ({ ...m, hooks: m.hooks.map((cb) => instrumentHook(event, cb, ledger)) }));
   }
   return { ...permission, canUseTool, hooks };
 }
@@ -1502,82 +1546,126 @@ export async function executeBoardMissionViaSdk(
   // SDK throws "returned an error result" after an is_error result) keeps
   // that result's specific reason instead of a generic provider_error.
   let terminal: SdkBoardResult | null = null;
+  // The CLI's config directory for THIS run only: fresh, random, empty,
+  // outside every tool root, deleted on every exit path (M0-G06 D1; see
+  // executor-env.ts).
+  let configDir: string | undefined;
   try {
-    const sdk = await (deps.loadSdk ?? loadClaudeAgentSdk)();
-    const gate = buildClaudeSdkPermissionOptions(policy, {
-      ...params.enforcement,
-      onDecision: (e) => {
-        if (!e.decision.allow) {
-          logger.warn({
-            msg: 'tool call denied by policy',
-            boardId: params.boardId,
-            tool: e.toolName,
-            code: e.decision.code,
-            via: e.via,
-          });
-          denials.noteAudit({ toolName: e.toolName, source: 'policy-audit', reason: `${e.decision.code}: ${e.decision.reason}` });
-        }
-        params.enforcement?.onDecision?.(e);
-      },
-    });
-    const observer = new RunStreamObserver(policy, failures, denials, truncations);
-    const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
-    // An explicit, allowlisted environment: `env` REPLACES the CLI's
-    // environment, so nothing ambient (RIPGREP_CONFIG_PATH, a falsy
-    // USE_BUILTIN_RIPGREP, CLAUDE_CODE_* toggles, …) reaches the executor
-    // (M0-G06, FR-SEC-01, OQ-18; see executor-env.ts).
-    const env = buildClaudeExecutorEnv(process.env, deps.executorEnvOverrides);
-    mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
-    const q = sdk.query({
-      prompt: params.missionBrief,
-      options: {
-        model: params.model,
-        systemPrompt: params.systemPrompt,
-        maxTurns: params.maxTurns ?? 8,
-        ...permission,
-        mcpServers: filterMcpServers(policy, params.mcpServers),
-        env,
-      },
-    });
-
-    // Await the terminal `result` message(s). Normally the last one observed
-    // wins, but a non-success result anywhere in the stream permanently
-    // disqualifies a later "success" from being reported (D1): once the
-    // stream has shown failure/blocked/interrupted, a subsequent success
-    // message cannot un-fail the mission.
-    let sawNonSuccessResult = false;
-    for await (const msg of q) {
-      observer.observe(msg);
-      if (msg.type !== 'result') continue;
-      const reported: unknown = (msg as { permission_denials?: unknown }).permission_denials;
-      if (Array.isArray(reported)) {
-        for (const d of reported as unknown[]) {
-          const id = d && typeof d === 'object' ? (d as { tool_use_id?: unknown }).tool_use_id : undefined;
-          denials.record(typeof id === 'string' ? id : undefined, {
-            toolName: denialToolName(d),
-            source: 'permission_denials',
-          });
-        }
+    return await runMission();
+  } finally {
+    if (configDir !== undefined) {
+      const removed = await removeExecutorConfigDir(configDir);
+      if (!removed) {
+        logger.warn({ msg: 'executor config dir could not be removed', boardId: params.boardId, dir: configDir });
       }
-      const mapped = mapSdkResultMessage(msg, params.boardId, observer.takeFinalTurnEvidence());
-      if (mapped.status === 'succeeded' && sawNonSuccessResult) {
-        logger.warn({
-          msg: 'SDK board: later success result ignored after an earlier non-success result',
-          boardId: params.boardId,
-        });
-        continue;
-      }
-      terminal = mapped;
-      if (mapped.status !== 'succeeded') sawNonSuccessResult = true;
     }
+  }
 
-    if (!terminal) {
+  async function runMission(): Promise<SdkBoardResult> {
+    try {
+      const sdk = await (deps.loadSdk ?? loadClaudeAgentSdk)();
+      const gate = buildClaudeSdkPermissionOptions(policy, {
+        ...params.enforcement,
+        onDecision: (e) => {
+          if (!e.decision.allow) {
+            logger.warn({
+              msg: 'tool call denied by policy',
+              boardId: params.boardId,
+              tool: e.toolName,
+              code: e.decision.code,
+              via: e.via,
+            });
+            denials.noteAudit({ toolName: e.toolName, source: 'policy-audit', reason: `${e.decision.code}: ${e.decision.reason}` });
+          }
+          params.enforcement?.onDecision?.(e);
+        },
+      });
+      const observer = new RunStreamObserver(policy, failures, denials, truncations);
+      const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
+      // An explicit, allowlisted environment: `env` REPLACES the CLI's
+      // environment, so nothing ambient (RIPGREP_CONFIG_PATH, a falsy
+      // USE_BUILTIN_RIPGREP, CLAUDE_CODE_* toggles, …) reaches the executor,
+      // and `CLAUDE_CONFIG_DIR` is a fresh private directory nothing could
+      // have planted into (M0-G06, FR-SEC-01, OQ-18, OQ-22; executor-env.ts).
+      configDir = createExecutorConfigDir();
+      const env = buildClaudeExecutorEnv(process.env, configDir, deps.executorEnvOverrides);
+      const q = sdk.query({
+        prompt: params.missionBrief,
+        options: {
+          model: params.model,
+          systemPrompt: params.systemPrompt,
+          maxTurns: params.maxTurns ?? 8,
+          ...permission,
+          mcpServers: filterMcpServers(policy, params.mcpServers),
+          env,
+        },
+      });
+
+      // Await the terminal `result` message(s). Normally the last one observed
+      // wins, but a non-success result anywhere in the stream permanently
+      // disqualifies a later "success" from being reported (D1): once the
+      // stream has shown failure/blocked/interrupted, a subsequent success
+      // message cannot un-fail the mission.
+      let sawNonSuccessResult = false;
+      for await (const msg of q) {
+        observer.observe(msg);
+        if (msg.type !== 'result') continue;
+        const reported: unknown = (msg as { permission_denials?: unknown }).permission_denials;
+        if (Array.isArray(reported)) {
+          for (const d of reported as unknown[]) {
+            const id = d && typeof d === 'object' ? (d as { tool_use_id?: unknown }).tool_use_id : undefined;
+            denials.record(typeof id === 'string' ? id : undefined, {
+              toolName: denialToolName(d),
+              source: 'permission_denials',
+            });
+          }
+        }
+        const mapped = mapSdkResultMessage(msg, params.boardId, observer.takeFinalTurnEvidence());
+        if (mapped.status === 'succeeded' && sawNonSuccessResult) {
+          logger.warn({
+            msg: 'SDK board: later success result ignored after an earlier non-success result',
+            boardId: params.boardId,
+          });
+          continue;
+        }
+        terminal = mapped;
+        if (mapped.status !== 'succeeded') sawNonSuccessResult = true;
+      }
+
+      if (!terminal) {
+        return applyRunLedgers(
+          {
+            status: 'failed',
+            reason: {
+              code: 'no_terminal_result',
+              message: `Board ${params.boardId} executor stream ended without a terminal result.`,
+            },
+          },
+          failures,
+          denials,
+          params.boardId,
+          truncations,
+        );
+      }
+      return applyRunLedgers(terminal, failures, denials, params.boardId, truncations);
+    } catch (err) {
+      logger.warn({
+        msg: 'SDK board execution failed',
+        boardId: params.boardId,
+        err: String(err),
+      });
+      // A non-success result already observed is the more specific truth.
+      const observed: SdkBoardResult | null = terminal;
+      if (observed && observed.status !== 'succeeded') {
+        return applyRunLedgers(observed, failures, denials, params.boardId, truncations);
+      }
       return applyRunLedgers(
         {
           status: 'failed',
           reason: {
-            code: 'no_terminal_result',
-            message: `Board ${params.boardId} executor stream ended without a terminal result.`,
+            code: 'provider_error',
+            message: `Board ${params.boardId} executor failed before a terminal result.`,
+            detail: String(err),
           },
         },
         failures,
@@ -1586,31 +1674,5 @@ export async function executeBoardMissionViaSdk(
         truncations,
       );
     }
-    return applyRunLedgers(terminal, failures, denials, params.boardId, truncations);
-  } catch (err) {
-    logger.warn({
-      msg: 'SDK board execution failed',
-      boardId: params.boardId,
-      err: String(err),
-    });
-    // A non-success result already observed is the more specific truth.
-    const observed: SdkBoardResult | null = terminal;
-    if (observed && observed.status !== 'succeeded') {
-      return applyRunLedgers(observed, failures, denials, params.boardId, truncations);
-    }
-    return applyRunLedgers(
-      {
-        status: 'failed',
-        reason: {
-          code: 'provider_error',
-          message: `Board ${params.boardId} executor failed before a terminal result.`,
-          detail: String(err),
-        },
-      },
-      failures,
-      denials,
-      params.boardId,
-      truncations,
-    );
   }
 }
