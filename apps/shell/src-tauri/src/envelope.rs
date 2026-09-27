@@ -248,6 +248,10 @@ impl TerminalRecord {
             if validation != "passed" && validation != "not_defined" {
                 v.push(format!("succeeded requires validation passed|not_defined, got {validation}"));
             }
+            // M0-G05: every reason code is a non-success reason.
+            if has_reason {
+                v.push("succeeded cannot carry a failure reason".to_string());
+            }
         } else if !has_reason {
             v.push(format!("{outcome} requires a reason"));
         }
@@ -391,6 +395,20 @@ mod tests {
             assert_eq!(out["outcome"], "unverified", "{fields}");
             assert_eq!(out["validation"], "not_run", "{fields}");
         }
+    }
+
+    /// M0-G05: a `succeeded` record that carries a failure reason is
+    /// contradictory and is forwarded as `unverified`, never as success.
+    #[test]
+    fn delegation_complete_succeeded_with_failure_reason_is_unverified() {
+        let out = complete(
+            r#""outcome":"succeeded","mode":"live","validation":"not_defined","reason":{"code":"provider_error","message":"m"}"#,
+        );
+        assert_eq!(out["outcome"], "unverified");
+        assert_eq!(out["reason"]["code"], "invalid_record");
+        let detail = out["reason"]["detail"].as_str().unwrap();
+        assert!(detail.contains("claimed succeeded(provider_error)"), "{detail}");
+        assert!(detail.contains("succeeded cannot carry a failure reason"), "{detail}");
     }
 
     #[test]

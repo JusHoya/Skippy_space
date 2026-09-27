@@ -143,6 +143,10 @@ export function terminalRecordViolations(r: TerminalRecord): string[] {
     if (r.validation !== 'passed' && r.validation !== 'not_defined') {
       v.push(`succeeded requires validation passed|not_defined, got ${r.validation}`);
     }
+    // M0-G05: every reason code is a non-success reason; a success carrying
+    // one is contradictory (no writer produces it — `deriveTaskOutcome`
+    // never sets a reason on success).
+    if (r.reason) v.push(`succeeded cannot carry a failure reason (${r.reason.code})`);
   } else if (!r.reason) {
     v.push(`${r.outcome} requires a reason`);
   }

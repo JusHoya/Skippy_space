@@ -15,7 +15,10 @@ import {
   Envelope,
   RecordedOutcomeSchema,
   guardTerminalRecord,
+  readDelegationCompleteRecord,
+  terminalRecordViolations,
   type ReceivedTerminalRecord,
+  type TerminalRecord,
 } from '@skippy/shared';
 
 const base = { summary: 's' } as const;
@@ -40,6 +43,24 @@ test('D3: other invariant violators (reasonless failure, live simulated, failing
     assert.equal(g.outcome, 'unverified', JSON.stringify(c));
     assert.ok(g.violations.length > 0);
   }
+});
+
+test('M0-G05: a succeeded record carrying a failure reason is a contract violation, shown as unverified', () => {
+  const r: ReceivedTerminalRecord = {
+    ...base,
+    outcome: 'succeeded',
+    mode: 'live',
+    validation: 'not_defined',
+    reason: { code: 'provider_error', message: 'm' },
+  };
+  assert.deepEqual(terminalRecordViolations(r as TerminalRecord), ['succeeded cannot carry a failure reason (provider_error)']);
+  const g = guardTerminalRecord(r);
+  assert.equal(g.outcome, 'unverified');
+  assert.equal(g.reason?.code, 'invalid_record');
+  assert.match(g.reason?.detail ?? '', /claimed succeeded\(provider_error\): succeeded cannot carry a failure reason/);
+  // The persisted-record reader applies the same invariant.
+  const rec = readDelegationCompleteRecord({ type: 'delegation_complete', delegationId: 'D1', fromBoardId: 'coding', ts: '2026-09-27T00:00:00.000Z', ...r });
+  assert.notEqual(rec?.outcome, 'succeeded');
 });
 
 test('D3: conforming records pass through unchanged', () => {

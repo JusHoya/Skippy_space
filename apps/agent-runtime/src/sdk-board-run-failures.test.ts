@@ -1016,3 +1016,345 @@ test('OQ-20 controls: background wake-ups, fallbacks and executed tool turns sti
   ]);
   assert.equal(toolFb.status, 'succeeded', JSON.stringify(toolFb));
 });
+
+// ── M0-G01: main-thread terminal failures inside a result-less segment ──────
+//
+// Captured from the bundled CLI 2.1.162 against the local mock (m_bgMid401,
+// m_bgMidRefusal, m_bgMidPause, m_bgMidMaxTokAll and the controls
+// y_bgMid529ThenOkR2, n_bgMidMaxTok, main401). While a background task agent
+// runs, a main-thread request that fails terminally ends its segment with
+// NO `result`: the CLI emits only a main-thread `<synthetic>` assistant
+// message with the typed `error` field and fires the main-thread
+// `StopFailure` hook (no `agent_id`). After the background wake-up the next
+// segment ends with one `result: success / end_turn`. A retry the CLI
+// recovers from emits only `system/api_retry` (no synthetic message, no hook).
+
+/** The CLI's synthetic terminal error message on the board's main thread. */
+const syntheticMain = (text: string, error: string, stopReason: string): Record<string, unknown> => ({
+  type: 'assistant',
+  message: {
+    id: 'a3371ed1-6949-45e4-90ee-de30c53975bc',
+    container: null,
+    model: '<synthetic>',
+    role: 'assistant',
+    stop_details: null,
+    stop_reason: stopReason,
+    stop_sequence: '',
+    type: 'message',
+    content: [{ type: 'text', text }],
+    context_management: null,
+  },
+  parent_tool_use_id: null,
+  error,
+});
+/** The main-thread `StopFailure` hook call (no `agent_id`). */
+const stopFailureMain = (error: string, last: string): Step => ({
+  hook: 'StopFailure',
+  input: { session_id: 's', transcript_path: '', cwd: '', hook_event_name: 'StopFailure', error, last_assistant_message: last },
+});
+const MAX_OUT =
+  "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.";
+/** The single result the CLI sends after the background wake-up. */
+const wakeResult = (text: string): Record<string, unknown> => ({ ...successResult, result: text, num_turns: 1 });
+
+const BG_MID_401: Step[] = [
+  ...bgLaunch,
+  statusRequesting,
+  syntheticMain(INVALID_KEY, 'authentication_failed', 'stop_sequence'),
+  stopFailureMain('authentication_failed', INVALID_KEY),
+  ...bgFinish,
+  ...fullTextTurn('msg_4', 'final ok'),
+  wakeResult('final ok'),
+];
+
+test('M0-G01 m_bgMid401: main-thread 401 in a result-less segment, then a wake-up success → failed(provider_error)', async () => {
+  const r = await run(BG_MID_401);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  const { code, message, detail } = reasonOf(r);
+  assert.equal(code, 'provider_error');
+  assert.match(message, /Board coding main thread hit a provider API error\.$/);
+  assert.match(detail, /provider_error \[main thread\]: assistant error="authentication_failed"/);
+  assert.match(detail, /StopFailure error="authentication_failed"/);
+  assert.equal(deriveTaskOutcome(r, 'not_defined').outcome, 'failed');
+  // Either signal alone fails the run (hook first, message first, or one only).
+  const noHook = BG_MID_401.filter((s) => (s as { hook?: unknown }).hook === undefined);
+  const noMsg = BG_MID_401.filter((s) => (s as { error?: unknown }).error === undefined);
+  for (const steps of [noHook, noMsg]) {
+    const one = await run(steps);
+    assert.equal(one.status, 'failed', JSON.stringify(one));
+    assert.equal(reasonOf(one).code, 'provider_error');
+  }
+});
+
+test('M0-G01 m_bgMid400/500/destroy: every typed main-thread API error in a result-less segment fails the run', async () => {
+  for (const [error, text] of [
+    ['unknown', 'API Error: 400 mock error'],
+    ['server_error', 'API Error: 500 boom'],
+    ['unknown', 'API Error: Unable to connect to API (ECONNRESET)'],
+    ['rate_limit', 'API Error: 429'],
+  ] as const) {
+    const r = await run([
+      ...bgLaunch,
+      statusRequesting,
+      syntheticMain(text, error, 'stop_sequence'),
+      stopFailureMain(error, text),
+      ...bgFinish,
+      ...fullTextTurn('msg_4', 'final ok'),
+      wakeResult('final ok'),
+    ]);
+    assert.equal(r.status, 'failed', `${error}: ${JSON.stringify(r)}`);
+    assert.equal(reasonOf(r).code, 'provider_error', error);
+  }
+});
+
+test('M0-G01 m_bgMidRefusal: main-thread refusal in a result-less segment → failed(model_refused), counted once', async () => {
+  const refusal: Step[] = [
+    ...bgLaunch,
+    statusRequesting,
+    msgStart('msg_4'),
+    textStart(0),
+    mainText('msg_4', 'no'),
+    blockStop(0),
+    syntheticMain(AUP, 'invalid_request', 'refusal'),
+    msgDelta('refusal'),
+    msgStop,
+    stopFailureMain('invalid_request', AUP),
+    ...bgFinish,
+    ...fullTextTurn('msg_5', 'All done, monkeys! Magnificent.'),
+    wakeResult('All done, monkeys! Magnificent.'),
+  ];
+  const r = await run(refusal);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  const { code, message, detail } = reasonOf(r);
+  assert.equal(code, 'model_refused');
+  // The synthetic message, the hook and the superseded refusal turn are one failure.
+  assert.match(message, /main thread was refused by the model\.$/);
+  assert.match(detail, /main-thread turn msg_4 was refused \(stop_reason "refusal"\)/);
+  // The streamed refusal turn alone (no synthetic message, no hook) still fails.
+  const turnOnly = await run(refusal.filter((s) => (s as { hook?: unknown }).hook === undefined && (s as { error?: unknown }).error === undefined));
+  assert.equal(reasonOf(turnOnly).code, 'model_refused');
+});
+
+test('M0-G01 m_bgMidPause: a pause_turn the CLI never continued before the wake-up → failed(executor_error)', async () => {
+  const r = await run([
+    ...bgLaunch,
+    ...fullTextTurn('msg_4', 'paused', 'pause_turn'),
+    ...bgFinish,
+    ...fullTextTurn('msg_5', 'All done, monkeys! Magnificent.'),
+    wakeResult('All done, monkeys! Magnificent.'),
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(reasonOf(r).code, 'executor_error');
+  assert.match(reasonOf(r).detail, /msg_4 ended with stop_reason "pause_turn" and the CLI did not continue it/);
+});
+
+test('M0-G01 m_bgMidMaxTokAll: the CLI gives up on max_tokens recovery in a result-less segment → failed(executor_error), counted once', async () => {
+  const steps: Step[] = [
+    ...bgLaunch,
+    ...fullTextTurn('msg_4', 'a', 'max_tokens'),
+    ...fullTextTurn('msg_5', 'b', 'max_tokens'),
+    ...fullTextTurn('msg_6', 'c', 'max_tokens'),
+    ...fullTextTurn('msg_7', 'd', 'max_tokens'),
+    syntheticMain(MAX_OUT, 'max_output_tokens', 'stop_sequence'),
+    stopFailureMain('max_output_tokens', MAX_OUT),
+    ...bgFinish,
+    ...fullTextTurn('msg_8', 'final ok'),
+    wakeResult('final ok'),
+  ];
+  const r = await run(steps);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  const { code, message, detail } = reasonOf(r);
+  assert.equal(code, 'executor_error');
+  assert.match(message, /main thread ended abnormally\.$/);
+  assert.match(detail, /error="max_output_tokens"/);
+  // The recovered max_tokens turns (msg_4..msg_6) are not failures.
+  assert.doesNotMatch(detail, /msg_[456]/);
+  // Without either CLI signal the unrecovered last turn still fails the run.
+  const turnOnly = await run(steps.filter((s) => (s as { hook?: unknown }).hook === undefined && (s as { error?: unknown }).error === undefined));
+  assert.equal(reasonOf(turnOnly).code, 'executor_error');
+  assert.match(reasonOf(turnOnly).detail, /msg_7 ended with stop_reason "max_tokens"/);
+});
+
+test('M0-G01 dedupe: a main-thread error whose segment ends with an error result keeps the result mapping, not doubled', async () => {
+  // main401 capture: synthetic message + hook + `is_error` result (status 401).
+  const r = await run([
+    init,
+    statusRequesting,
+    syntheticMain(INVALID_KEY, 'authentication_failed', 'stop_sequence'),
+    stopFailureMain('authentication_failed', INVALID_KEY),
+    {
+      type: 'result',
+      subtype: 'success',
+      is_error: true,
+      api_error_status: 401,
+      num_turns: 1,
+      result: INVALID_KEY,
+      stop_reason: 'stop_sequence',
+      total_cost_usd: 0,
+      permission_denials: [],
+      terminal_reason: 'completed',
+    },
+  ]);
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(reasonOf(r), {
+    code: 'provider_error',
+    message: 'Board coding executor hit a provider API error (status 401).',
+    detail: '401',
+  });
+  // max_output_tokens give-up with a result (t_finalMaxTokAll): executor_error, one reason.
+  const maxTok = await run([
+    init,
+    ...fullTextTurn('msg_1', 'a', 'max_tokens'),
+    syntheticMain(MAX_OUT, 'max_output_tokens', 'stop_sequence'),
+    stopFailureMain('max_output_tokens', MAX_OUT),
+    { type: 'result', subtype: 'success', is_error: true, result: MAX_OUT, stop_reason: 'stop_sequence', permission_denials: [], terminal_reason: 'completed' },
+  ]);
+  assert.equal(reasonOf(maxTok).code, 'executor_error');
+  assert.doesNotMatch(reasonOf(maxTok).detail, /also failed/);
+});
+
+test('M0-G01: a main-thread failure in an EARLIER segment survives a later clean result and a later error result keeps it in the detail', async () => {
+  const r = await run([
+    ...bgLaunch,
+    statusRequesting,
+    syntheticMain(INVALID_KEY, 'authentication_failed', 'stop_sequence'),
+    ...bgFinish,
+    statusRequesting,
+    syntheticMain('API Error: 500 boom', 'server_error', 'stop_sequence'),
+    { type: 'result', subtype: 'success', is_error: true, api_error_status: 500, result: 'API Error: 500 boom', stop_reason: 'stop_sequence', permission_denials: [], terminal_reason: 'completed' },
+  ]);
+  assert.equal(r.status, 'failed');
+  const { code, detail } = reasonOf(r);
+  assert.equal(code, 'provider_error');
+  assert.match(detail, /main thread also failed: provider_error \[main thread\]: assistant error="authentication_failed"/);
+  assert.doesNotMatch(detail, /server_error/);
+});
+
+test('M0-G01: a tool_use turn whose tools never ran, superseded by a later turn → failed(executor_error)', async () => {
+  const r = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_3'),
+    toolStart(0, 'toolu_main_1_0_2'),
+    {
+      type: 'assistant',
+      message: { id: 'msg_3', model: 'claude-sonnet-4-6', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_main_1_0_2', name: 'Read', input: { file_path: 'inside.txt' } }], stop_reason: null },
+      parent_tool_use_id: null,
+    },
+    blockStop(0),
+    msgDelta('tool_use'),
+    msgStop,
+    ...fullTextTurn('msg_4', 'All done'),
+    successResult,
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(reasonOf(r).code, 'executor_error');
+  assert.match(reasonOf(r).detail, /msg_3 ended with stop_reason "tool_use" but none of its tool calls ran/);
+});
+
+test('M0-G01 controls: recovered retries, recovered max_tokens, tool errors and complete wake-ups still succeed', async () => {
+  // y_bgMid529ThenOkR2: a 529 the CLI retried (system/api_retry only).
+  const retry = await run([
+    ...bgLaunch,
+    statusRequesting,
+    { type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 2, retry_delay_ms: 525, error_status: 529, error: 'overloaded' },
+    msgStart('msg_4'),
+    textStart(0),
+    mainText('msg_4', 'final ok'),
+    blockStop(0),
+    msgDelta('end_turn'),
+    msgStop,
+    ...bgFinish,
+    ...fullTextTurn('msg_5', 'All done, monkeys! Magnificent.'),
+    wakeResult('All done, monkeys! Magnificent.'),
+  ]);
+  assert.equal(retry.status, 'succeeded', JSON.stringify(retry));
+  // n_bgMidMaxTok: a max_tokens turn the CLI continued inside its segment.
+  const maxTok = await run([
+    ...bgLaunch,
+    ...fullTextTurn('msg_4', 'partial', 'max_tokens'),
+    ...fullTextTurn('msg_5', 'continued'),
+    ...bgFinish,
+    ...fullTextTurn('msg_6', 'All done, monkeys! Magnificent.'),
+    wakeResult('All done, monkeys! Magnificent.'),
+  ]);
+  assert.equal(maxTok.status, 'succeeded', JSON.stringify(maxTok));
+  // x_invalidToolOk: a complete tool_use turn whose call the CLI rejected
+  // (is_error) — the model recovers in the next turn.
+  const toolErr = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_2'),
+    toolStart(0, 'toolu_main_0_0_1'),
+    { type: 'assistant', message: { id: 'msg_2', model: 'claude-sonnet-4-6', content: [{ type: 'tool_use', id: 'toolu_main_0_0_1', name: 'Read', input: {} }], stop_reason: null }, parent_tool_use_id: null },
+    blockStop(0),
+    msgDelta('tool_use'),
+    msgStop,
+    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_main_0_0_1', is_error: true, content: '<tool_use_error>InputValidationError</tool_use_error>' }] }, parent_tool_use_id: null },
+    ...fullTextTurn('msg_3', 'All done, monkeys! Magnificent.'),
+    successResult,
+  ]);
+  assert.equal(toolErr.status, 'succeeded', JSON.stringify(toolErr));
+  // z_deltaToolUseNoTools: stop_reason tool_use with no tool_use block (nothing to run).
+  const noTools = await run([init, ...fullTextTurn('msg_1', 'x', 'tool_use'), ...fullTextTurn('msg_2', 'All done'), successResult]);
+  assert.equal(noTools.status, 'succeeded', JSON.stringify(noTools));
+  // stop_sequence mid-segment and end_turn wake-ups.
+  const stopSeq = await run([
+    ...bgLaunch,
+    ...fullTextTurn('msg_4', 'waiting', 'stop_sequence'),
+    ...bgFinish,
+    ...fullTextTurn('msg_5', 'All done'),
+    wakeResult('All done'),
+  ]);
+  assert.equal(stopSeq.status, 'succeeded', JSON.stringify(stopSeq));
+});
+
+// ── M0-G02 / M0-G03: tool evidence for a turn without a stop reason ─────────
+
+/** z_nsToolNullStop: the stream was cut inside a tool block; the CLI's
+ * non-streamed fallback returned a tool_use turn with `stop_reason: null`. */
+const nsToolNull = (isError: boolean): Step[] => [
+  init,
+  statusRequesting,
+  msgStart('msg_2'),
+  toolStart(0, 'toolu_main_0_0_1'),
+  {
+    type: 'assistant',
+    message: { id: 'msg_4', model: 'claude-sonnet-4-6', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_main_0_0_3', name: 'Read', input: { file_path: 'inside.txt' } }], stop_reason: null },
+    parent_tool_use_id: null,
+  },
+  {
+    type: 'user',
+    message: { role: 'user', content: [{ tool_use_id: 'toolu_main_0_0_3', type: 'tool_result', content: isError ? '<tool_use_error>InputValidationError</tool_use_error>' : '1\tinside', ...(isError ? { is_error: true } : {}) }] },
+    parent_tool_use_id: null,
+  },
+  ...fullTextTurn('msg_5', 'final ok'),
+  { ...successResult, result: 'final ok' },
+];
+
+test('M0-G02 z_nsToolNullStop: a non-streamed stop_reason-null turn whose tool the CLI ran is complete → succeeded', async () => {
+  const r = await run(nsToolNull(false));
+  assert.equal(r.status, 'succeeded', JSON.stringify(r));
+});
+
+test('M0-G03: a cut turn whose only tool_use the CLI rejected (is_error) is still truncated → failed(provider_error)', async () => {
+  // z_nsToolNullInvalid: the non-streamed variant.
+  const ns = await run(nsToolNull(true));
+  assert.equal(ns.status, 'failed', JSON.stringify(ns));
+  assert.match(reasonOf(ns).detail, /msg_4 got no stop reason \(non-streamed message with stop_reason null\)/);
+  // x_invalidToolCut: streamed, cut after the tool block, before message_delta.
+  const cut = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_2'),
+    toolStart(0, 'toolu_main_0_0_1'),
+    { type: 'assistant', message: { id: 'msg_2', model: 'claude-sonnet-4-6', content: [{ type: 'tool_use', id: 'toolu_main_0_0_1', name: 'Read', input: {} }], stop_reason: null }, parent_tool_use_id: null },
+    blockStop(0),
+    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_main_0_0_1', is_error: true, content: '<tool_use_error>InputValidationError</tool_use_error>' }] }, parent_tool_use_id: null },
+    ...fullTextTurn('msg_3', 'All done, monkeys! Magnificent.'),
+    successResult,
+  ]);
+  assert.equal(cut.status, 'failed', JSON.stringify(cut));
+  assert.equal(reasonOf(cut).code, 'provider_error');
+  assert.match(reasonOf(cut).detail, /main-thread turn msg_2 got no stop reason/);
+});

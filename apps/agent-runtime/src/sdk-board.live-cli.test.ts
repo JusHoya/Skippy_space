@@ -68,6 +68,9 @@ interface ScriptStep {
   msgId?: string;
   delayMs?: number;
   attempts?: ScriptStep[];
+  /** Answer with this HTTP error status (JSON `body`) instead of a message. */
+  http?: number;
+  body?: unknown;
 }
 
 let scenario: Scenario = { mainTools: [], subTools: [] };
@@ -151,6 +154,11 @@ function scripted(
   let step = steps[turn] ?? dflt;
   if (step.attempts) step = step.attempts[attempt] ?? step.attempts[step.attempts.length - 1]!;
   const s = step;
+  if (s.http !== undefined) {
+    res.writeHead(s.http, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(s.body ?? { type: 'error', error: { type: 'invalid_request_error', message: 'mock error' } }));
+    return;
+  }
   if (j.stream !== true) nonStreamedRequests++;
   const blocks: Array<Record<string, unknown>> = (s.tools ?? []).map((t, i) => ({
     type: 'tool_use',
@@ -488,4 +496,81 @@ test('live CLI (OQ-20 D3 t_noBlockStopEnd): end_turn with a text block never clo
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
   assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /never closed/);
+});
+
+// ── M0-G01: main-thread terminal failure in a segment with no `result` ──────
+//
+// While the background task agent runs, the CLI ends the failed main-thread
+// segment WITHOUT a result (only a `<synthetic>` error message + the main-
+// thread StopFailure hook); the wake-up segment then ends `success/end_turn`.
+
+const failureOf = (r: Awaited<ReturnType<typeof executeBoardMissionViaSdk>>): { code: string; text: string } => {
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  return r.status === 'failed' ? { code: r.reason.code, text: `${r.reason.message} ${r.reason.detail ?? ''}` } : { code: '', text: '' };
+};
+
+test('live CLI (M0-G01 m_bgMid401): main-thread 401 while a background task runs, then a wake-up success → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({
+    main: [
+      { tools: [bgAgent] },
+      { attempts: [{ http: 401, body: { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } } }, { text: 'final ok' }] },
+    ],
+    sub: slowSub,
+  });
+  const f = failureOf(r);
+  assert.equal(f.code, 'provider_error');
+  assert.match(f.text, /main thread/);
+  assert.match(f.text, /authentication_failed/);
+});
+
+test('live CLI (M0-G01 m_bgMidRefusal): main-thread refusal while a background task runs → failed(model_refused)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({ main: [{ tools: [bgAgent] }, { text: 'no', stop: 'refusal' }, { text: 'final ok' }], sub: slowSub });
+  assert.equal(failureOf(r).code, 'model_refused');
+});
+
+test('live CLI (M0-G01 m_bgMidPause): main-thread pause_turn never continued before the wake-up → failed(executor_error)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({ main: [{ tools: [bgAgent] }, { text: 'paused', stop: 'pause_turn' }, { text: 'final ok' }], sub: slowSub });
+  const f = failureOf(r);
+  assert.equal(f.code, 'executor_error');
+  assert.match(f.text, /pause_turn/);
+});
+
+test('live CLI (M0-G01 m_bgMidMaxTokAll): the CLI gives up on max_tokens recovery while a background task runs → failed(executor_error)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({
+    main: [
+      { tools: [bgAgent] },
+      { text: 'a', stop: 'max_tokens' },
+      { text: 'b', stop: 'max_tokens' },
+      { text: 'c', stop: 'max_tokens' },
+      { text: 'd', stop: 'max_tokens' },
+      { text: 'final ok' },
+    ],
+    sub: slowSub,
+  });
+  const f = failureOf(r);
+  assert.equal(f.code, 'executor_error');
+  assert.match(f.text, /max_output_tokens/);
+});
+
+test('live CLI (M0-G01 controls): a retried 529 and a recovered max_tokens turn while a background task runs → succeeded', { skip, timeout: 120_000 }, async () => {
+  const saved = process.env.CLAUDE_CODE_MAX_RETRIES;
+  process.env.CLAUDE_CODE_MAX_RETRIES = '2';
+  try {
+    const retried = await scriptedRun({
+      main: [
+        { tools: [bgAgent] },
+        { attempts: [{ http: 529, body: { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } } }, { text: 'waiting on bg' }] },
+        { text: 'Report complete, monkeys.' },
+      ],
+      sub: slowSub,
+    });
+    assert.equal(retried.status, 'succeeded', JSON.stringify(retried));
+  } finally {
+    process.env.CLAUDE_CODE_MAX_RETRIES = saved;
+  }
+  const maxTok = await scriptedRun({
+    main: [{ tools: [bgAgent] }, { text: 'partial', stop: 'max_tokens' }, { text: 'continued' }, { text: 'Report complete, monkeys.' }],
+    sub: slowSub,
+  });
+  assert.equal(maxTok.status, 'succeeded', JSON.stringify(maxTok));
 });

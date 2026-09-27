@@ -181,7 +181,9 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  * (null from the real API), so they are not a signal on their own. Earlier
  * main-thread turns judged truncated when a later turn superseded them (a
  * background wake-up segment needs no `result` in between) are applied on top
- * — see {@link TruncatedTurnLedger}.
+ * — see {@link TruncatedTurnLedger}. Superseded turns that ended abnormally
+ * and main-thread terminal errors inside a result-less segment (M0-G01) are
+ * applied through the {@link RunFailureLedger}.
  *
  * A succeeded result's `summary` is always a non-blank string (`result` when
  * it is one, otherwise {@link NO_SUMMARY}) so the emitted `delegation_complete`
@@ -604,6 +606,20 @@ function applyRunDenials(base: SdkBoardResult, ledger: DenialLedger, boardId: st
 // sub turn that hit `max_tokens` and was recovered by the CLI is forwarded
 // with `null`), so only `refusal` or an `error` flag count — a recovered
 // truncation is not a failure.
+//
+// The board's MAIN thread uses the same ledger (M0-G01). While a background
+// task agent runs, CLI 2.1.162 emits no `result` between the board's
+// segments, so a main-thread request that fails terminally there is reported
+// ONLY by (a) a main-thread `<synthetic>` assistant message with the typed
+// `error` field and (b) a main-thread `StopFailure` hook (no `agent_id`); the
+// next segment can still end with `result: success`. Verified live
+// (m_bgMid401/400/500/Destroy/Refusal/MaxTokAll): both signals appear for
+// every terminal failure. A retry the CLI recovers from (529/500/ECONNRESET
+// with CLAUDE_CODE_MAX_RETRIES>0, or the non-streaming fallback) emits only
+// `system/api_retry` — never a synthetic message or `StopFailure` — so only
+// terminal failures are recorded. When the same segment ends with an error
+// `result`, that result already reports the failure and the main-thread
+// entries of the segment are dropped (no doubled reason).
 
 type RunFailureCode = 'provider_error' | 'model_refused' | 'executor_error';
 
@@ -619,9 +635,13 @@ interface ObservedFailure {
   code: RunFailureCode;
   /** Human label for the task agent (id + type + description when known). */
   agent: string;
+  /** `main`: the board's own main thread failed (M0-G01), not a task agent. */
+  scope?: 'main';
   /** Structured signals that reported it (deduplicated, in arrival order). */
   signals: string[];
 }
+
+const failureSubject = (f: ObservedFailure): string => (f.scope === 'main' ? 'main thread' : `task agent ${f.agent}`);
 
 const MAX_FAILURES_IN_DETAIL = 10;
 
@@ -636,10 +656,12 @@ function classifyTaskAgentError(error: unknown, stopReason?: unknown): RunFailur
 }
 
 /**
- * Every task-agent (subagent) failure observed during one SDK run (EC1 D1).
- * Keyed by task-agent id (the CLI's `task_id` == hook `agent_id`), so the hook
- * and the forwarded message for the same agent count once, keeping the most
- * specific reason code. Any entry fails the run (see {@link applyRunFailures}).
+ * Every task-agent (subagent) failure observed during one SDK run (EC1 D1),
+ * plus main-thread failures that no `result` reports (M0-G01). Keyed by
+ * task-agent id (the CLI's `task_id` == hook `agent_id`) or by a main-thread
+ * failure key, so the hook and the stream message for the same failure count
+ * once, keeping the most specific reason code. Any entry fails the run (see
+ * {@link applyRunFailures}).
  */
 export class RunFailureLedger {
   private readonly byKey = new Map<string, ObservedFailure>();
@@ -653,7 +675,14 @@ export class RunFailureLedger {
     const code = FAILURE_PRIORITY[f.code] > FAILURE_PRIORITY[prev.code] ? f.code : prev.code;
     const signals = [...prev.signals];
     for (const s of f.signals) if (!signals.includes(s)) signals.push(s);
-    this.byKey.set(key, { code, agent: prev.agent, signals });
+    const merged: ObservedFailure = { code, agent: prev.agent, signals };
+    if (prev.scope) merged.scope = prev.scope;
+    this.byKey.set(key, merged);
+  }
+
+  /** Drop an entry another signal already reports (an error `result`). */
+  delete(key: string): void {
+    this.byKey.delete(key);
   }
 
   list(): ObservedFailure[] {
@@ -662,6 +691,14 @@ export class RunFailureLedger {
 
   get size(): number {
     return this.byKey.size;
+  }
+
+  /** Who failed, for "… also failed" details. */
+  subjects(): string {
+    const all = this.list();
+    const main = all.some((f) => f.scope === 'main');
+    const task = all.some((f) => f.scope !== 'main');
+    return main && task ? 'main thread and task agents' : main ? 'main thread' : 'task agents';
   }
 
   toReason(boardId: string): { code: RunFailureCode; message: string; detail: string } {
@@ -674,13 +711,12 @@ export class RunFailureLedger {
     };
     const shown = all
       .slice(0, MAX_FAILURES_IN_DETAIL)
-      .map((f) => `${f.code} [task agent ${f.agent}]: ${f.signals.join('; ')}`);
+      .map((f) => `${f.code} [${failureSubject(f)}]: ${f.signals.join('; ')}`);
     if (all.length > shown.length) shown.push(`…and ${all.length - shown.length} more`);
+    const count = all.every((f) => f.scope !== 'main') ? `${all.length} task agents failed` : `${all.length} failures`;
     return {
       code: first.code,
-      message:
-        `Board ${boardId} task agent ${first.agent} ${what[first.code]}` +
-        (all.length > 1 ? ` (${all.length} task agents failed).` : '.'),
+      message: `Board ${boardId} ${failureSubject(first)} ${what[first.code]}` + (all.length > 1 ? ` (${count}).` : '.'),
       detail: shown.join(' | '),
     };
   }
@@ -731,14 +767,25 @@ interface MainTurn {
   content: number;
   /** Indexes of streamed content blocks started but never stopped. */
   openBlocks: Set<number>;
-  /** tool_use ids of this turn's closed (forwarded) tool_use blocks. */
+  /** tool_use ids of this turn's closed (forwarded) tool_use blocks — streamed
+   * or non-streamed (M0-G02). */
   toolUseIds: Set<string>;
   /** The CLI returned a main-thread tool_result for one of `toolUseIds`. */
+  ranTools: boolean;
+  /** …and at least one of them was not `is_error` (M0-G03): a call the CLI
+   * rejected (invalid input, unknown tool, denial) proves nothing about the
+   * rest of a cut turn. */
   executed: boolean;
   /** A new main-thread API request began (`system/status: requesting`) after
    * this turn's `message_start` — the turn can no longer be completed by the
    * non-streaming fallback of its own request. */
   requestAfter: boolean;
+  /** A new segment began (`system/init`, e.g. a background-task wake-up)
+   * after this turn: the CLI's own query loop ended without continuing it. */
+  segmentAfter: boolean;
+  /** Ledger key of a main-thread terminal failure (synthetic error message)
+   * the CLI reported for this turn's own request (M0-G01). */
+  failureKey?: string;
   /** `message_start`'s own stop_reason (null from the real API). The CLI copies
    * it into the turn's streamed assistant messages (verified live,
    * `t_startStopEndTrunc`), so it is never a completion signal. */
@@ -758,22 +805,34 @@ function newMainTurn(
     content: 0,
     openBlocks: new Set(),
     toolUseIds: new Set(),
+    ranTools: false,
     executed: false,
     requestAfter: false,
+    segmentAfter: false,
     startStop,
   };
 }
 
 const stopReasonOf = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
 
+function addToolUseIds(turn: MainTurn, content: unknown): void {
+  if (!Array.isArray(content)) return;
+  for (const b of content as unknown[]) {
+    const block = asRecord(b);
+    if (block?.type === 'tool_use' && typeof block.id === 'string') turn.toolUseIds.add(block.id);
+  }
+}
+
 /**
  * Why a main-thread turn is truncated (OQ-20), or undefined when complete.
  * A turn is complete when it got a stop reason with every streamed content
  * block closed, or — lacking a stop reason — when every block it opened was
- * closed and the CLI executed one of its tool_use blocks (the CLI accepted
- * the turn and continued; verified live, `t_toolBlockCut`). A block left open
- * means content was lost even if an earlier tool ran (`t_twoToolsCutMid1`: the
- * CLI ran tool #0 and silently dropped the half-streamed tool #1).
+ * closed and the CLI executed one of its tool_use blocks without error (the
+ * CLI accepted the turn and continued; verified live, `t_toolBlockCut`,
+ * `z_nsToolNullStop` for a non-streamed turn). A block left open means
+ * content was lost even if an earlier tool ran (`t_twoToolsCutMid1`: the CLI
+ * ran tool #0 and silently dropped the half-streamed tool #1). A tool_use the
+ * CLI rejected with an `is_error` result (`x_invalidToolCut`) is no evidence.
  */
 function truncationOf(t: MainTurn): string | undefined {
   const open = t.openBlocks.size;
@@ -790,6 +849,38 @@ function truncationOf(t: MainTurn): string | undefined {
     return `ended (stop_reason ${JSON.stringify(t.stopReason)}) with ${openNote}`;
   }
   return undefined;
+}
+
+/**
+ * A superseded main-thread turn that got a stop reason but did not end
+ * normally (OQ-20, M0-G01), or undefined. Judged only after
+ * {@link truncationOf} found the turn complete:
+ *
+ *   - `end_turn` / `stop_sequence` ({@link isNormalStopReason}): normal.
+ *   - `tool_use`: normal when the CLI returned a tool_result (error or not)
+ *     for one of the turn's tool_use blocks, or the turn had none (nothing to
+ *     run; the CLI simply continued). A tool_use turn whose tools never ran
+ *     was abandoned → `executor_error`.
+ *   - `refusal` → `model_refused`.
+ *   - anything else (`max_tokens`, `pause_turn`,
+ *     `model_context_window_exceeded`, unknown): normal only when the CLI
+ *     continued it inside the same segment (its max_tokens recovery; verified
+ *     live, `mainmaxtok`, `m_bgMidMaxTokAll` turns 1–3). Superseded across a
+ *     segment boundary (a background wake-up) the CLI never recovered it →
+ *     `executor_error` (`m_bgMidPause`). A recovery the CLI gives up on is
+ *     also reported by its synthetic error message (`max_output_tokens`).
+ */
+function abnormalStopOf(t: MainTurn): { code: RunFailureCode; why: string } | undefined {
+  const stop = t.stopReason;
+  if (stop === null || isNormalStopReason(stop)) return undefined;
+  const tag = `stop_reason ${JSON.stringify(stop)}`;
+  if (stop === 'tool_use') {
+    if (t.ranTools || t.toolUseIds.size === 0) return undefined;
+    return { code: 'executor_error', why: `ended with ${tag} but none of its tool calls ran` };
+  }
+  if (stop === 'refusal') return { code: 'model_refused', why: `was refused (${tag})` };
+  if (!t.segmentAfter) return undefined;
+  return { code: 'executor_error', why: `ended with ${tag} and the CLI did not continue it before the next segment` };
 }
 
 const MAX_TRUNCATIONS_IN_DETAIL = 10;
@@ -837,6 +928,16 @@ export class RunStreamObserver {
   private mainTurn: MainTurn | null = null;
   /** Main-thread `stream_event`s seen, i.e. partial messages are flowing. */
   private streamEvents = false;
+  /** Main-thread terminal failures reported by synthetic error messages and
+   * by `StopFailure` hooks so far (M0-G01). The CLI reports each one once by
+   * each signal, in order, so the n-th of either shares one ledger key. */
+  private mainErrorMessages = 0;
+  private mainStopFailures = 0;
+  /** Main-thread failure keys recorded in the current segment; dropped when
+   * the segment's own `result` reports an error (it already carries it). */
+  private readonly segmentMainKeys = new Set<string>();
+  /** Turns without a message id judged abnormal (unique ledger keys). */
+  private anonTurns = 0;
 
   constructor(
     private readonly policy: Pick<ExecutionPolicy, 'allowedTools' | 'mcpServers'>,
@@ -884,6 +985,75 @@ export class RunStreamObserver {
     else if (msg.type === 'assistant') this.observeAssistant(msg);
     else if (msg.type === 'user') this.observeUser(msg);
     else if (msg.type === 'stream_event') this.observeStreamEvent(msg);
+    else if (msg.type === 'result') this.observeResult(msg);
+  }
+
+  /**
+   * A main-thread `StopFailure` hook call (no `agent_id`): the CLI gave up on
+   * a main-thread request (M0-G01). Recorded whether or not a `result`
+   * follows; see {@link observeResult} for the dedupe.
+   */
+  recordMainStopFailure(error: unknown, lastAssistantMessage: unknown): void {
+    const code = classifyTaskAgentError(error);
+    const signals = [`StopFailure error=${describeValue(error)}`];
+    const ex = code === 'provider_error' ? excerpt(lastAssistantMessage) : undefined;
+    if (ex) signals.push(`cli: ${ex}`);
+    this.recordMain(`main:failure#${++this.mainStopFailures}`, code, signals);
+  }
+
+  private recordMain(key: string, code: RunFailureCode, signals: string[]): void {
+    this.failures.record(key, { code, agent: 'main thread', scope: 'main', signals });
+    this.segmentMainKeys.add(key);
+  }
+
+  /**
+   * A `result` that itself reports a failure (error subtype, `is_error`, an
+   * API error status, an abnormal/missing stop reason or terminal reason) is
+   * always mapped non-success, and a non-success result is never overridden
+   * by a later success; the main-thread failures of its segment are then
+   * already reported and are dropped so the reason is not doubled. After a
+   * clean result they stay: a later segment cannot un-fail them.
+   */
+  private observeResult(msg: Record<string, unknown>): void {
+    const tr = msg.terminal_reason;
+    const reportsFailure =
+      msg.subtype !== 'success' ||
+      msg.is_error !== false ||
+      (msg.api_error_status !== undefined && msg.api_error_status !== null) ||
+      !isNormalStopReason(msg.stop_reason) ||
+      (tr !== undefined && tr !== 'completed');
+    if (reportsFailure) for (const key of this.segmentMainKeys) this.failures.delete(key);
+    this.segmentMainKeys.clear();
+  }
+
+  /** A main-thread assistant message carrying the typed `error` field: the
+   * CLI's synthetic terminal error message (M0-G01). */
+  private observeMainError(msg: Record<string, unknown>, message: Record<string, unknown> | undefined): void {
+    const error = msg.error;
+    if (error === undefined || error === null) return;
+    const key = `main:failure#${++this.mainErrorMessages}`;
+    // The failed request's own streamed turn (e.g. a refusal, or the last of
+    // the CLI's max_tokens recoveries) shares the key when it is judged later.
+    const turn = this.mainTurn;
+    if (turn && !turn.requestAfter && turn.failureKey === undefined) turn.failureKey = key;
+    const stopReason = message?.stop_reason;
+    const signals = [
+      [
+        'assistant',
+        `error=${describeValue(error)}`,
+        typeof stopReason === 'string' ? `stop_reason=${stopReason}` : '',
+        message?.model === '<synthetic>' ? 'model=<synthetic>' : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+    ];
+    if (message?.model === '<synthetic>') {
+      const content = Array.isArray(message.content) ? (message.content as unknown[]) : [];
+      const text = content.map((b) => asRecord(b)).find((b) => b?.type === 'text' && typeof b.text === 'string')?.text;
+      const ex = excerpt(text);
+      if (ex) signals.push(`cli: ${ex}`);
+    }
+    this.recordMain(key, classifyTaskAgentError(error, stopReason), signals);
   }
 
   /**
@@ -905,12 +1075,27 @@ export class RunStreamObserver {
    * Judge the tracked main-thread turn now that it is superseded by `next`
    * (OQ-20). Only a turn's own non-streaming fallback may replace it without
    * a stop reason; that case never reaches here (see observeMainAssistant).
+   * A truncated turn goes to the truncation ledger; a complete turn that
+   * ended abnormally (see {@link abnormalStopOf}) to the failure ledger.
    */
   private supersede(next: string): void {
     const turn = this.mainTurn;
-    const why = turn ? truncationOf(turn) : undefined;
-    if (turn && why) {
-      this.truncations.record(`main-thread turn ${turn.id ?? '(no id)'} ${why}, superseded by ${next}`);
+    if (!turn) return;
+    const label = `main-thread turn ${turn.id ?? '(no id)'}`;
+    const why = truncationOf(turn);
+    if (why) {
+      this.truncations.record(`${label} ${why}, superseded by ${next}`);
+      return;
+    }
+    const abnormal = abnormalStopOf(turn);
+    if (abnormal) {
+      const key = turn.failureKey ?? `main:turn:${turn.id ?? `#${++this.anonTurns}`}`;
+      this.failures.record(key, {
+        code: abnormal.code,
+        agent: 'main thread',
+        scope: 'main',
+        signals: [`${label} ${abnormal.why}, superseded by ${next}`],
+      });
     }
   }
 
@@ -966,9 +1151,10 @@ export class RunStreamObserver {
    * right after the dropped stream, with no `system/status: requesting` in
    * between, under a new id or the same one): it completes that turn with its
    * own `stop_reason` (D2). If a new API request began since the tracked
-   * turn's `message_start`, that turn was abandoned and is judged first. The
-   * CLI's `<synthetic>` error messages are left to the result mapping (they
-   * come with an `is_error` result).
+   * turn's `message_start`, that turn was abandoned and is judged first. A
+   * non-streamed turn's tool_use ids are tracked like a streamed turn's
+   * (M0-G02). The CLI's `<synthetic>` error messages are not turns; the ones
+   * carrying `error` are recorded by {@link observeMainError}.
    */
   private observeMainAssistant(message: Record<string, unknown> | undefined): void {
     if (!this.streamEvents || !message || message.model === '<synthetic>') return;
@@ -977,17 +1163,20 @@ export class RunStreamObserver {
     const turn = this.mainTurn;
     if (turn?.source === 'stream' && id === turn.id && (stop === null || stop === turn.startStop)) {
       turn.content++;
-      const content = Array.isArray(message.content) ? (message.content as unknown[]) : [];
-      for (const b of content) {
-        const block = asRecord(b);
-        if (block?.type === 'tool_use' && typeof block.id === 'string') turn.toolUseIds.add(block.id);
-      }
+      addToolUseIds(turn, message.content);
+      return;
+    }
+    // Another content message of the same non-streamed response.
+    if (turn?.source === 'non-streamed' && id !== undefined && id === turn.id && !turn.requestAfter && stop === turn.stopReason) {
+      turn.content++;
+      addToolUseIds(turn, message.content);
       return;
     }
     if (turn?.requestAfter) {
       this.supersede(`non-streamed main-thread message ${id ?? '(no id)'} of a later request`);
     }
     this.mainTurn = newMainTurn(id, 'non-streamed', stop);
+    addToolUseIds(this.mainTurn, message.content);
   }
 
   private observeSystem(msg: Record<string, unknown>): void {
@@ -1001,6 +1190,10 @@ export class RunStreamObserver {
         return;
       }
       case 'init': {
+        // CLI 2.1.162 starts every segment (the first one and each
+        // background-task wake-up) with `system/init`.
+        if (this.mainTurn) this.mainTurn.segmentAfter = true;
+        this.segmentMainKeys.clear();
         if (Array.isArray(msg.tools)) {
           this.offered = new Set(msg.tools.filter((t): t is string => typeof t === 'string').map(canonicalToolName));
         }
@@ -1068,10 +1261,12 @@ export class RunStreamObserver {
         this.toolNames.set(block.id, block.name);
       }
     }
-    // Task-agent terminal failure (signal 2). Main-thread assistant errors are
-    // covered by the result message mapping and are not recorded here.
+    // Task-agent terminal failure (signal 2). A main-thread terminal error is
+    // recorded too (M0-G01): no `result` follows it inside a segment that a
+    // background task keeps open.
     const parent = msg.parent_tool_use_id;
     if (typeof parent !== 'string' || parent.length === 0) {
+      this.observeMainError(msg, message);
       this.observeMainAssistant(message);
       return;
     }
@@ -1106,10 +1301,12 @@ export class RunStreamObserver {
     for (const b of content) {
       const block = asRecord(b);
       if (block?.type !== 'tool_result') continue;
-      // OQ-20: the CLI executed a tool_use of the tracked main-thread turn.
+      // OQ-20: the CLI ran a tool_use of the tracked main-thread turn; only a
+      // non-error result proves it executed (M0-G03).
       const toolUseId = block.tool_use_id;
       if (mainThread && turn && typeof toolUseId === 'string' && turn.toolUseIds.has(toolUseId)) {
-        turn.executed = true;
+        turn.ranTools = true;
+        if (block.is_error !== true) turn.executed = true;
       }
       if (block.is_error !== true) continue;
       const id = typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined;
@@ -1154,9 +1351,11 @@ export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
     try {
       const rec = input as unknown as Record<string, unknown>;
       const agentId = rec.agent_id;
-      // Main-thread StopFailure also ends the run with an error result, which
-      // mapSdkResultMessage handles; only task agents are recorded here.
-      if (typeof agentId === 'string' && agentId.length > 0) {
+      if (typeof agentId !== 'string' || agentId.length === 0) {
+        // Main thread (M0-G01): no error `result` follows inside a segment a
+        // background task keeps open; deduped against one that does.
+        observer.recordMainStopFailure(rec.error, rec.last_assistant_message);
+      } else {
         const { key, label } = observer.agentKey(agentId);
         const code = classifyTaskAgentError(rec.error);
         const signals = [`StopFailure error=${describeValue(rec.error)}`];
@@ -1192,7 +1391,7 @@ function applyRunFailures(base: SdkBoardResult, failures: RunFailureLedger, boar
       ...base,
       reason: {
         ...base.reason,
-        detail: `${base.reason.detail ?? base.reason.message} | task agents also failed: ${reason.detail}`,
+        detail: `${base.reason.detail ?? base.reason.message} | ${failures.subjects()} also failed: ${reason.detail}`,
       },
     };
     return out;
