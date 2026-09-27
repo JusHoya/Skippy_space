@@ -1034,7 +1034,7 @@ test('F5 skip reasons are reported per path, in byte order', () => {
   const repo = makeRepo();
   try {
     const g = repo.git;
-    write(repo.dir, '.gitattributes', 'vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\n');
+    write(repo.dir, '.gitattributes', 'vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\nvault/*.txt working-tree-encoding=UTF-16LE\n');
     g('config', 'filter.rot.clean', 'tr A-Za-z N-ZA-Mn-za-m');
     g('config', 'filter.rot.smudge', 'tr A-Za-z N-ZA-Mn-za-m');
     // Non-deterministic clean filter (appends its own PID): refused like any
@@ -1053,6 +1053,7 @@ test('F5 skip reasons are reported per path, in byte order', () => {
     g('add', 'vault/mine.md');
     write(repo.dir, 'vault/.env', 'K=1\n');
     write(repo.dir, 'vault/leak.md', 'AKIAABCDEFGHIJKLMNOP\n');
+    write(repo.dir, 'vault/enc.txt', 'aws AKIAABCDEFGHIJKLMNOP ok\n'); // stored as CJK text without the rule
     write(repo.dir, 'vault/rot/leak.md', 'AKIAABCDEFGHIJKLMNOP\n');
     write(repo.dir, 'vault/pid/p.md', 'plain\n');
     write(repo.dir, 'vault/ptr.bin', LFS_POINTER);
@@ -1065,6 +1066,7 @@ test('F5 skip reasons are reported per path, in byte order', () => {
     const want = [
       ['vault/.env', 'secret-filename'],
       ['vault/big.bin', 'too-large-to-scan'],
+      ['vault/enc.txt', 'encoded-path'],
       ['vault/flag.md', 'flagged'],
       ['vault/leak.md', 'secret-content'],
       ['vault/mine.md', 'user-staged'],
@@ -1699,3 +1701,215 @@ test('EC5-R5-7 stale skippy-ac temp dirs are swept (exact name, real dirs, never
     }
   }
 });
+
+// =========================================================================
+// M0-G12 / M0-G15 (OQ-19): a `working-tree-encoding` is a clean filter in all
+// but name. Mirrors the Rust twin's `g12_regression_tests` case for case.
+// The smuggling and stall cases leak / fail on 10f6654. Fixtures live on the
+// canonical long temp path (the Windows runner's TEMP is an 8.3 alias).
+// =========================================================================
+
+const G12_KEY = 'aws AKIAABCDEFGHIJKLMNOP ok\n'; // 26 bytes: an even count
+
+function g12Repo() {
+  const dir = mkdtempSync(join(realpathSync.native(tmpdir()), 'skippy-g12-'));
+  const q = (...args) => execFileSync('git', ['-C', dir, '-c', 'core.quotepath=false', ...args], { encoding: 'utf8', stdio: 'pipe' });
+  q('init', '-q', '-b', 'main');
+  q('config', 'user.name', 'Skippy Test');
+  q('config', 'user.email', 'skippy-test@example.invalid');
+  q('config', 'commit.gpgsign', 'false');
+  q('config', 'core.hooksPath', '.no-hooks');
+  return {
+    dir,
+    q,
+    write: (rel, contents) => write(dir, rel, contents),
+    commitAll: (msg) => {
+      q('add', '-A', '.');
+      q('commit', '-q', '-m', msg);
+    },
+    headTree: () => q('ls-tree', '-r', '-z', '--name-only', 'HEAD').split('\0').filter(Boolean),
+    show: (spec) => q('show', spec).trim(),
+    status: () => q('status', '--porcelain', '-uno').trim(),
+  };
+}
+
+function withG12Repo(fn) {
+  const r = g12Repo();
+  try {
+    fn(r);
+  } finally {
+    rmSync(r.dir, { recursive: true, force: true });
+  }
+}
+
+/** Every file of a checkout (skipping .git), as latin1 text. */
+function checkoutText(dir) {
+  const out = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === '.git') continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...checkoutText(p));
+    else out.push(readFileSync(p).toString('latin1'));
+  }
+  return out;
+}
+
+for (const enc of ['UTF-16LE', 'UTF-16BE']) {
+  test(`M0-G12 an ASCII secret declared ${enc} is refused as encoded-path; it never reaches HEAD or a fresh clone`, () =>
+    withG12Repo((r) => {
+      r.write('vault/n.md', 'x\n');
+      r.commitAll('init');
+      r.write('vault/.gitattributes', `*.txt working-tree-encoding=${enc}\n`);
+      r.write('vault/note.txt', G12_KEY); // git would store it as CJK text: no AKIA, no NUL
+      r.write('vault/n.md', 'y\n');
+      const res = runAutocommit(r.dir);
+      // The leak itself first: a fresh clone (file://, reachable objects only).
+      const clone = mkdtempSync(join(realpathSync.native(tmpdir()), 'skippy-g12-clone-'));
+      try {
+        execFileSync('git', ['clone', '-q', pathToFileURL(r.dir).href, join(clone, 'c')], { stdio: 'pipe' });
+        assert.ok(!checkoutText(join(clone, 'c')).some((t) => t.includes('AKIA')), 'a fresh clone checks the secret out');
+        const objects = execFileSync('git', ['-C', join(clone, 'c'), 'rev-list', '--objects', '--all'], { encoding: 'utf8' });
+        assert.ok(!objects.includes('vault/note.txt'), 'history of a fresh clone names the encoded note');
+      } finally {
+        rmSync(clone, { recursive: true, force: true });
+      }
+      assert.throws(() => r.q('cat-file', '--filters', 'HEAD:vault/note.txt'), 'the encoded note reached HEAD');
+      assert.deepEqual(res.skippedDetail, [{ path: 'vault/note.txt', reason: 'encoded-path' }]);
+      assert.equal(res.status, 'committed');
+      assert.deepEqual(r.headTree(), ['vault/.gitattributes', 'vault/n.md']);
+      assert.equal(r.show('HEAD:vault/n.md'), 'y', 'an unrelated note must still commit');
+      const again = runAutocommit(r.dir);
+      assert.equal(again.status, 'noop');
+      assert.deepEqual(again.skippedDetail, [{ path: 'vault/note.txt', reason: 'encoded-path' }]);
+    }));
+}
+
+test('M0-G15 an unconvertible working-tree-encoding (UTF-32, valueless) or a failing required filter excludes only its own paths; other notes still commit', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.q('config', 'filter.bad.clean', 'exit 1');
+    r.q('config', 'filter.bad.smudge', 'cat');
+    r.q('config', 'filter.bad.required', 'true');
+    r.write('vault/n.md', 'x\n');
+    r.write('vault/gone.md', 'bye\n');
+    r.write('vault/old.u32', 'abc\n'); // committed before any rule: unchanged, now unconvertible
+    r.commitAll('init');
+    const oldBlob = r.q('rev-parse', 'HEAD:vault/old.u32').trim();
+    r.write(
+      'vault/.gitattributes',
+      [
+        '*.u32 working-tree-encoding=UTF-32', // BOM required: git dies on the add
+        '*.le working-tree-encoding=UTF-32LE', // 6 bytes: not a UTF-32 sequence
+        '*.set working-tree-encoding', // valueless: git dies ("true/false ...")
+        '*.off -working-tree-encoding', // unset: no conversion at all
+        '*.bad filter=bad',
+        '',
+      ].join('\n'),
+    );
+    r.write('vault/a.u32', 'abc\n');
+    r.write('vault/b.le', 'abcde\n');
+    r.write('vault/c.set', 'plain\n');
+    r.write('vault/d.off', 'plain note under an unset rule\n');
+    r.write('vault/e.bad', 'clean filter fails\n');
+    r.write('vault/n.md', 'y\n');
+    r.write('vault/new.md', 'the magnificent Skippy approves\n');
+    rmSync(join(r.dir, 'vault/gone.md'));
+    const want = [
+      { path: 'vault/a.u32', reason: 'encoded-path' },
+      { path: 'vault/b.le', reason: 'encoded-path' },
+      { path: 'vault/c.set', reason: 'encoded-path' },
+      { path: 'vault/e.bad', reason: 'filtered-path' },
+      { path: 'vault/old.u32', reason: 'encoded-path' },
+    ];
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, want);
+    assert.deepEqual(r.headTree(), ['vault/.gitattributes', 'vault/d.off', 'vault/n.md', 'vault/new.md', 'vault/old.u32']);
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    assert.equal(r.q('rev-parse', 'HEAD:vault/old.u32').trim(), oldBlob, 'the unconvertible tracked note must be left as HEAD has it');
+    const again = runAutocommit(r.dir);
+    assert.equal(again.status, 'noop');
+    assert.deepEqual(again.skippedDetail, want);
+  }));
+
+test('M0-G15 a sparse checkout plus an unconvertible encoding: in-cone notes commit, out-of-cone paths stay flagged', () =>
+  withG12Repo((r) => {
+    r.write('vault/a/1.md', '1\n');
+    r.write('vault/b/2.md', '2\n');
+    r.commitAll('init');
+    r.q('sparse-checkout', 'set', 'vault/a');
+    r.write('vault/a/.gitattributes', '*.u32 working-tree-encoding=UTF-32\n');
+    r.write('vault/a/[x].u32', 'abc\n'); // glob-like name: excluded literally
+    r.write('vault/a/x.md', 'x\n');
+    r.write('vault/a/1.md', '1b\n');
+    r.write('vault/b/new.md', 'new outside the cone\n');
+    const want = [
+      { path: 'vault/a/[x].u32', reason: 'encoded-path' },
+      { path: 'vault/b/2.md', reason: 'flagged' },
+      { path: 'vault/b/new.md', reason: 'flagged' },
+    ];
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, want);
+    assert.deepEqual(r.headTree(), ['vault/a/.gitattributes', 'vault/a/1.md', 'vault/a/x.md', 'vault/b/2.md']);
+    assert.equal(r.show('HEAD:vault/a/1.md'), '1b');
+    const again = runAutocommit(r.dir);
+    assert.equal(again.status, 'noop');
+    assert.deepEqual(again.skippedDetail, want);
+  }));
+
+test('M0-G12 a legitimate working-tree-encoding rule on a genuinely UTF-16 note is refused too (fail closed); unrelated notes commit', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/.gitattributes', '*.u16 working-tree-encoding=UTF-16\n*.txt working-tree-encoding=UTF-16LE\n*.md8 working-tree-encoding=UTF-8\n');
+    r.write('vault/bom.u16', utf16leWithBom('The magnificent Skippy, in UTF-16 with a BOM\n'));
+    r.write('vault/le.txt', Buffer.from('Monkeys write UTF-16LE without a BOM\n', 'utf16le'));
+    r.write('vault/same.md8', 'declared UTF-8: a no-op for git, refused all the same\n');
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/bom.u16', reason: 'encoded-path' },
+      { path: 'vault/le.txt', reason: 'encoded-path' },
+      { path: 'vault/same.md8', reason: 'encoded-path' },
+    ]);
+    assert.deepEqual(r.headTree(), ['vault/.gitattributes', 'vault/n.md']);
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    assert.equal(r.status(), '');
+  }));
+
+test('M0-G12 a path with both a filter and a working-tree-encoding is filtered-path; notes without either are unaffected', () =>
+  withG12Repo((r) => {
+    r.q('config', 'filter.rot.clean', 'tr A-Za-z N-ZA-Mn-za-m');
+    r.q('config', 'filter.rot.smudge', 'tr A-Za-z N-ZA-Mn-za-m');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/.gitattributes', '*.both filter=rot working-tree-encoding=UTF-16LE\n*.enc working-tree-encoding=UTF-16LE\n');
+    r.write('vault/x.both', G12_KEY);
+    r.write('vault/y.enc', G12_KEY);
+    r.write('vault/z.md', 'plain\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/x.both', reason: 'filtered-path' },
+      { path: 'vault/y.enc', reason: 'encoded-path' },
+    ]);
+    assert.deepEqual(r.headTree(), ['vault/.gitattributes', 'vault/n.md', 'vault/z.md']);
+  }));
+
+test('M0-G12 audit: text/eol/ident are not excluded; the checkout differs from the scanned blob only by CRs before LFs and the $Id$ expansion', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.write('vault/.gitattributes', '*.md text eol=crlf ident\n');
+    r.write('vault/n.md', 'x\r\n');
+    r.commitAll('init');
+    r.write('vault/n.md', 'id $Id: dropped on add $\r\nline two\r\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, []);
+    const blob = r.q('cat-file', '-p', 'HEAD:vault/n.md');
+    assert.equal(blob, 'id $Id$\nline two\n', 'add drops the CRs and collapses $Id: ...$');
+    const oid = r.q('rev-parse', 'HEAD:vault/n.md').trim();
+    assert.equal(r.q('cat-file', '--filters', 'HEAD:vault/n.md'), `id $Id: ${oid} $\r\nline two\r\n`);
+  }));

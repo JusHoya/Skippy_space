@@ -9,7 +9,8 @@
 // its output is handled as raw bytes (a "byte string": one JS char per byte,
 // latin1), so non-ASCII names are never C-quoted, never mangled, and round-
 // trip exactly into pathspec files / `update-index --index-info` stdin.
-// Every git call runs with GIT_LITERAL_PATHSPECS=1 (E5-4) and no user path is
+// Every git call runs with GIT_LITERAL_PATHSPECS=1 (E5-4; the M0-G15 add
+// fallback instead spells `:(literal)` on each entry) and no user path is
 // ever put on a command line (E5-5): per-path input goes through stdin or a
 // NUL-delimited --pathspec-from-file.
 //
@@ -43,7 +44,23 @@
 //      `add` refuses (and fails on) out-of-cone paths; if it fails while
 //      core.sparseCheckout is on, the throwaway index is reset to the seed
 //      and the add is redone with `--sparse`, so a sparse checkout never
-//      fails every tick (out-of-cone paths are then flagged, step 5). The
+//      fails every tick (out-of-cone paths are then flagged, step 5). git
+//      also dies on the whole add for ONE file it cannot convert (M0-G15: a
+//      UTF-32 or BOM-less UTF-16/UTF-32 `working-tree-encoding`, an odd byte
+//      count under UTF-16, an unknown encoding, a valueless
+//      `working-tree-encoding`, a failing required filter). So on any add
+//      failure the tick lists what add would visit (`ls-files --cached
+//      --others --exclude-standard` against the seed index), evaluates
+//      `filter` / `working-tree-encoding` for its present files against the
+//      seed index, and — if any has one (or the checkout is sparse) — resets
+//      to the seed and redoes `add -A [--sparse] -- vault` with each of them
+//      excluded (`:(literal)vault` plus one `:(exclude,literal)<path>` per
+//      file in a NUL-delimited `--pathspec-from-file`: the only git call run
+//      without GIT_LITERAL_PATHSPECS, and every entry is still literal).
+//      The withheld files are candidates excluded as `filtered-path` /
+//      `encoded-path` (step 5); since git cannot tell whether they changed,
+//      they are reported on every tick that needs this fallback. Any other
+//      add failure still fails the tick explicitly. The
 //      throwaway index lives in a fresh private directory in the OS temp dir
 //      (`<tmp>/skippy-ac-<16 hex>/`, D1) — never under the git dir, so a long
 //      repo/worktree path can't push `<index>.lock` past MAX_PATH — and the
@@ -79,6 +96,19 @@
 //                           turn any content into bytes the blob scan cannot
 //                           judge (an LFS pointer, rot13), so filtered paths
 //                           are never autocommitted (OQ-19)
+//        encoded-path       the path has a `working-tree-encoding` attribute
+//                           (any value but unspecified/unset: UTF-16LE,
+//                           UTF-32, even UTF-8 or an empty value) in EITHER
+//                           evaluation, same `check-attr` call and semantics
+//                           as filtered-path (a path with both is
+//                           filtered-path). Re-encoding is a clean filter in
+//                           all but name (M0-G12): ASCII `AKIA...` bytes
+//                           declared UTF-16LE are stored as CJK text holding
+//                           no `AKIA` and no NUL, which no blob view can
+//                           judge, and every checkout or clone turns the blob
+//                           back into the plaintext key. Fail closed: a
+//                           genuinely UTF-16 note under a legitimate rule is
+//                           refused too (the vault is UTF-8 Markdown) (OQ-19)
 //        too-large-to-scan  blob larger than limits.maxScanBytes (64 MiB, D3)
 //                           — never read, fail closed
 //        lfs-pointer        the blob holds a git-lfs pointer version line
@@ -94,14 +124,26 @@
 //                           would contain (`cat-file --batch`, fetched in
 //                           batches of at most maxScanBytes; latin1 and again
 //                           with NULs stripped for UTF-16)
-//      With filtered paths refused, every committed blob is exactly the
-//      scanned blob: the scan needs no proof step. Mode-120000 entries are
-//      scanned the same way (core.symlinks=false: the blob IS the file's
-//      bytes; a real symlink: the blob is the link target). eol/autocrlf,
-//      `working-tree-encoding` and `ident` stay exactly as git applies them:
-//      they are fixed, public transforms (CR/LF, re-encoding of the same
-//      characters, the blob's own id) that cannot turn a clean blob into a
-//      secret on checkout, and the blob they produce is what gets scanned.
+//      With filtered and encoded paths refused, every committed blob is
+//      exactly the scanned blob: the scan needs no proof step. Mode-120000
+//      entries are scanned the same way (core.symlinks=false: the blob IS the
+//      file's bytes; a real symlink: the blob is the link target).
+//      Attribute audit (M0-G12; git's convert.c reads exactly `text`, `eol`,
+//      `crlf`, `ident`, `filter` and `working-tree-encoding`, plus
+//      core.autocrlf / core.eol / core.safecrlf): only `filter` and
+//      `working-tree-encoding` can make the checkout differ from the blob in
+//      anything but line endings, and both are refused. `text`/`eol`/`crlf`/
+//      core.autocrlf only add or drop a CR right before an LF (text=auto
+//      leaves binary and lone-CR files alone), and no shared content pattern
+//      can consume a CR that is followed by an LF, so the blob's verdict is
+//      the checkout's. `ident` only collapses `$Id: ...$` to `$Id$` on add
+//      (dropping bytes, never storing them) and expands `$Id$` to the blob's
+//      own object id on checkout, which the user cannot choose. `diff`,
+//      `merge`, `whitespace`, `encoding` (gitk/gui display), `binary`,
+//      `delta` and `conflict-marker-size` never touch blob content;
+//      `export-subst` / `export-ignore` act on `git archive` only. Those stay
+//      exactly as git applies them, and the blob they produce is what gets
+//      scanned.
 //      Attribute snapshots A1 (before the add) and A2 (after the scans and
 //      both check-attr runs) cover every source git reads: the in-tree
 //      `.gitattributes` at the repo root and anywhere under vault/ (walked
@@ -140,9 +182,10 @@
 // pre-commit hook can never see (or block) this commit. The built-in guard
 // (step 5) is the only line of defense. It scans exactly the committed
 // blobs, and refuses every path whose committed bytes could differ from what
-// the user wrote (filtered-path) or could make `git push` upload something
-// else (lfs-pointer), so neither a clean filter nor git-lfs can smuggle a
-// secret into history.
+// the user wrote or what a checkout writes back (filtered-path,
+// encoded-path) or could make `git push` upload something else
+// (lfs-pointer), so neither a clean filter, a working-tree-encoding nor
+// git-lfs can smuggle a secret into history.
 //
 // Test seam: `runAutocommit(root, now, { onPhase })` calls
 // `onPhase('added')` after step 4's add/write-tree and `onPhase('scanned')`
@@ -170,6 +213,8 @@ const SYNC_RETRY_ATTEMPTS = 3;
 const SYNC_RETRY_DELAY_MS = 20;
 const MAX_GIT_OUTPUT = 1024 * 1024 * 1024;
 const GIT_ENV = { GIT_LITERAL_PATHSPECS: '1' };
+/** The M0-G15 fallback add only: pathspec magic on, every entry `:(literal)`. */
+const MAGIC_PATHSPEC_ENV = { GIT_LITERAL_PATHSPECS: '0', GIT_GLOB_PATHSPECS: '0' };
 const OID_RE = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // --- Secret guard (FR-WIKI-06), shared with the Rust twin ----------------
@@ -450,28 +495,66 @@ function scanBlobsForSecrets(root, oids) {
   return verdicts;
 }
 
+/** A conversion attribute value that is set to anything but "off". */
+const attrIsSet = (v) => v !== 'unspecified' && v !== 'unset';
+
 /**
- * The subset of `paths` with a `filter` attribute set to anything (`set` or
- * any driver name, e.g. `lfs`, configured or not); `unspecified` / `unset`
- * mean no filter. One `check-attr -z --stdin` call, raw byte paths on stdin;
- * `env` selects the index git falls back to for a `.gitattributes` missing
- * from the working tree (the seed index = the pre-add state, or the temp
- * index = the post-add state).
+ * The conversion attributes of `paths` (OQ-19): `filtered`, the subset with a
+ * `filter` attribute set to anything (`set` or any driver name, e.g. `lfs`,
+ * configured or not), and `encoded`, the subset with a
+ * `working-tree-encoding` attribute set to anything (`set`, any encoding
+ * name — even UTF-8, an unknown one or an empty value); `unspecified` /
+ * `unset` mean neither. One `check-attr -z --stdin` call, raw byte paths on
+ * stdin; `env` selects the index git falls back to for a `.gitattributes`
+ * missing from the working tree (the seed index = the pre-add state, or the
+ * temp index = the post-add state).
  */
-function filteredPaths(root, paths, env) {
-  if (paths.length === 0) return new Set();
-  const out = gitRaw(root, ['check-attr', '-z', '--stdin', 'filter'], {
+function conversionAttributes(root, paths, env) {
+  const filtered = new Set();
+  const encoded = new Set();
+  if (paths.length === 0) return { filtered, encoded };
+  const out = gitRaw(root, ['check-attr', '-z', '--stdin', 'filter', 'working-tree-encoding'], {
     env,
     input: Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1'),
   });
   const f = out.toString('latin1').split('\0');
-  if (f.length !== paths.length * 3 + 1 || f[f.length - 1] !== '') throw new Error('check-attr: unexpected output');
-  const filtered = new Set();
-  for (let i = 0; i + 2 < f.length; i += 3) {
-    if (f[i + 1] !== 'filter') throw new Error('check-attr: unexpected output');
-    if (f[i + 2] !== 'unspecified' && f[i + 2] !== 'unset') filtered.add(f[i]);
+  if (f.length !== paths.length * 6 + 1 || f[f.length - 1] !== '') throw new Error('check-attr: unexpected output');
+  for (let i = 0; i + 5 < f.length; i += 6) {
+    if (f[i + 1] !== 'filter' || f[i + 3] !== f[i] || f[i + 4] !== 'working-tree-encoding') {
+      throw new Error('check-attr: unexpected output');
+    }
+    if (attrIsSet(f[i + 2])) filtered.add(f[i]);
+    if (attrIsSet(f[i + 5])) encoded.add(f[i]);
   }
-  return filtered;
+  return { filtered, encoded };
+}
+
+/**
+ * M0-G15 fallback, only after `add -A -- vault` failed: of every path that
+ * add would visit (`ls-files --cached --others --exclude-standard` against
+ * the seed index; a nested repository shows as `dir/`), the ones it must not
+ * be asked to convert — present files (not directories, not deleted from the
+ * working tree) whose pre-add evaluation has a `filter` (`filtered-path`) or
+ * a `working-tree-encoding` (`encoded-path`), as path -> reason. git dies on
+ * the whole add for one file it cannot convert (UTF-32 or a BOM-less
+ * UTF-16/UTF-32 rule, an odd byte count under UTF-16, an unknown encoding, a
+ * valueless `working-tree-encoding`, a failing required filter), so those are
+ * withheld from the redone add.
+ */
+function withheldAddCandidates(root, seedEnv) {
+  const candidates = [
+    ...new Set(splitZ(gitRaw(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', VAULT_PATHSPEC], { env: seedEnv }))),
+  ].sort(byteOrder);
+  const deleted = new Set(splitZ(gitRaw(root, ['ls-files', '-z', '--deleted', '--', VAULT_PATHSPEC], { env: seedEnv })));
+  const files = candidates.filter((p) => !p.endsWith('/') && !deleted.has(p));
+  const { filtered, encoded } = conversionAttributes(root, files, seedEnv);
+  /** @type {Map<string, string>} */
+  const withheld = new Map();
+  for (const p of files) {
+    if (filtered.has(p)) withheld.set(p, 'filtered-path');
+    else if (encoded.has(p)) withheld.set(p, 'encoded-path');
+  }
+  return withheld;
 }
 
 /**
@@ -817,6 +900,7 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
   // git reads as an empty index): the pre-add attribute evaluation uses it.
   const seedIndex = join(tempDir, 'seed-index');
   const env = { GIT_INDEX_FILE: indexFile };
+  const seedEnv = { GIT_INDEX_FILE: seedIndex };
   try {
     const headEntries = treeEntries(root, head);
     const snapshot = realIndexSnapshot(root);
@@ -827,22 +911,41 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
       copyFileSync(indexFile, seedIndex);
     }
     const attrsBefore = attributeSnapshot(root); // A1
+    /** @type {Map<string, string>} path -> reason, withheld from the add (M0-G15). */
+    let withheld = new Map();
     // -A so deletions are captured; .gitignore respected; vault/ only.
     try {
       git(root, ['add', '-A', '--', VAULT_PATHSPEC], { env });
     } catch (e) {
       // A sparse checkout makes `add` refuse (and fail on) out-of-cone
-      // paths: redo it from the seed with --sparse; those paths are then
-      // flagged below, so the tick never fails for that reason.
-      if (!sparseCheckoutEnabled(root)) throw e;
+      // paths, and a file git cannot convert (M0-G15) makes it die: redo it
+      // from the seed, with --sparse (those paths are then flagged below)
+      // and without the filtered / encoded files, so the tick never fails
+      // for either reason.
+      const sparse = sparseCheckoutEnabled(root);
+      withheld = withheldAddCandidates(root, seedEnv);
+      if (!sparse && withheld.size === 0) throw e;
       if (head) copyFileSync(seedIndex, indexFile);
       else rmSync(indexFile, { force: true });
-      git(root, ['add', '-A', '--sparse', '--', VAULT_PATHSPEC], { env });
+      const sparseArg = sparse ? ['--sparse'] : [];
+      if (withheld.size === 0) {
+        git(root, ['add', '-A', ...sparseArg, '--', VAULT_PATHSPEC], { env });
+      } else {
+        // `add -A -- vault` minus each withheld file: the one call that runs
+        // with pathspec magic, and every pathspec is still `literal`.
+        const specs = [`:(literal)${VAULT_PATHSPEC}`, ...[...withheld.keys()].map((p) => `:(exclude,literal)${p}`)];
+        const specFile = join(tempDir, 'pathspec');
+        writeFileSync(specFile, Buffer.from(specs.map((s) => `${s}\0`).join(''), 'latin1'));
+        git(root, ['add', '-A', ...sparseArg, `--pathspec-from-file=${specFile}`, '--pathspec-file-nul'], {
+          env: { ...env, ...MAGIC_PATHSPEC_ENV },
+        });
+      }
     }
     const preliminaryTree = git(root, ['write-tree'], { env });
     onPhase?.('added');
     const prelimEntries = treeEntries(root, preliminaryTree);
-    const allChanged = differingPaths(headEntries, prelimEntries);
+    // Withheld paths are candidates too: they are excluded (and reported) below.
+    const allChanged = [...new Set([...differingPaths(headEntries, prelimEntries), ...withheld.keys()])].sort(byteOrder);
 
     const modeOf = (entries, p) => (entries.has(p) ? entries.get(p).split(' ')[0] : null);
     const blobOf = (p) => prelimEntries.get(p).split(' ')[1];
@@ -857,14 +960,20 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
       else if (matchesSecretFilename(p)) early.set(p, 'secret-filename');
     }
 
-    // filtered-path: a `filter` attribute in the pre-add (seed index) OR the
-    // post-add (temp index) evaluation. Deletions carry no blob.
+    // filtered-path / encoded-path: a `filter` / `working-tree-encoding`
+    // attribute in the pre-add (seed index) OR the post-add (temp index)
+    // evaluation. Deletions carry no blob. Withheld paths keep the reason
+    // the fallback found.
     /** @type {Map<string, string>} */
     const late = new Map();
-    const present = allChanged.filter((p) => !early.has(p) && prelimEntries.has(p));
-    const filteredBefore = filteredPaths(root, present, { GIT_INDEX_FILE: seedIndex });
-    const filteredAfter = filteredPaths(root, present, env);
-    for (const p of present) if (filteredBefore.has(p) || filteredAfter.has(p)) late.set(p, 'filtered-path');
+    for (const [p, r] of withheld) if (!early.has(p)) late.set(p, r);
+    const present = allChanged.filter((p) => !early.has(p) && !withheld.has(p) && prelimEntries.has(p));
+    const before = conversionAttributes(root, present, seedEnv);
+    const after = conversionAttributes(root, present, env);
+    for (const p of present) {
+      if (before.filtered.has(p) || after.filtered.has(p)) late.set(p, 'filtered-path');
+      else if (before.encoded.has(p) || after.encoded.has(p)) late.set(p, 'encoded-path');
+    }
 
     // The exact blobs the commit would contain: size cap, LFS pointer, secrets.
     const toScan = present.filter((p) => !late.has(p));

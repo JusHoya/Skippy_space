@@ -12,7 +12,8 @@
 //!
 //! Every path-listing git command runs with `-z` and its output is handled
 //! as raw bytes, so non-ASCII names are never C-quoted or mangled and round-
-//! trip exactly. Every git call runs with `GIT_LITERAL_PATHSPECS=1`, and no
+//! trip exactly. Every git call runs with `GIT_LITERAL_PATHSPECS=1` (the
+//! M0-G15 add fallback instead spells `:(literal)` on each entry), and no
 //! user path is ever put on a command line: per-path input goes through
 //! stdin (`update-index -z --index-info`, `cat-file --batch`) or a NUL-
 //! delimited `--pathspec-from-file`.
@@ -50,7 +51,24 @@
 //!    checkout `add` refuses (and fails on) out-of-cone paths; if it fails
 //!    while `core.sparseCheckout` is on, the throwaway index is reset to the
 //!    seed and the add is redone with `--sparse`, so a sparse checkout never
-//!    fails every tick (out-of-cone paths are then flagged, step 5). The
+//!    fails every tick (out-of-cone paths are then flagged, step 5). git
+//!    also dies on the whole add for ONE file it cannot convert (M0-G15: a
+//!    UTF-32 or BOM-less UTF-16/UTF-32 `working-tree-encoding`, an odd byte
+//!    count under UTF-16, an unknown encoding, a valueless
+//!    `working-tree-encoding`, a failing required filter). So on any add
+//!    failure the tick lists what add would visit (`ls-files --cached
+//!    --others --exclude-standard` against the seed index), evaluates
+//!    `filter` / `working-tree-encoding` for its present files against the
+//!    seed index ([`withheld_add_candidates`]), and — if any has one (or the
+//!    checkout is sparse) — resets to the seed and redoes `add -A [--sparse]
+//!    -- vault` with each of them excluded (`:(literal)vault` plus one
+//!    `:(exclude,literal)<path>` per file in a NUL-delimited
+//!    `--pathspec-from-file`: the only git call run without
+//!    `GIT_LITERAL_PATHSPECS`, and every entry is still literal). The
+//!    withheld files are candidates excluded
+//!    as `filtered-path` / `encoded-path` (step 5); since git cannot tell
+//!    whether they changed, they are reported on every tick that needs this
+//!    fallback. Any other add failure still fails the tick explicitly. The
 //!    throwaway index lives in a fresh private directory in the OS temp dir
 //!    (`<tmp>/skippy-ac-<16 hex>/`, D1) — never under the git dir, so a long
 //!    repo/worktree path can't push `<index>.lock` past MAX_PATH — and the
@@ -83,6 +101,16 @@
 //!        clean filter; a filter can turn any content into bytes the blob
 //!        scan cannot judge (an LFS pointer, rot13), so filtered paths are
 //!        never autocommitted (OQ-19);
+//!      * `encoded-path` — the path has a `working-tree-encoding` attribute
+//!        (any value but unspecified/unset: UTF-16LE, UTF-32, even UTF-8 or
+//!        an empty value) in EITHER evaluation, same `check-attr` call and
+//!        semantics as `filtered-path` (a path with both is
+//!        `filtered-path`). Re-encoding is a clean filter in all but name
+//!        (M0-G12): ASCII `AKIA...` bytes declared UTF-16LE are stored as CJK
+//!        text holding no `AKIA` and no NUL, which no blob view can judge,
+//!        and every checkout or clone turns the blob back into the plaintext
+//!        key. Fail closed: a genuinely UTF-16 note under a legitimate rule
+//!        is refused too (the vault is UTF-8 Markdown) (OQ-19);
 //!      * `too-large-to-scan` — blob larger than `limits.maxScanBytes`
 //!        (64 MiB, D3), never read, fail closed;
 //!      * `lfs-pointer` — the blob holds a git-lfs pointer version line
@@ -97,14 +125,27 @@
 //!        most `maxScanBytes`; one char per byte and again with NULs stripped
 //!        for UTF-16).
 //!
-//!    With filtered paths refused, every committed blob is exactly the
-//!    scanned blob: the scan needs no proof step. Mode-120000 entries are
-//!    scanned the same way (`core.symlinks=false`: the blob IS the file's
-//!    bytes; a real symlink: the blob is the link target). eol/autocrlf,
-//!    `working-tree-encoding` and `ident` stay exactly as git applies them:
-//!    they are fixed, public transforms (CR/LF, re-encoding of the same
-//!    characters, the blob's own id) that cannot turn a clean blob into a
-//!    secret on checkout, and the blob they produce is what gets scanned.
+//!    With filtered and encoded paths refused, every committed blob is
+//!    exactly the scanned blob: the scan needs no proof step. Mode-120000
+//!    entries are scanned the same way (`core.symlinks=false`: the blob IS
+//!    the file's bytes; a real symlink: the blob is the link target).
+//!
+//!    Attribute audit (M0-G12; git's `convert.c` reads exactly `text`, `eol`,
+//!    `crlf`, `ident`, `filter` and `working-tree-encoding`, plus
+//!    `core.autocrlf` / `core.eol` / `core.safecrlf`): only `filter` and
+//!    `working-tree-encoding` can make the checkout differ from the blob in
+//!    anything but line endings, and both are refused. `text`/`eol`/`crlf`/
+//!    `core.autocrlf` only add or drop a CR right before an LF (`text=auto`
+//!    leaves binary and lone-CR files alone), and no shared content pattern
+//!    can consume a CR that is followed by an LF, so the blob's verdict is
+//!    the checkout's. `ident` only collapses `$Id: ...$` to `$Id$` on add
+//!    (dropping bytes, never storing them) and expands `$Id$` to the blob's
+//!    own object id on checkout, which the user cannot choose. `diff`,
+//!    `merge`, `whitespace`, `encoding` (gitk/gui display), `binary`,
+//!    `delta` and `conflict-marker-size` never touch blob content;
+//!    `export-subst` / `export-ignore` act on `git archive` only. Those stay
+//!    exactly as git applies them, and the blob they produce is what gets
+//!    scanned.
 //!
 //!    Attribute snapshots A1 (before the add) and A2 (after the scans and
 //!    both `check-attr` runs) cover every source git reads: the in-tree
@@ -161,9 +202,10 @@
 //! assignments, Anthropic/OpenAI/Stripe/GitHub/Slack/Google key shapes.
 //! Matches are skipped — left exactly as HEAD has them, or absent. The guard
 //! scans exactly the committed blobs, and refuses every path whose committed
-//! bytes could differ from what the user wrote (`filtered-path`) or could make
-//! `git push` upload something else (`lfs-pointer`), so neither a clean
-//! filter nor git-lfs can smuggle a secret into history.
+//! bytes could differ from what the user wrote or what a checkout writes back
+//! (`filtered-path`, `encoded-path`) or could make `git push` upload
+//! something else (`lfs-pointer`), so neither a clean filter, a
+//! `working-tree-encoding` nor git-lfs can smuggle a secret into history.
 //!
 //! Test seam: [`run_autocommit_report_with`] calls its hook with
 //! [`TickPhase::Added`] after step 4's add/write-tree and
@@ -227,6 +269,7 @@ pub enum SkipReason {
     SecretFilename,
     AttributesChanged,
     FilteredPath,
+    EncodedPath,
     TooLargeToScan,
     LfsPointer,
     SecretContent,
@@ -241,6 +284,7 @@ impl SkipReason {
             SkipReason::SecretFilename => "secret-filename",
             SkipReason::AttributesChanged => "attributes-changed",
             SkipReason::FilteredPath => "filtered-path",
+            SkipReason::EncodedPath => "encoded-path",
             SkipReason::TooLargeToScan => "too-large-to-scan",
             SkipReason::LfsPointer => "lfs-pointer",
             SkipReason::SecretContent => "secret-content",
@@ -826,41 +870,102 @@ async fn scan_blobs_for_secrets(root: &Path, oids: &[String]) -> Result<BTreeMap
     Ok(verdicts)
 }
 
-/// The subset of `paths` with a `filter` attribute set to anything (`set` or
-/// any driver name, e.g. `lfs`, configured or not); `unspecified` / `unset`
-/// mean no filter. One `check-attr -z --stdin` call, raw byte paths on stdin;
-/// `env` selects the index git falls back to for a `.gitattributes` missing
-/// from the working tree (the seed index = the pre-add state, or the temp
-/// index = the post-add state).
-async fn filtered_paths(root: &Path, paths: &[BPath], env: &[(&str, &OsStr)]) -> Result<BTreeSet<BPath>> {
-    let mut filtered = BTreeSet::new();
+/// The conversion attributes of a set of paths (OQ-19).
+#[derive(Default)]
+struct ConversionAttrs {
+    /// Paths with a `filter` attribute set to anything.
+    filtered: BTreeSet<BPath>,
+    /// Paths with a `working-tree-encoding` attribute set to anything.
+    encoded: BTreeSet<BPath>,
+}
+
+/// A conversion attribute value that is set to anything but "off".
+fn attr_is_set(value: &[u8]) -> bool {
+    value != b"unspecified" && value != b"unset"
+}
+
+/// The conversion attributes of `paths` (OQ-19): `filtered`, the subset with
+/// a `filter` attribute set to anything (`set` or any driver name, e.g.
+/// `lfs`, configured or not), and `encoded`, the subset with a
+/// `working-tree-encoding` attribute set to anything (`set`, any encoding
+/// name — even UTF-8, an unknown one or an empty value); `unspecified` /
+/// `unset` mean neither. One `check-attr -z --stdin` call, raw byte paths on
+/// stdin; `env` selects the index git falls back to for a `.gitattributes`
+/// missing from the working tree (the seed index = the pre-add state, or the
+/// temp index = the post-add state).
+async fn conversion_attributes(root: &Path, paths: &[BPath], env: &[(&str, &OsStr)]) -> Result<ConversionAttrs> {
+    let mut attrs = ConversionAttrs::default();
     if paths.is_empty() {
-        return Ok(filtered);
+        return Ok(attrs);
     }
     let mut input = Vec::new();
     for p in paths {
         input.extend_from_slice(p);
         input.push(0);
     }
-    let out = git_raw(root, &["check-attr", "-z", "--stdin", "filter"], env, Some(&input))
+    let out = git_raw(root, &["check-attr", "-z", "--stdin", "filter", "working-tree-encoding"], env, Some(&input))
         .await
-        .context("git check-attr filter failed")?;
+        .context("git check-attr filter working-tree-encoding failed")?;
     let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
-    if fields.len() != paths.len() * 3 + 1 || !fields[fields.len() - 1].is_empty() {
+    if fields.len() != paths.len() * 6 + 1 || !fields[fields.len() - 1].is_empty() {
         bail!("check-attr: unexpected output");
     }
     let mut i = 0;
-    while i + 2 < fields.len() {
-        if fields[i + 1] != b"filter" {
+    while i + 5 < fields.len() {
+        if fields[i + 1] != b"filter" || fields[i + 3] != fields[i] || fields[i + 4] != b"working-tree-encoding" {
             bail!("check-attr: unexpected output");
         }
-        let value = fields[i + 2];
-        if value != b"unspecified" && value != b"unset" {
-            filtered.insert(fields[i].to_vec());
+        if attr_is_set(fields[i + 2]) {
+            attrs.filtered.insert(fields[i].to_vec());
         }
-        i += 3;
+        if attr_is_set(fields[i + 5]) {
+            attrs.encoded.insert(fields[i].to_vec());
+        }
+        i += 6;
     }
-    Ok(filtered)
+    Ok(attrs)
+}
+
+/// M0-G15 fallback, only after `add -A -- vault` failed: of every path that
+/// add would visit (`ls-files --cached --others --exclude-standard` against
+/// the seed index; a nested repository shows as `dir/`), the ones it must
+/// not be asked to convert — present files (not directories, not deleted
+/// from the working tree) whose pre-add evaluation has a `filter`
+/// ([`SkipReason::FilteredPath`]) or a `working-tree-encoding`
+/// ([`SkipReason::EncodedPath`]), as path -> reason. git dies on the whole
+/// add for one file it cannot convert (UTF-32 or a BOM-less UTF-16/UTF-32
+/// rule, an odd byte count under UTF-16, an unknown encoding, a valueless
+/// `working-tree-encoding`, a failing required filter), so those are
+/// withheld from the redone add.
+async fn withheld_add_candidates(root: &Path, seed_env: &[(&str, &OsStr)]) -> Result<BTreeMap<BPath, SkipReason>> {
+    let listed = git_raw(
+        root,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", VAULT_PATHSPEC],
+        seed_env,
+        None,
+    )
+    .await
+    .context("git ls-files (add fallback) failed")?;
+    let candidates: Vec<BPath> = split_z(&listed).map(<[u8]>::to_vec).collect::<BTreeSet<_>>().into_iter().collect();
+    let deleted_out = git_raw(root, &["ls-files", "-z", "--deleted", "--", VAULT_PATHSPEC], seed_env, None)
+        .await
+        .context("git ls-files --deleted (add fallback) failed")?;
+    let deleted: BTreeSet<&[u8]> = split_z(&deleted_out).collect();
+    let files: Vec<BPath> = candidates
+        .iter()
+        .filter(|p| !p.ends_with(b"/") && !deleted.contains(p.as_slice()))
+        .cloned()
+        .collect();
+    let attrs = conversion_attributes(root, &files, seed_env).await?;
+    let mut withheld = BTreeMap::new();
+    for p in files {
+        if attrs.filtered.contains(&p) {
+            withheld.insert(p, SkipReason::FilteredPath);
+        } else if attrs.encoded.contains(&p) {
+            withheld.insert(p, SkipReason::EncodedPath);
+        }
+    }
+    Ok(withheld)
 }
 
 /// One attribute source per key (A1 / A2): path and/or state bytes.
@@ -1475,12 +1580,18 @@ async fn run_autocommit_inner(
             .context("failed to snapshot the seeded temp index")?;
     }
     let attrs_before = attribute_snapshot(root).await; // A1
+    // path -> reason, withheld from the add (M0-G15).
+    let mut withheld: BTreeMap<BPath, SkipReason> = BTreeMap::new();
     // -A so deletions are captured; .gitignore respected; vault/ only.
     if let Err(e) = git(root, &["add", "-A", "--", VAULT_PATHSPEC], &env).await {
         // A sparse checkout makes `add` refuse (and fail on) out-of-cone
-        // paths: redo it from the seed with --sparse; those paths are then
-        // flagged below, so the tick never fails for that reason.
-        if !sparse_checkout_enabled(root).await? {
+        // paths, and a file git cannot convert (M0-G15) makes it die: redo
+        // it from the seed, with --sparse (those paths are then flagged
+        // below) and without the filtered / encoded files, so the tick never
+        // fails for either reason.
+        let sparse = sparse_checkout_enabled(root).await?;
+        withheld = withheld_add_candidates(root, &seed_env).await?;
+        if !sparse && withheld.is_empty() {
             return Err(e.context("git add -A -- vault into temp index failed"));
         }
         if head.is_some() {
@@ -1490,9 +1601,40 @@ async fn run_autocommit_inner(
         } else {
             let _ = tokio::fs::remove_file(&temp_index).await;
         }
-        git(root, &["add", "-A", "--sparse", "--", VAULT_PATHSPEC], &env)
-            .await
-            .context("git add -A --sparse -- vault into temp index failed")?;
+        let mut args: Vec<OsString> = vec!["add".into(), "-A".into()];
+        if sparse {
+            args.push("--sparse".into());
+        }
+        if withheld.is_empty() {
+            args.extend(["--".into(), VAULT_PATHSPEC.into()]);
+            git_raw(root, &args, &env, None)
+                .await
+                .context("git add -A --sparse -- vault into temp index failed")?;
+        } else {
+            // `add -A -- vault` minus each withheld file: the one call that
+            // runs with pathspec magic, and every pathspec is still `literal`.
+            let mut spec = format!(":(literal){VAULT_PATHSPEC}\0").into_bytes();
+            for p in withheld.keys() {
+                spec.extend_from_slice(b":(exclude,literal)");
+                spec.extend_from_slice(p);
+                spec.push(0);
+            }
+            let spec_file = temp_dir.join("pathspec");
+            tokio::fs::write(&spec_file, &spec)
+                .await
+                .context("failed to write the add fallback pathspec file")?;
+            let mut from_file = OsString::from("--pathspec-from-file=");
+            from_file.push(spec_file.as_os_str());
+            args.extend([from_file, "--pathspec-file-nul".into()]);
+            let magic_env = [
+                env[0],
+                ("GIT_LITERAL_PATHSPECS", OsStr::new("0")),
+                ("GIT_GLOB_PATHSPECS", OsStr::new("0")),
+            ];
+            git_raw(root, &args, &magic_env, None)
+                .await
+                .context("git add -A without the withheld vault paths into temp index failed")?;
+        }
     }
     let preliminary_tree = git(root, &["write-tree"], &env)
         .await
@@ -1501,7 +1643,13 @@ async fn run_autocommit_inner(
         h(TickPhase::Added);
     }
     let prelim_entries = tree_entries(root, Some(&preliminary_tree)).await?;
-    let all_changed = differing_paths(&head_entries, &prelim_entries);
+    // Withheld paths are candidates too: they are excluded (and reported) below.
+    let all_changed: Vec<BPath> = differing_paths(&head_entries, &prelim_entries)
+        .into_iter()
+        .chain(withheld.keys().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     let mode_of = |entries: &Entries, p: &BPath| -> Option<String> {
         entries.get(p).and_then(|e| e.split_once(' ')).map(|(m, _)| m.to_string())
@@ -1532,20 +1680,29 @@ async fn run_autocommit_inner(
         }
     }
 
-    // filtered-path: a `filter` attribute in the pre-add (seed index) OR the
-    // post-add (temp index) evaluation. Deletions carry no blob.
+    // filtered-path / encoded-path: a `filter` / `working-tree-encoding`
+    // attribute in the pre-add (seed index) OR the post-add (temp index)
+    // evaluation. Deletions carry no blob. Withheld paths keep the reason the
+    // fallback found.
     let mut late: BTreeMap<BPath, SkipReason> = BTreeMap::new();
+    for (p, r) in &withheld {
+        if !early.contains_key(p) {
+            late.insert(p.clone(), *r);
+        }
+    }
     let present: Vec<(BPath, String)> = all_changed
         .iter()
-        .filter(|p| !early.contains_key(*p))
+        .filter(|p| !early.contains_key(*p) && !withheld.contains_key(*p))
         .filter_map(|p| blob_of(p).map(|oid| (p.clone(), oid)))
         .collect();
     let present_paths: Vec<BPath> = present.iter().map(|(p, _)| p.clone()).collect();
-    let filtered_before = filtered_paths(root, &present_paths, &seed_env).await?;
-    let filtered_after = filtered_paths(root, &present_paths, &env).await?;
+    let before = conversion_attributes(root, &present_paths, &seed_env).await?;
+    let after = conversion_attributes(root, &present_paths, &env).await?;
     for p in &present_paths {
-        if filtered_before.contains(p) || filtered_after.contains(p) {
+        if before.filtered.contains(p) || after.filtered.contains(p) {
             late.insert(p.clone(), SkipReason::FilteredPath);
+        } else if before.encoded.contains(p) || after.encoded.contains(p) {
+            late.insert(p.clone(), SkipReason::EncodedPath);
         }
     }
 
@@ -2166,7 +2323,10 @@ mod tests {
     #[tokio::test]
     async fn skip_reasons_match_the_node_twin() {
         let repo = TempRepo::new("reasons");
-        repo.write(".gitattributes", "vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\n");
+        repo.write(
+            ".gitattributes",
+            "vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\nvault/*.txt working-tree-encoding=UTF-16LE\n",
+        );
         repo.git_ok(&["config", "filter.rot.clean", "tr A-Za-z N-ZA-Mn-za-m"]);
         repo.git_ok(&["config", "filter.rot.smudge", "tr A-Za-z N-ZA-Mn-za-m"]);
         // Non-deterministic clean filter (appends its own PID): refused like
@@ -2185,6 +2345,7 @@ mod tests {
         repo.git_ok(&["add", "vault/mine.md"]);
         repo.write("vault/.env", "K=1\n");
         repo.write("vault/leak.md", "AKIAABCDEFGHIJKLMNOP\n");
+        repo.write("vault/enc.txt", "aws AKIAABCDEFGHIJKLMNOP ok\n"); // stored as CJK text without the rule
         repo.write("vault/rot/leak.md", "AKIAABCDEFGHIJKLMNOP\n");
         repo.write("vault/pid/p.md", "plain\n");
         repo.write("vault/ptr.bin", LFS_POINTER);
@@ -2209,6 +2370,7 @@ mod tests {
         let want: Vec<(String, &str)> = [
             ("vault/.env", "secret-filename"),
             ("vault/big.bin", "too-large-to-scan"),
+            ("vault/enc.txt", "encoded-path"),
             ("vault/flag.md", "flagged"),
             ("vault/leak.md", "secret-content"),
             ("vault/mine.md", "user-staged"),
@@ -3867,5 +4029,330 @@ mod r5_regression_tests {
         let allowed: BTreeSet<String> =
             ["file:index", "file:seed-index", "file:pathspec", "file:index.lock"].iter().map(|s| s.to_string()).collect();
         assert!(seen.is_subset(&allowed), "only index/pathspec files may live in a tick's temp dir: {seen:?}");
+    }
+}
+
+/// M0-G12 / M0-G15 (OQ-19): a `working-tree-encoding` is a clean filter in
+/// all but name. Mirrors the Node twin's `M0-G12` / `M0-G15` cases case for
+/// case. Self-contained (only `run_autocommit_report`, the report fields and
+/// `SkipReason::as_str` plus the git CLI), so the same module also compiles
+/// against 10f6654, where the smuggling cases leak and the stall case fails.
+/// Fixtures live on the canonical long temp path (the Windows runner's TEMP
+/// is an 8.3 alias).
+#[cfg(test)]
+mod g12_regression_tests {
+    use super::{run_autocommit_report, AutocommitOutcome, AutocommitReport};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const KEY: &str = "aws AKIAABCDEFGHIJKLMNOP ok\n"; // 26 bytes: an even count
+
+    fn temp_base() -> PathBuf {
+        let canon = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canon = canon.to_string_lossy();
+        PathBuf::from(canon.strip_prefix(r"\\?\").unwrap_or(&canon))
+    }
+
+    struct Repo {
+        dir: PathBuf,
+    }
+
+    impl Repo {
+        fn new(name: &str) -> Self {
+            let dir = temp_base().join(format!("skippy-g12-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let r = Self { dir };
+            r.ok(&["init", "-q", "-b", "main"]);
+            r.ok(&["config", "user.name", "Skippy Test"]);
+            r.ok(&["config", "user.email", "skippy-test@example.invalid"]);
+            r.ok(&["config", "commit.gpgsign", "false"]);
+            r.ok(&["config", "core.hooksPath", ".no-hooks"]);
+            r
+        }
+
+        fn run(&self, args: &[&str]) -> std::process::Output {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["-c", "core.quotepath=false"])
+                .args(args)
+                .output()
+                .expect("git spawn")
+        }
+
+        fn ok(&self, args: &[&str]) -> String {
+            let out = self.run(args);
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        /// Exact blob / checkout bytes (no trimming).
+        fn bytes(&self, args: &[&str]) -> String {
+            let out = self.run(args);
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        fn write(&self, rel: &str, contents: impl AsRef<[u8]>) {
+            let p = self.dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+
+        fn commit_all(&self, msg: &str) {
+            self.ok(&["add", "-A", "."]);
+            self.ok(&["commit", "-q", "-m", msg]);
+        }
+
+        fn head_tree(&self) -> Vec<String> {
+            self.bytes(&["ls-tree", "-r", "-z", "--name-only", "HEAD"])
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn status(&self) -> String {
+            self.ok(&["status", "--porcelain", "-uno"])
+        }
+
+        async fn tick(&self) -> AutocommitReport {
+            run_autocommit_report(&self.dir).await.expect("autocommit ok")
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn detail(rep: &AutocommitReport) -> Vec<(String, &'static str)> {
+        rep.skipped_detail.iter().map(|(p, r)| (p.clone(), r.as_str())).collect()
+    }
+
+    fn d(pairs: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        pairs.iter().map(|(p, r)| (p.to_string(), *r)).collect()
+    }
+
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    fn utf16le(s: &str, bom: bool) -> Vec<u8> {
+        let mut v = if bom { vec![0xff, 0xfe] } else { Vec::new() };
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&u.to_le_bytes());
+        }
+        v
+    }
+
+    /// Every file of a checkout (skipping .git), lossily decoded.
+    fn checkout_text(dir: &Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            if e.file_name() == ".git" {
+                continue;
+            }
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                checkout_text(&p, out);
+            } else {
+                out.push(String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned());
+            }
+        }
+    }
+
+    async fn ascii_secret_declared_utf16_never_reaches_head_or_a_clone(enc: &str) {
+        let r = Repo::new(&format!("smuggle-{}", enc.to_ascii_lowercase()));
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/.gitattributes", format!("*.txt working-tree-encoding={enc}\n"));
+        r.write("vault/note.txt", KEY); // git would store it as CJK text: no AKIA, no NUL
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        // The leak itself first: a fresh clone (file://, reachable objects only).
+        let clone = temp_base().join(format!("skippy-g12-clone-{}", uuid::Uuid::new_v4()));
+        let url = format!("file:///{}", r.dir.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
+        let cloned = Command::new("git").args(["clone", "-q", &url]).arg(&clone).output().unwrap();
+        let objects = Command::new("git").arg("-C").arg(&clone).args(["rev-list", "--objects", "--all"]).output().unwrap();
+        let mut files = Vec::new();
+        if cloned.status.success() {
+            checkout_text(&clone, &mut files);
+        }
+        let _ = std::fs::remove_dir_all(&clone);
+        assert!(cloned.status.success(), "clone failed: {}", String::from_utf8_lossy(&cloned.stderr));
+        assert!(!files.iter().any(|t| t.contains("AKIA")), "a fresh clone checks the secret out");
+        assert!(
+            !String::from_utf8_lossy(&objects.stdout).contains("vault/note.txt"),
+            "history of a fresh clone names the encoded note"
+        );
+        assert!(
+            !r.run(&["cat-file", "--filters", "HEAD:vault/note.txt"]).status.success(),
+            "the encoded note reached HEAD"
+        );
+        assert_eq!(detail(&rep), d(&[("vault/note.txt", "encoded-path")]));
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(strs(&r.head_tree()), vec!["vault/.gitattributes", "vault/n.md"]);
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y", "an unrelated note must still commit");
+        let again = r.tick().await;
+        assert_eq!(again.outcome, AutocommitOutcome::NoOp);
+        assert_eq!(detail(&again), d(&[("vault/note.txt", "encoded-path")]));
+    }
+
+    #[tokio::test]
+    async fn g12_ascii_secret_declared_utf16le_is_refused_as_encoded_path_and_never_reaches_head_or_a_clone() {
+        ascii_secret_declared_utf16_never_reaches_head_or_a_clone("UTF-16LE").await;
+    }
+
+    #[tokio::test]
+    async fn g12_ascii_secret_declared_utf16be_is_refused_as_encoded_path_and_never_reaches_head_or_a_clone() {
+        ascii_secret_declared_utf16_never_reaches_head_or_a_clone("UTF-16BE").await;
+    }
+
+    #[tokio::test]
+    async fn g15_unconvertible_encodings_or_a_failing_required_filter_exclude_only_their_own_paths() {
+        let r = Repo::new("stall");
+        r.ok(&["config", "core.autocrlf", "false"]);
+        r.ok(&["config", "filter.bad.clean", "exit 1"]);
+        r.ok(&["config", "filter.bad.smudge", "cat"]);
+        r.ok(&["config", "filter.bad.required", "true"]);
+        r.write("vault/n.md", "x\n");
+        r.write("vault/gone.md", "bye\n");
+        r.write("vault/old.u32", "abc\n"); // committed before any rule: unchanged, now unconvertible
+        r.commit_all("init");
+        let old_blob = r.ok(&["rev-parse", "HEAD:vault/old.u32"]);
+        r.write(
+            "vault/.gitattributes",
+            [
+                "*.u32 working-tree-encoding=UTF-32", // BOM required: git dies on the add
+                "*.le working-tree-encoding=UTF-32LE", // 6 bytes: not a UTF-32 sequence
+                "*.set working-tree-encoding",        // valueless: git dies ("true/false ...")
+                "*.off -working-tree-encoding",       // unset: no conversion at all
+                "*.bad filter=bad",
+                "",
+            ]
+            .join("\n"),
+        );
+        r.write("vault/a.u32", "abc\n");
+        r.write("vault/b.le", "abcde\n");
+        r.write("vault/c.set", "plain\n");
+        r.write("vault/d.off", "plain note under an unset rule\n");
+        r.write("vault/e.bad", "clean filter fails\n");
+        r.write("vault/n.md", "y\n");
+        r.write("vault/new.md", "the magnificent Skippy approves\n");
+        std::fs::remove_file(r.dir.join("vault/gone.md")).unwrap();
+        let want = d(&[
+            ("vault/a.u32", "encoded-path"),
+            ("vault/b.le", "encoded-path"),
+            ("vault/c.set", "encoded-path"),
+            ("vault/e.bad", "filtered-path"),
+            ("vault/old.u32", "encoded-path"),
+        ]);
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), want);
+        assert_eq!(
+            strs(&r.head_tree()),
+            vec!["vault/.gitattributes", "vault/d.off", "vault/n.md", "vault/new.md", "vault/old.u32"]
+        );
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y");
+        assert_eq!(
+            r.ok(&["rev-parse", "HEAD:vault/old.u32"]),
+            old_blob,
+            "the unconvertible tracked note must be left as HEAD has it"
+        );
+        let again = r.tick().await;
+        assert_eq!(again.outcome, AutocommitOutcome::NoOp);
+        assert_eq!(detail(&again), want);
+    }
+
+    #[tokio::test]
+    async fn g15_sparse_checkout_plus_an_unconvertible_encoding_commits_in_cone_notes_and_keeps_out_of_cone_flagged() {
+        let r = Repo::new("sparse");
+        r.write("vault/a/1.md", "1\n");
+        r.write("vault/b/2.md", "2\n");
+        r.commit_all("init");
+        r.ok(&["sparse-checkout", "set", "vault/a"]);
+        r.write("vault/a/.gitattributes", "*.u32 working-tree-encoding=UTF-32\n");
+        r.write("vault/a/[x].u32", "abc\n"); // glob-like name: excluded literally
+        r.write("vault/a/x.md", "x\n");
+        r.write("vault/a/1.md", "1b\n");
+        r.write("vault/b/new.md", "new outside the cone\n");
+        let want = d(&[("vault/a/[x].u32", "encoded-path"), ("vault/b/2.md", "flagged"), ("vault/b/new.md", "flagged")]);
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), want);
+        assert_eq!(
+            strs(&r.head_tree()),
+            vec!["vault/a/.gitattributes", "vault/a/1.md", "vault/a/x.md", "vault/b/2.md"]
+        );
+        assert_eq!(r.ok(&["show", "HEAD:vault/a/1.md"]), "1b");
+        let again = r.tick().await;
+        assert_eq!(again.outcome, AutocommitOutcome::NoOp);
+        assert_eq!(detail(&again), want);
+    }
+
+    #[tokio::test]
+    async fn g12_legitimate_rule_on_a_genuinely_utf16_note_is_refused_too_and_unrelated_notes_commit() {
+        let r = Repo::new("legit");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write(
+            "vault/.gitattributes",
+            "*.u16 working-tree-encoding=UTF-16\n*.txt working-tree-encoding=UTF-16LE\n*.md8 working-tree-encoding=UTF-8\n",
+        );
+        r.write("vault/bom.u16", utf16le("The magnificent Skippy, in UTF-16 with a BOM\n", true));
+        r.write("vault/le.txt", utf16le("Monkeys write UTF-16LE without a BOM\n", false));
+        r.write("vault/same.md8", "declared UTF-8: a no-op for git, refused all the same\n");
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(
+            detail(&rep),
+            d(&[("vault/bom.u16", "encoded-path"), ("vault/le.txt", "encoded-path"), ("vault/same.md8", "encoded-path")])
+        );
+        assert_eq!(strs(&r.head_tree()), vec!["vault/.gitattributes", "vault/n.md"]);
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y");
+        assert_eq!(r.status(), "");
+    }
+
+    #[tokio::test]
+    async fn g12_filter_plus_encoding_is_filtered_path_and_plain_notes_are_unaffected() {
+        let r = Repo::new("both");
+        r.ok(&["config", "filter.rot.clean", "tr A-Za-z N-ZA-Mn-za-m"]);
+        r.ok(&["config", "filter.rot.smudge", "tr A-Za-z N-ZA-Mn-za-m"]);
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write(
+            "vault/.gitattributes",
+            "*.both filter=rot working-tree-encoding=UTF-16LE\n*.enc working-tree-encoding=UTF-16LE\n",
+        );
+        r.write("vault/x.both", KEY);
+        r.write("vault/y.enc", KEY);
+        r.write("vault/z.md", "plain\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), d(&[("vault/x.both", "filtered-path"), ("vault/y.enc", "encoded-path")]));
+        assert_eq!(strs(&r.head_tree()), vec!["vault/.gitattributes", "vault/n.md", "vault/z.md"]);
+    }
+
+    #[tokio::test]
+    async fn g12_audit_text_eol_ident_are_not_excluded_and_only_change_line_endings_and_the_id() {
+        let r = Repo::new("audit");
+        r.ok(&["config", "core.autocrlf", "false"]);
+        r.write("vault/.gitattributes", "*.md text eol=crlf ident\n");
+        r.write("vault/n.md", "x\r\n");
+        r.commit_all("init");
+        r.write("vault/n.md", "id $Id: dropped on add $\r\nline two\r\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert!(rep.skipped_detail.is_empty(), "{:?}", rep.skipped_detail);
+        assert_eq!(
+            r.bytes(&["cat-file", "-p", "HEAD:vault/n.md"]),
+            "id $Id$\nline two\n",
+            "add drops the CRs and collapses $Id: ...$"
+        );
+        let oid = r.ok(&["rev-parse", "HEAD:vault/n.md"]);
+        assert_eq!(r.bytes(&["cat-file", "--filters", "HEAD:vault/n.md"]), format!("id $Id: {oid} $\r\nline two\r\n"));
     }
 }
