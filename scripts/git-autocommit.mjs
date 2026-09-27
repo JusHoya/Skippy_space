@@ -1,56 +1,68 @@
 #!/usr/bin/env node
 // Git auto-commit — vault/-only, isolated-index, never touches the user's
-// real index or staged work. See apps/shell/src-tauri/src/git_autocommit.rs
-// for the Rust twin and full algorithm writeup (A05 / FR-WIKI-06). Both
-// implementations must stay in lockstep.
+// staged work. See apps/shell/src-tauri/src/git_autocommit.rs for the Rust
+// twin (A05 / FR-WIKI-06). Both implementations must stay in exact semantic
+// parity; the secret lists live in ONE shared file,
+// scripts/git-autocommit-secret-patterns.json, read by both.
 //
-// Algorithm (no shell interpolation anywhere — every git invocation uses
-// execFileSync with an argv array):
-//   0. Before anything else, if a pending-index-sync marker file exists
-//      (<git-dir>/skippy-autocommit-pending, left behind by a previous tick
-//      whose commit landed but whose real-index sync failed), retry syncing
-//      just the paths that are still safe to touch, then clear the marker.
-//      See `recoverPendingSync`.
-//   1. Resolve HEAD (or note it's unborn).
+// Path handling (E5-1): every path-listing git command runs with `-z` and
+// its output is handled as raw bytes (a "byte string": one JS char per byte,
+// latin1), so non-ASCII names are never C-quoted, never mangled, and round-
+// trip exactly into pathspec files / `update-index --index-info` stdin.
+// Every git call runs with GIT_LITERAL_PATHSPECS=1 (E5-4) and no user path is
+// ever put on a command line (E5-5): per-path input goes through stdin or a
+// NUL-delimited --pathspec-from-file.
+//
+// Algorithm (no shell interpolation anywhere — execFileSync with argv):
+//   0. If a pending-index-sync marker exists (<git-dir>/skippy-autocommit-pending,
+//      {version, ref, new, parent}, left by a tick whose commit landed but whose
+//      real-index sync failed), validate it first (E5-2): recover only if HEAD
+//      is still symbolically on `ref` and resolves to exactly `new`; otherwise
+//      (reset --hard, checkout of another branch, a user commit on top, a
+//      corrupt marker) drop it WITHOUT touching the index and report
+//      `dropped`. If recovery is attempted and fails, the tick stops with an
+//      explicit error rather than stacking a commit on an unsynced index.
+//   1. Resolve HEAD (or note it's unborn) and the symbolic ref it points to.
 //   2. Fail fast, untouched, if <git-dir>/index.lock already exists.
-//   3. Seed a throwaway index: GIT_INDEX_FILE=<tmp> git read-tree HEAD.
-//   4. GIT_INDEX_FILE=<tmp> git add -A -- vault (working tree -> temp index,
-//      vault pathspec only, .gitignore respected) -> preliminary tree, diffed
-//      against HEAD to get the full candidate path list.
-//   5. From that candidate list, compute three exclusion sets and restore
-//      each matching path back to its HEAD state in the temp index (or
-//      remove it if HEAD doesn't have it), so none of them are ever part of
-//      this auto-commit:
-//        a. skip-worktree / assume-unchanged vault paths (`listFlaggedVaultPaths`),
-//        b. paths whose staged blob differs from BOTH HEAD and the working
-//           tree ("staged-vs-worktree conflict", `listStagedVsWorktreeConflicts`),
-//        c. well-known secret filenames (`SECRET_FILENAME_PATTERNS`) and,
-//           for everything else, a content scan of the working-tree bytes
-//           for high-confidence secret markers (`SECRET_CONTENT_PATTERNS`).
-//      All three are reported back as `skipped`.
-//   6. write-tree again (only if anything was restored) -> final tree. If
-//      it equals HEAD's vault subtree, nothing to do.
+//   3. Snapshot the real index's vault entries (`ls-files -s -v -z`) and
+//      HEAD's vault entries (`ls-tree -r -z`). A vault path is USER-OWNED
+//      (E5-6/E5-7) if its real-index entry differs from HEAD in any way:
+//      staged add/modify/delete, `rm --cached`, either side of a rename or
+//      copy, intent-to-add, or unmerged. Skip-worktree / assume-unchanged
+//      paths are FLAGGED. Neither is ever committed or re-synced.
+//   4. Seed a throwaway index (read-tree HEAD), `add -A -- vault` into it,
+//      write-tree -> preliminary tree; the candidate list is every vault path
+//      whose (mode, oid) differs between HEAD and that tree.
+//   5. Exclusions, each restored to its HEAD state in the temp index (or
+//      removed if HEAD lacks it) with ONE `update-index -z --index-info`:
+//        a. flagged paths, b. user-owned paths,
+//        c. secret filename hits, d. secret content hits — the content scan
+//           reads the exact blobs the commit would contain (`cat-file
+//           --batch`), as latin1 and again with NULs stripped (UTF-16).
+//      All are reported as `skipped`.
+//   6. If nothing is left, no-op. Otherwise write-tree -> final tree.
 //   7. git commit-tree <tree> [-p HEAD] -m <msg> (plumbing: no hooks run).
 //   8. git update-ref HEAD <new> <old> — compare-and-swap; fails explicitly
-//      if HEAD moved concurrently, and nothing else has happened yet, so
-//      the real index and working tree are untouched.
-//   9. Only on success: sync the real index for the vault paths that
-//      actually changed (excluding everything from steps 5/6, which must
-//      keep their original real-index flags and content untouched). If
-//      this sync fails (e.g. something else grabbed the index lock right
-//      after our commit landed), the commit is NOT rolled back and is NOT
-//      reported as a failure — HEAD has already moved. Instead a pending
-//      marker is written (new sha + parent sha) and the result is reported
-//      as 'pending-sync'; the next tick's step 0 will finish the job.
+//      if HEAD moved, before the real index was touched.
+//   9. Sync the real index ONLY for the committed paths (parent -> new diff),
+//      and only those whose real-index entry still equals the parent's
+//      (re-read at sync time), via `reset -q <new> --pathspec-from-file`
+//      (literal, NUL-delimited). Failure after bounded retries is NOT a failed
+//      commit: a pending marker is written and the result is 'pending-sync'.
 //
-// The temp index file is removed in every case (success, no-op, or error).
+// Known window (E5-9): between step 8 and a successful sync (normally
+// milliseconds; up to the next tick if the sync hit a held index.lock), the
+// real index still holds the parent's blobs for the committed paths. A user
+// `git commit` made inside that window records those parent blobs, i.e. it
+// reverts the autocommitted vault change in the user's commit. The marker is
+// then dropped (HEAD moved) and the next tick re-commits the working-tree
+// content, so the revert lasts only until the next tick.
 //
-// Secrets: `commit-tree` is plumbing and never runs hooks, so a repo's own
-// secret-scanning pre-commit hook can never see (or block) this commit.
-// The built-in guard below is the only line of defense: a static pathspec
-// exclude list for well-known secret file names/extensions, plus a content
-// scan of every candidate blob for high-confidence secret markers. Matches
-// are skipped (left exactly as HEAD has them / absent), never committed.
+// The temp index / pathspec files are removed in every case.
+//
+// Secrets: `commit-tree` never runs hooks, so a repo's own secret-scanning
+// pre-commit hook can never see (or block) this commit. The built-in guard
+// (step 5c/5d) is the only line of defense.
 
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
@@ -62,70 +74,83 @@ import crypto from 'node:crypto';
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const VAULT_PATHSPEC = 'vault';
 const PENDING_MARKER_NAME = 'skippy-autocommit-pending';
+const PENDING_MARKER_VERSION = 2;
 const SYNC_RETRY_ATTEMPTS = 3;
 const SYNC_RETRY_DELAY_MS = 20;
+const MAX_GIT_OUTPUT = 1024 * 1024 * 1024;
+const GIT_ENV = { GIT_LITERAL_PATHSPECS: '1' };
+const OID_RE = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
-// Built-in exclusion list (FR-WIKI-06 secret guard). Filenames/extensions
-// that should never be swept into the vault auto-commit, matched against
-// the vault-relative path. Kept in parity with the Rust twin's
-// `SECRET_FILENAME_PATTERNS`.
-const SECRET_FILENAME_PATTERNS = [
-  /(^|\/)\.env[^/]*$/, // vault/**/.env*
-  /\.pem$/,
-  /\.key$/,
-  /\.p12$/,
-  /\.pfx$/,
-  /(^|\/)id_rsa[^/]*$/,
-  /(^|\/)id_ed25519[^/]*$/,
-  /(^|\/)id_ecdsa[^/]*$/,
-  /credentials[^/]*\.json$/i,
-  /(^|\/)\.npmrc$/,
-  /(^|\/)\.netrc$/,
-  /\.kdbx$/,
-  /(^|\/)secrets\.[^/]*$/i,
-];
+// --- Secret guard (FR-WIKI-06), shared with the Rust twin ----------------
 
-function matchesSecretFilename(vaultRelativePath) {
-  return SECRET_FILENAME_PATTERNS.some((re) => re.test(vaultRelativePath));
+export const SECRET_PATTERNS_FILE = fileURLToPath(new URL('./git-autocommit-secret-patterns.json', import.meta.url));
+export const SECRET_PATTERNS = JSON.parse(readFileSync(SECRET_PATTERNS_FILE, 'utf8'));
+
+const FILENAME_RULES = SECRET_PATTERNS.filename.map((r) => ({
+  re: new RegExp(r.pattern),
+  unless: r.unless ? new RegExp(r.unless) : null,
+}));
+const CONTENT_RULES = SECRET_PATTERNS.content.map((r) => ({
+  re: new RegExp(r.pattern),
+  ci: r.ignoreAsciiCase === true,
+}));
+
+/** ASCII-only lowercase (identical to Rust's `to_ascii_lowercase`). */
+function asciiLower(s) {
+  return s.replace(/[A-Z]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 32));
 }
 
-// High-confidence secret content markers. A hit on any candidate blob's
-// working-tree content excludes that path from the commit, regardless of
-// its name. Kept in parity with the Rust twin's `SECRET_CONTENT_PATTERNS`.
-const SECRET_CONTENT_PATTERNS = [
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /AKIA[0-9A-Z]{16}/,
-  /sk-ant-/,
-  /gh[po]_[A-Za-z0-9]{20,}/,
-  /github_pat_[A-Za-z0-9_]{20,}/,
-  /xox[baprs]-[A-Za-z0-9-]+/,
-];
+/** @param {string} bytePath repo-relative path as a byte string (latin1). */
+export function matchesSecretFilename(bytePath) {
+  const p = asciiLower(bytePath);
+  return FILENAME_RULES.some((r) => r.re.test(p) && !(r.unless && r.unless.test(p)));
+}
 
-function git(root, args, extraEnv = {}) {
+/** @param {Buffer} bytes exact blob content. */
+export function matchesSecretContent(bytes) {
+  const raw = bytes.toString('latin1');
+  const views = [raw];
+  if (raw.includes('\0')) views.push(raw.replace(/\0/g, '')); // UTF-16LE/BE, any offset
+  for (const view of views) {
+    let lower = null;
+    for (const r of CONTENT_RULES) {
+      const text = r.ci ? (lower ??= asciiLower(view)) : view;
+      if (r.re.test(text)) return true;
+    }
+  }
+  return false;
+}
+
+/** byte string (latin1) <-> display string (UTF-8). */
+export const toBytePath = (utf8) => Buffer.from(utf8, 'utf8').toString('latin1');
+const toDisplayPath = (bytePath) => Buffer.from(bytePath, 'latin1').toString('utf8');
+
+// --- git plumbing helpers --------------------------------------------------
+
+function gitRaw(root, args, { env = {}, input } = {}) {
   try {
-    const out = execFileSync('git', ['-C', root, ...args], {
-      encoding: 'utf8',
-      env: { ...process.env, ...extraEnv },
+    return execFileSync('git', ['-C', root, ...args], {
+      env: { ...process.env, ...GIT_ENV, ...env },
+      input,
+      maxBuffer: MAX_GIT_OUTPUT,
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return out.trim();
   } catch (e) {
     const stderr = e.stderr ? e.stderr.toString().trim() : e.message;
     const err = new Error(`git ${args.join(' ')} failed: ${stderr}`);
     err.cause = e;
+    err.status = e.status;
     throw err;
   }
 }
 
-/** Like git() but tolerates git's own nonzero "found a diff" exit code. */
-function gitDiffQuiet(root, args) {
-  try {
-    execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' });
-    return false; // exit 0 => no diff
-  } catch (e) {
-    if (typeof e.status === 'number' && e.status === 1) return true; // diff found
-    const stderr = e.stderr ? e.stderr.toString().trim() : e.message;
-    throw new Error(`git ${args.join(' ')} exited abnormally: ${stderr}`);
-  }
+function git(root, args, opts) {
+  return gitRaw(root, args, opts).toString('utf8').trim();
+}
+
+/** Split `-z` output into byte-string records. */
+function splitZ(buf) {
+  return buf.toString('latin1').split('\0').filter((r) => r.length > 0);
 }
 
 function resolveGitDir(root) {
@@ -140,111 +165,90 @@ function resolveGitDir(root) {
 
 export function resolveHead(root) {
   try {
-    return execFileSync('git', ['-C', root, 'rev-parse', '--verify', '-q', 'HEAD'], {
-      encoding: 'utf8',
-    }).trim();
+    return git(root, ['rev-parse', '--verify', '-q', 'HEAD']);
   } catch {
     return null; // unborn HEAD
   }
 }
 
-function vaultTreeChanged(root, head, tree) {
-  const base = head ?? EMPTY_TREE;
-  return gitDiffQuiet(root, ['diff', '--quiet', base, tree, '--', VAULT_PATHSPEC]);
+/** The ref HEAD points at (`refs/heads/main`), or null when detached. */
+function resolveSymbolicHead(root) {
+  try {
+    return git(root, ['symbolic-ref', '-q', 'HEAD']) || null;
+  } catch (e) {
+    if (e.status === 1) return null; // detached
+    throw e;
+  }
 }
 
-function changedVaultPaths(root, base, tree) {
-  let out;
-  try {
-    out = git(root, ['diff', '--name-only', base, tree, '--', VAULT_PATHSPEC]);
-  } catch {
-    return [];
+/** Vault entries of a tree-ish: Map<bytePath, "mode oid">. */
+function treeEntries(root, treeish) {
+  const map = new Map();
+  if (!treeish || treeish === EMPTY_TREE) return map;
+  for (const rec of splitZ(gitRaw(root, ['ls-tree', '-r', '-z', treeish, '--', VAULT_PATHSPEC]))) {
+    const tab = rec.indexOf('\t');
+    const [mode, , oid] = rec.slice(0, tab).split(' ');
+    map.set(rec.slice(tab + 1), `${mode} ${oid}`);
   }
-  return out.split('\n').filter(Boolean);
+  return map;
 }
 
-/** skip-worktree ('S' tag) and assume-unchanged (any lowercase tag) vault paths. */
-function listFlaggedVaultPaths(root) {
-  let out;
-  try {
-    out = git(root, ['ls-files', '-v', '--', VAULT_PATHSPEC]);
-  } catch {
-    return new Set();
-  }
+/** Real-index vault snapshot: stage-0 entries, flagged and unmerged paths. */
+function realIndexSnapshot(root) {
+  const entries = new Map();
   const flagged = new Set();
-  for (const line of out.split('\n')) {
-    if (!line) continue;
-    const tag = line[0];
-    const path = line.slice(2);
-    if (tag === 'S') flagged.add(path);
-    else if (tag >= 'a' && tag <= 'z') flagged.add(path); // assume-unchanged
-  }
-  return flagged;
-}
-
-/** Vault paths whose staged blob differs from BOTH HEAD and the working tree. */
-function listStagedVsWorktreeConflicts(root) {
-  let staged = [];
-  let worktree = [];
-  try {
-    staged = git(root, ['diff', '--cached', '--name-only', '--', VAULT_PATHSPEC])
-      .split('\n')
-      .filter(Boolean);
-  } catch {
-    staged = [];
-  }
-  try {
-    worktree = git(root, ['diff', '--name-only', '--', VAULT_PATHSPEC])
-      .split('\n')
-      .filter(Boolean);
-  } catch {
-    worktree = [];
-  }
-  const worktreeSet = new Set(worktree);
-  return new Set(staged.filter((p) => worktreeSet.has(p)));
-}
-
-/** Restore `path` in the temp index to its HEAD state, or remove it entirely
- * if HEAD doesn't have it — undoing whatever `add -A` staged there so it's
- * never part of this auto-commit. */
-function restorePathToHead(root, tempIndex, head, path) {
-  const env = { GIT_INDEX_FILE: tempIndex };
-  let headEntry = '';
-  if (head) {
-    try {
-      headEntry = git(root, ['ls-tree', head, '--', path]);
-    } catch {
-      headEntry = '';
+  const unmerged = new Set();
+  for (const rec of splitZ(gitRaw(root, ['ls-files', '-s', '-v', '-z', '--', VAULT_PATHSPEC]))) {
+    const tab = rec.indexOf('\t');
+    const [tag, mode, oid, stage] = rec.slice(0, tab).split(' ');
+    const path = rec.slice(tab + 1);
+    if (stage !== '0') {
+      unmerged.add(path);
+      continue;
     }
+    // 'S' = skip-worktree; lowercase = assume-unchanged (ls-files -v).
+    if (tag === 'S' || (tag >= 'a' && tag <= 'z')) flagged.add(path);
+    entries.set(path, `${mode} ${oid}`);
   }
-  const m = headEntry.match(/^(\d+) blob ([0-9a-f]+)\t/);
-  if (m) {
-    // --add: the path may have been removed from the temp index entirely
-    // (e.g. `add -A` staged a deletion for a skip-worktree file that no
-    // longer exists on disk), in which case a bare --cacheinfo update
-    // would fail with "missing --add option".
-    git(root, ['update-index', '--add', '--cacheinfo', `${m[1]},${m[2]},${path}`], env);
-    return;
-  }
-  try {
-    git(root, ['update-index', '--force-remove', '--', path], env);
-  } catch {
-    // Already absent from the temp index — nothing to undo.
-  }
+  return { entries, flagged, unmerged };
 }
 
-function scanWorkingTreeForSecrets(root, paths) {
-  const hits = [];
-  for (const p of paths) {
-    const abs = join(root, p);
-    if (!existsSync(abs)) continue; // deletion: nothing to leak
-    let content;
-    try {
-      content = readFileSync(abs, 'utf8');
-    } catch {
-      continue; // unreadable (e.g. binary/permissions) — best-effort scan only
-    }
-    if (SECRET_CONTENT_PATTERNS.some((re) => re.test(content))) hits.push(p);
+/** Paths whose entry differs between two entry maps, sorted bytewise. */
+function differingPaths(a, b) {
+  const out = new Set();
+  for (const [p, v] of a) if (b.get(p) !== v) out.add(p);
+  for (const p of b.keys()) if (!a.has(p)) out.add(p);
+  return [...out].sort(byteOrder);
+}
+
+function byteOrder(x, y) {
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/** Vault paths the user has staged something for (real index != HEAD). */
+function userOwnedPaths(snapshot, headEntries) {
+  const owned = new Set(snapshot.unmerged);
+  for (const p of differingPaths(snapshot.entries, headEntries)) owned.add(p);
+  return owned;
+}
+
+/** Content-scan blobs by oid with one `cat-file --batch`. Returns hit oids. */
+function scanBlobsForSecrets(root, oids) {
+  const unique = [...new Set(oids)];
+  const hits = new Set();
+  if (unique.length === 0) return hits;
+  const out = gitRaw(root, ['cat-file', '--batch'], { input: unique.map((o) => `${o}\n`).join('') });
+  let pos = 0;
+  for (const oid of unique) {
+    const nl = out.indexOf(0x0a, pos);
+    if (nl < 0) throw new Error('cat-file --batch: truncated output');
+    const header = out.subarray(pos, nl).toString('latin1').split(' ');
+    pos = nl + 1;
+    if (header[1] === 'missing') throw new Error(`cat-file --batch: blob ${oid} missing`);
+    const size = parseInt(header[2], 10);
+    if (header[0] !== oid || !Number.isFinite(size)) throw new Error('cat-file --batch: unexpected header');
+    if (matchesSecretContent(out.subarray(pos, pos + size))) hits.add(oid);
+    pos += size + 1; // trailing LF
   }
   return hits;
 }
@@ -254,10 +258,8 @@ export function commitAndAdvanceHead(root, tree, head, message) {
   if (head) args.push('-p', head);
   args.push('-m', message);
   const newCommit = git(root, args);
-
-  const old = head ?? '';
   // CAS: fails explicitly if HEAD moved concurrently.
-  git(root, ['update-ref', 'HEAD', newCommit, old]);
+  git(root, ['update-ref', 'HEAD', newCommit, head ?? '']);
   return newCommit;
 }
 
@@ -275,112 +277,132 @@ function withRetries(fn, attempts = SYNC_RETRY_ATTEMPTS, delayMs = SYNC_RETRY_DE
 }
 
 function sleepSync(ms) {
-  const sab = new SharedArrayBuffer(4);
-  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-/** Bring the real index's vault entries that actually changed in line with
- * `commit`, excluding every path in `excludedPaths` (skip-worktree,
- * assume-unchanged, staged-vs-worktree conflicts, secret hits — none of
- * which changed in `commit` to begin with, but excluded defensively so a
- * `git reset` can never strip their flags). */
-function syncRealIndexAfterCommit(root, commit, excludedPaths) {
-  const excludeArgs = [...excludedPaths].map((p) => `:(exclude)${p}`);
-  withRetries(() => git(root, ['reset', '-q', commit, '--', VAULT_PATHSPEC, ...excludeArgs]));
+/**
+ * Bring the real index in line with `newCommit` for exactly `paths` (the
+ * paths the autocommit changed), skipping any path whose real-index entry no
+ * longer equals `parentEntries` (the user staged something since), is
+ * flagged, or is unmerged. Literal, NUL-delimited pathspec file; never a
+ * whole-vault reset. Returns the number of paths synced.
+ */
+function syncRealIndex(root, newCommit, parentEntries, paths) {
+  return withRetries(() => {
+    const snap = realIndexSnapshot(root);
+    const safe = paths.filter(
+      (p) => !snap.flagged.has(p) && !snap.unmerged.has(p) && snap.entries.get(p) === parentEntries.get(p),
+    );
+    if (safe.length === 0) return 0; // never run a pathspec-less reset
+    const dir = mkdtempSync(join(tmpdir(), 'skippy-autocommit-sync-'));
+    try {
+      const specFile = join(dir, 'pathspec');
+      writeFileSync(specFile, Buffer.from(safe.map((p) => `${p}\0`).join(''), 'latin1'));
+      gitRaw(root, ['reset', '-q', newCommit, `--pathspec-from-file=${specFile}`, '--pathspec-file-nul']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    return safe.length;
+  });
 }
 
 function pendingMarkerPath(gitDir) {
   return join(gitDir, PENDING_MARKER_NAME);
 }
 
-function writePendingMarker(gitDir, newSha, parentSha) {
-  writeFileSync(pendingMarkerPath(gitDir), JSON.stringify({ new: newSha, parent: parentSha ?? null }), 'utf8');
+function writePendingMarker(gitDir, ref, newSha, parentSha) {
+  writeFileSync(
+    pendingMarkerPath(gitDir),
+    JSON.stringify({ version: PENDING_MARKER_VERSION, ref: ref ?? null, new: newSha, parent: parentSha ?? null }),
+    'utf8',
+  );
 }
 
-function realIndexBlobFor(root, path) {
-  let line;
+function dropMarker(markerPath) {
   try {
-    line = git(root, ['ls-files', '-s', '--', path]);
+    rmSync(markerPath, { force: true });
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Validate a parsed marker; returns null if unusable. */
+function parseMarker(raw) {
+  let m;
+  try {
+    m = JSON.parse(raw);
   } catch {
     return null;
   }
-  return line.match(/^\d+ ([0-9a-f]+) /)?.[1] ?? null;
-}
-
-function treeBlobFor(root, tree, path) {
-  if (tree === EMPTY_TREE) return null;
-  let line;
-  try {
-    line = git(root, ['ls-tree', tree, '--', path]);
-  } catch {
-    return null;
-  }
-  return line.match(/^\d+ blob ([0-9a-f]+)\t/)?.[1] ?? null;
+  if (!m || typeof m !== 'object' || Array.isArray(m)) return null;
+  if (typeof m.new !== 'string' || !OID_RE.test(m.new)) return null;
+  if (!(m.parent === null || m.parent === undefined || (typeof m.parent === 'string' && OID_RE.test(m.parent)))) return null;
+  const hasRef = Object.prototype.hasOwnProperty.call(m, 'ref');
+  if (hasRef && !(m.ref === null || (typeof m.ref === 'string' && m.ref.startsWith('refs/')))) return null;
+  return { new: m.new, parent: m.parent ?? null, hasRef, ref: hasRef ? m.ref : undefined };
 }
 
 /**
- * Step 0 of every tick: if a previous tick's commit landed but its
- * real-index sync failed, finish the job now, before touching anything
- * else. Only paths whose real-index entry still equals the PARENT commit's
- * blob (i.e. untouched by the user since) are synced — anything the user
- * has since staged differently is left alone and stays pending forever
- * rather than being clobbered.
- *
- * @returns {{synced: boolean, newSha: string, error?: string}|null} null if
- *   there was no pending marker.
+ * Step 0 of every tick. See the header. Returns null if there was no marker,
+ * otherwise {synced, newSha, dropped?, error?}.
  */
 function recoverPendingSync(root, gitDir) {
   const markerPath = pendingMarkerPath(gitDir);
-  if (!existsSync(markerPath)) return null;
-
-  let marker;
+  let raw;
   try {
-    marker = JSON.parse(readFileSync(markerPath, 'utf8'));
-  } catch {
-    // Corrupt marker: drop it rather than getting stuck forever.
-    try {
-      rmSync(markerPath);
-    } catch {
-      /* ignore */
-    }
-    return null;
+    raw = readFileSync(markerPath, 'utf8');
+  } catch (e) {
+    if (e.code === 'ENOENT') return null;
+    return { synced: false, newSha: null, error: `cannot read pending marker: ${e.message}` };
   }
 
-  const newSha = marker.new;
-  const parentSha = marker.parent ?? null;
-  const base = parentSha ?? EMPTY_TREE;
+  const marker = parseMarker(raw);
+  if (!marker) {
+    dropMarker(markerPath);
+    return { synced: false, newSha: null, dropped: 'corrupt pending marker' };
+  }
+
+  const head = resolveHead(root);
+  const ref = resolveSymbolicHead(root);
+  // Legacy (v1) markers carry no ref: only the HEAD check applies.
+  if (head !== marker.new || (marker.hasRef && ref !== marker.ref)) {
+    dropMarker(markerPath);
+    return {
+      synced: false,
+      newSha: marker.new,
+      dropped: `HEAD is no longer ${marker.new}${marker.hasRef ? ` on ${marker.ref ?? '(detached)'}` : ''}; index left untouched`,
+    };
+  }
 
   try {
-    withRetries(() => {
-      const changed = changedVaultPaths(root, base, newSha);
-      const safe = changed.filter((p) => realIndexBlobFor(root, p) === treeBlobFor(root, base, p));
-      if (safe.length > 0) {
-        git(root, ['reset', '-q', newSha, '--', ...safe]);
-      }
-    });
-    rmSync(markerPath);
-    return { synced: true, newSha };
+    const parentEntries = treeEntries(root, marker.parent);
+    const newEntries = treeEntries(root, marker.new);
+    syncRealIndex(root, marker.new, parentEntries, differingPaths(parentEntries, newEntries));
+    dropMarker(markerPath);
+    return { synced: true, newSha: marker.new };
   } catch (e) {
-    return { synced: false, newSha, error: e.message };
+    return { synced: false, newSha: marker.new, error: e.message };
   }
 }
 
 /**
  * Core algorithm. Throws on any explicit failure (locked index, CAS race,
- * not a repo, ...) — never silently swallowed.
+ * unresolved pending sync, not a repo, ...) — never silently swallowed.
  *
  * @param {string} root repo root (contains `vault/`)
  * @param {() => string} [now] injectable clock for tests
  * @returns {{status: 'noop'|'committed'|'pending-sync', skipped: string[], recovered: object|null, syncError?: string}}
  */
 export function runAutocommit(root, now = () => new Date().toISOString()) {
-  const vaultDir = join(root, 'vault');
-  if (!existsSync(vaultDir)) return { status: 'noop', skipped: [], recovered: null };
+  if (!existsSync(join(root, 'vault'))) return { status: 'noop', skipped: [], recovered: null };
 
   const gitDir = resolveGitDir(root);
 
-  // Step 0: finish any interrupted sync from a previous tick first.
+  // Step 0: finish (or safely discard) an interrupted sync first.
   const recovered = recoverPendingSync(root, gitDir);
+  if (recovered && !recovered.synced && !recovered.dropped) {
+    throw new Error(`pending index sync for ${recovered.newSha} still unresolved (${recovered.error}); skipping autocommit`);
+  }
 
   const lockPath = join(gitDir, 'index.lock');
   if (existsSync(lockPath)) {
@@ -388,50 +410,62 @@ export function runAutocommit(root, now = () => new Date().toISOString()) {
   }
 
   const head = resolveHead(root);
+  const ref = resolveSymbolicHead(root);
 
   const tempDir = mkdtempSync(join(tmpdir(), 'skippy-autocommit-'));
-  const tempIndex = join(tempDir, `index-${crypto.randomUUID()}`);
+  const env = { GIT_INDEX_FILE: join(tempDir, `index-${crypto.randomUUID()}`) };
   try {
-    const flagged = listFlaggedVaultPaths(root);
-    const conflicts = listStagedVsWorktreeConflicts(root);
-    const excluded = new Set([...flagged, ...conflicts]);
+    const headEntries = treeEntries(root, head);
+    const snapshot = realIndexSnapshot(root);
+    const owned = userOwnedPaths(snapshot, headEntries);
 
-    const env = { GIT_INDEX_FILE: tempIndex };
-    if (head) git(root, ['read-tree', head], env);
-    // -A (not just add) so vault deletions are captured too; pathspec keeps
-    // this scoped to vault/ only. .gitignore is respected by default.
-    git(root, ['add', '-A', '--', VAULT_PATHSPEC], env);
+    if (head) git(root, ['read-tree', head], { env });
+    // -A so deletions are captured; .gitignore respected; vault/ only.
+    git(root, ['add', '-A', '--', VAULT_PATHSPEC], { env });
+    const preliminaryTree = git(root, ['write-tree'], { env });
+    const prelimEntries = treeEntries(root, preliminaryTree);
+    const allChanged = differingPaths(headEntries, prelimEntries);
 
-    const base = head ?? EMPTY_TREE;
-    const preliminaryTree = git(root, ['write-tree'], env);
-    const allChanged = changedVaultPaths(root, base, preliminaryTree);
+    const flaggedHits = allChanged.filter((p) => snapshot.flagged.has(p));
+    const ownedHits = allChanged.filter((p) => !snapshot.flagged.has(p) && owned.has(p));
+    const candidates = allChanged.filter((p) => !snapshot.flagged.has(p) && !owned.has(p));
+    const nameHits = candidates.filter((p) => matchesSecretFilename(p));
+    const toScan = candidates.filter((p) => !nameHits.includes(p) && prelimEntries.has(p));
+    const blobOf = (p) => {
+      const [mode, oid] = prelimEntries.get(p).split(' ');
+      return mode === '160000' ? null : oid; // gitlinks have no content here
+    };
+    const hitOids = scanBlobsForSecrets(root, toScan.map(blobOf).filter(Boolean));
+    const contentHits = toScan.filter((p) => hitOids.has(blobOf(p)));
 
-    const secretNameHits = allChanged.filter((p) => !excluded.has(p) && matchesSecretFilename(p));
-    const remaining = allChanged.filter((p) => !excluded.has(p) && !secretNameHits.includes(p));
-    const secretContentHits = scanWorkingTreeForSecrets(root, remaining);
+    const excluded = [...flaggedHits, ...ownedHits, ...nameHits, ...contentHits];
+    const excludedSet = new Set(excluded);
+    const commitPaths = allChanged.filter((p) => !excludedSet.has(p));
+    const skipped = excluded.map(toDisplayPath);
 
-    const toRestore = new Set([...excluded, ...secretNameHits, ...secretContentHits]);
-    for (const p of toRestore) restorePathToHead(root, tempIndex, head, p);
+    if (commitPaths.length === 0) return { status: 'noop', skipped, recovered };
 
-    const tree = toRestore.size > 0 ? git(root, ['write-tree'], env) : preliminaryTree;
-    const skipped = [...flagged, ...conflicts, ...secretNameHits, ...secretContentHits];
-
-    if (!vaultTreeChanged(root, head, tree)) {
-      return { status: 'noop', skipped, recovered };
+    let tree = preliminaryTree;
+    if (excluded.length > 0) {
+      const zero = '0'.repeat(preliminaryTree.length);
+      const info = excluded
+        .map((p) => (headEntries.has(p) ? `${headEntries.get(p)}\t${p}\0` : `0 ${zero}\t${p}\0`))
+        .join('');
+      gitRaw(root, ['update-index', '-z', '--index-info'], { env, input: Buffer.from(info, 'latin1') });
+      tree = git(root, ['write-tree'], { env });
     }
+    const headTree = head ? git(root, ['rev-parse', `${head}^{tree}`]) : EMPTY_TREE;
+    if (tree === headTree) return { status: 'noop', skipped, recovered };
 
-    const stamp = now().replace(/\.\d+Z$/, 'Z'); // ISO8601 UTC, no ms if none given
-    const message = `chore(vault): auto-commit ${stamp}`;
-
-    const newCommit = commitAndAdvanceHead(root, tree, head, message);
+    const stamp = now().replace(/\.\d+Z$/, 'Z');
+    const newCommit = commitAndAdvanceHead(root, tree, head, `chore(vault): auto-commit ${stamp}`);
 
     try {
-      syncRealIndexAfterCommit(root, newCommit, excluded);
+      syncRealIndex(root, newCommit, headEntries, commitPaths);
       return { status: 'committed', skipped, recovered };
     } catch (e) {
-      // HEAD already advanced — this is NOT a failed commit. Leave a marker
-      // so the next tick finishes the real-index sync.
-      writePendingMarker(gitDir, newCommit, head);
+      // HEAD already advanced — NOT a failed commit. Next tick finishes it.
+      writePendingMarker(gitDir, ref, newCommit, head);
       return { status: 'pending-sync', skipped, recovered, syncError: e.message };
     }
   } finally {
@@ -440,22 +474,19 @@ export function runAutocommit(root, now = () => new Date().toISOString()) {
 }
 
 function commitOnce() {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const repoRoot = resolve(here, '..');
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
   return runAutocommit(repoRoot);
 }
 
 function reportResult(result) {
-  if (result.recovered?.synced) {
-    console.error(`autocommit: recovered pending index sync for ${result.recovered.newSha}`);
-  } else if (result.recovered && !result.recovered.synced) {
-    console.error(`autocommit: pending index sync still unresolved: ${result.recovered.error}`);
-  }
+  const r = result.recovered;
+  if (r?.synced) console.error(`autocommit: recovered pending index sync for ${r.newSha}`);
+  else if (r?.dropped) console.error(`autocommit: dropped stale pending index sync marker: ${r.dropped}`);
   if (result.status === 'pending-sync') {
     console.error(`autocommit: committed but index sync pending: ${result.syncError}`);
   }
   if (result.skipped?.length) {
-    console.error(`autocommit: skipped vault paths (excluded/secret): ${result.skipped.join(', ')}`);
+    console.error(`autocommit: skipped vault paths (user-staged/flagged/secret): ${result.skipped.join(', ')}`);
   }
 }
 
@@ -469,7 +500,7 @@ function main() {
       process.exitCode = 1;
     }
   } else {
-    const ms = (parseInt(arg.match(/--interval=(\d+)/)?.[1] ?? '300', 10)) * 1000;
+    const ms = parseInt(arg.match(/--interval=(\d+)/)?.[1] ?? '300', 10) * 1000;
     setInterval(() => {
       try {
         reportResult(commitOnce());
@@ -481,8 +512,7 @@ function main() {
   }
 }
 
-// Only run the CLI when executed directly (`node scripts/git-autocommit.mjs`),
-// not when imported (e.g. by the test file).
+// Only run the CLI when executed directly, not when imported by tests.
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   main();

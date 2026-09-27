@@ -3,90 +3,102 @@
 //! Per PRD FR-WIKI-06 / §8.4: vault sync is git-only, with auto-commit every
 //! 5 min. This task never pushes; it never commits anything outside
 //! `vault/`; it skips silently when not inside a git repo or `vault/`
-//! doesn't exist.
+//! doesn't exist. The Node twin is `scripts/git-autocommit.mjs`; both must
+//! stay in exact semantic parity, and the secret lists live in ONE shared
+//! file, `scripts/git-autocommit-secret-patterns.json` (`include_str!` here,
+//! `readFileSync` there).
+//!
+//! ## Path handling (E5-1, E5-4, E5-5)
+//!
+//! Every path-listing git command runs with `-z` and its output is handled
+//! as raw bytes, so non-ASCII names are never C-quoted or mangled and round-
+//! trip exactly. Every git call runs with `GIT_LITERAL_PATHSPECS=1`, and no
+//! user path is ever put on a command line: per-path input goes through
+//! stdin (`update-index -z --index-info`, `cat-file --batch`) or a NUL-
+//! delimited `--pathspec-from-file`.
 //!
 //! ## Isolated-index algorithm (A05)
 //!
-//! The naive approach (`git add vault/ && git commit`) stages and commits
-//! through the *shared* index, which means any unrelated change the user had
-//! already staged (outside `vault/`) gets swept into the auto-commit too.
-//! To avoid that we build the commit through a throwaway index that never
-//! touches the user's real one:
-//!
-//! 0. Before anything else, if a pending-index-sync marker file exists
-//!    (`<git-dir>/skippy-autocommit-pending`, left behind by a previous tick
-//!    whose commit landed but whose real-index sync failed), retry syncing
-//!    just the paths that are still safe to touch, then clear the marker.
-//!    See [`recover_pending_sync`].
-//! 1. Resolve `HEAD` (or note it's unborn — no commits yet).
+//! 0. If a pending-index-sync marker exists
+//!    (`<git-dir>/skippy-autocommit-pending`, `{version, ref, new, parent}`,
+//!    left by a tick whose commit landed but whose real-index sync failed),
+//!    validate it first (E5-2): recover only if HEAD is still symbolically on
+//!    `ref` and resolves to exactly `new`; otherwise (reset --hard, checkout
+//!    of another branch, a user commit on top, a corrupt marker) drop it
+//!    WITHOUT touching the index and report it as dropped. If recovery is
+//!    attempted and fails, the tick stops with an explicit error rather than
+//!    stacking a commit on an unsynced index. See [`recover_pending_sync`].
+//! 1. Resolve `HEAD` (or note it's unborn) and the symbolic ref it names.
 //! 2. Fail fast, without touching anything, if `<git-dir>/index.lock`
 //!    already exists (someone else holds the real index lock).
-//! 3. Seed a temp index file with `GIT_INDEX_FILE=<tmp> git read-tree HEAD`
-//!    (skipped when HEAD is unborn — an empty index is the correct seed).
-//! 4. `GIT_INDEX_FILE=<tmp> git add -A -- vault` stages *only* the vault
-//!    pathspec (respecting `.gitignore`) into the temp index, from the
-//!    working tree. `write-tree` + `diff HEAD` against it gives the full
-//!    candidate path list.
-//! 5. From that candidate list, compute three exclusion sets and restore
-//!    each matching path back to its HEAD state in the temp index (or
-//!    remove it if HEAD doesn't have it), so none of them are ever part of
-//!    this auto-commit:
-//!      a. skip-worktree / assume-unchanged vault paths
-//!         ([`list_flagged_vault_paths`]),
-//!      b. paths whose staged blob differs from BOTH HEAD and the working
-//!         tree ("staged-vs-worktree conflict",
-//!         [`list_staged_vs_worktree_conflicts`]),
-//!      c. well-known secret filenames ([`SECRET_FILENAME_PATTERNS`]) and,
-//!         for everything else, a content scan of the working-tree bytes
-//!         for high-confidence secret markers ([`SECRET_CONTENT_PATTERNS`]).
-//!    All three are reported back to the caller as `skipped` paths.
-//! 6. `write-tree` again (only if anything was restored). If the resulting
-//!    tree is identical to what HEAD already has for `vault/`, there's
-//!    nothing to commit — bail out cleanly (`Ok(AutocommitOutcome::NoOp)`).
+//! 3. Snapshot the real index's vault entries (`ls-files -s -v -z`) and
+//!    HEAD's (`ls-tree -r -z`). A vault path is USER-OWNED (E5-6/E5-7) if
+//!    its real-index entry differs from HEAD in any way: staged add/modify/
+//!    delete, `rm --cached`, either side of a rename or copy, intent-to-add,
+//!    or unmerged. Skip-worktree / assume-unchanged paths are FLAGGED.
+//!    Neither is ever committed or re-synced.
+//! 4. Seed a throwaway index (`GIT_INDEX_FILE=<tmp> git read-tree HEAD`),
+//!    `add -A -- vault` into it, `write-tree` -> preliminary tree. The
+//!    candidate list is every vault path whose (mode, oid) differs between
+//!    HEAD and that tree.
+//! 5. Exclusions, each restored to its HEAD state in the temp index (or
+//!    removed if HEAD lacks it) with ONE `update-index -z --index-info`:
+//!      a. flagged paths, b. user-owned paths,
+//!      c. secret filename hits, d. secret content hits — the content scan
+//!         reads the exact blobs the commit would contain (`cat-file
+//!         --batch`), one char per byte and again with NULs stripped (UTF-16).
+//!    All are reported back as `skipped` paths.
+//! 6. If nothing is left, no-op. Otherwise `write-tree` -> final tree.
 //! 7. `git commit-tree <tree> [-p HEAD] -m <msg>` builds the commit object.
 //!    `commit-tree` is plumbing: it never runs commit hooks, so a flaky
 //!    `pre-commit`/`commit-msg` hook (or a secret-scanning one) in the
 //!    user's repo cannot block, corrupt, or protect vault sync — which is
-//!    exactly why the exclusions in step 5c exist as a *built-in* guard.
+//!    exactly why the exclusions in step 5c/5d exist as a *built-in* guard.
 //! 8. `git update-ref HEAD <new> <old>` advances HEAD with a compare-and-
-//!    swap: `<old>` is the HEAD we observed in step 1 (or the empty string
-//!    for "must not exist yet" when unborn). If something else moved HEAD
-//!    in the meantime, this fails explicitly instead of silently
-//!    clobbering a concurrent commit, and nothing else has happened yet —
-//!    the real index and working tree are untouched.
-//! 9. Only *after* that succeeds do we touch the real index, and only for
-//!    the vault paths that actually changed, excluding everything from step
-//!    5 (so a plain `git reset` can never strip their skip-worktree /
-//!    assume-unchanged flags even though their content is unchanged). If
-//!    this sync fails (e.g. something else grabbed the index lock right
-//!    after our commit landed), the commit is **not** rolled back and is
-//!    **not** reported as a failure — HEAD has already moved. Instead a
-//!    pending marker is written (new sha + parent sha) and the outcome is
-//!    [`AutocommitOutcome::CommittedIndexSyncPending`]; the next tick's step
-//!    0 finishes the job.
+//!    swap (`<old>` empty = "must not exist yet" when unborn). If something
+//!    else moved HEAD, this fails explicitly before the real index is
+//!    touched.
+//! 9. Sync the real index ONLY for the committed paths (parent -> new), and
+//!    only those whose real-index entry still equals the parent's (re-read at
+//!    sync time), via `reset -q <new> --pathspec-from-file` (literal, NUL-
+//!    delimited). If that fails after bounded retries, the commit is **not**
+//!    rolled back and **not** reported as a failure: a pending marker is
+//!    written and the outcome is
+//!    [`AutocommitOutcome::CommittedIndexSyncPending`].
 //!
-//! The temp index file is removed in all cases (success, no-op, or error).
+//! Known window (E5-9): between step 8 and a successful sync (normally
+//! milliseconds; up to the next tick if the sync hit a held `index.lock`),
+//! the real index still holds the parent's blobs for the committed paths. A
+//! user `git commit` made inside that window records those parent blobs,
+//! i.e. it reverts the autocommitted vault change in the user's commit. The
+//! marker is then dropped (HEAD moved) and the next tick re-commits the
+//! working-tree content, so the revert lasts only until the next tick.
+//!
+//! The temp index / pathspec files are removed in all cases.
 //!
 //! ## Secrets (FR-WIKI-06)
 //!
 //! `commit-tree` never runs hooks, so a repo's own secret-scanning
 //! pre-commit hook can never see (or block) this commit. The built-in guard
-//! above is the only line of defense: a static filename/extension exclusion
-//! list (`.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`,
-//! `id_ed25519*`, `id_ecdsa*`, `*credentials*.json`, `.npmrc`, `.netrc`,
-//! `*.kdbx`, `secrets.*`) plus a content scan of every remaining candidate
-//! blob's working-tree bytes for high-confidence secret markers (private
-//! key headers, AWS access key ids, Anthropic/GitHub/Slack token prefixes).
-//! Matches are skipped — left exactly as HEAD has them, or absent — never
-//! committed, and reported back as `skipped` paths.
+//! is the only line of defense: filename rules (case-insensitive: `.env` /
+//! `.env.*`, `.envrc`, key/cert/keystore extensions, `id_*` SSH keys,
+//! `*credentials*.json`, `.npmrc`/`.netrc`/`_netrc`/`.pypirc`/
+//! `.git-credentials`, `secrets.*` except Markdown notes) plus a content scan
+//! for private-key armor (incl. PGP), AWS key ids and secret-key
+//! assignments, Anthropic/OpenAI/Stripe/GitHub/Slack/Google key shapes.
+//! Matches are skipped — left exactly as HEAD has them, or absent.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use once_cell::sync::Lazy;
 use regex::Regex;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -98,53 +110,90 @@ const VAULT_PATHSPEC: &str = "vault";
 /// Git's well-known empty-tree object id (`git hash-object -t tree /dev/null`).
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const PENDING_MARKER_NAME: &str = "skippy-autocommit-pending";
+const PENDING_MARKER_VERSION: u64 = 2;
 const SYNC_RETRY_ATTEMPTS: u32 = 3;
 const SYNC_RETRY_DELAY_MS: u64 = 20;
 
-/// Built-in exclusion list (FR-WIKI-06 secret guard). Filenames/extensions
-/// that should never be swept into the vault auto-commit, matched against
-/// the vault-relative path. Kept in parity with the Node twin's
-/// `SECRET_FILENAME_PATTERNS`.
-static SECRET_FILENAME_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    [
-        r"(^|/)\.env[^/]*$",
-        r"\.pem$",
-        r"\.key$",
-        r"\.p12$",
-        r"\.pfx$",
-        r"(^|/)id_rsa[^/]*$",
-        r"(^|/)id_ed25519[^/]*$",
-        r"(^|/)id_ecdsa[^/]*$",
-        r"(?i)credentials[^/]*\.json$",
-        r"(^|/)\.npmrc$",
-        r"(^|/)\.netrc$",
-        r"\.kdbx$",
-        r"(?i)(^|/)secrets\.[^/]*$",
-    ]
-    .iter()
-    .map(|p| Regex::new(p).expect("static secret filename pattern"))
-    .collect()
+/// Shared with the Node twin (single source of truth).
+const SECRET_PATTERNS_JSON: &str = include_str!("../../../../scripts/git-autocommit-secret-patterns.json");
+
+/// A repo-relative path as raw bytes (exactly what git stores).
+type BPath = Vec<u8>;
+/// Vault entries keyed by path: value is `"<mode> <oid>"`.
+type Entries = BTreeMap<BPath, String>;
+
+struct FilenameRule {
+    re: Regex,
+    unless: Option<Regex>,
+}
+
+struct ContentRule {
+    re: Regex,
+    ignore_ascii_case: bool,
+}
+
+struct SecretRules {
+    filename: Vec<FilenameRule>,
+    content: Vec<ContentRule>,
+}
+
+static SECRET_RULES: Lazy<SecretRules> = Lazy::new(|| {
+    let v: serde_json::Value = serde_json::from_str(SECRET_PATTERNS_JSON).expect("secret patterns JSON");
+    let re = |s: &serde_json::Value| Regex::new(s.as_str().expect("pattern string")).expect("secret pattern regex");
+    let filename = v["filename"]
+        .as_array()
+        .expect("filename rules")
+        .iter()
+        .map(|r| FilenameRule {
+            re: re(&r["pattern"]),
+            unless: r.get("unless").map(re),
+        })
+        .collect();
+    let content = v["content"]
+        .as_array()
+        .expect("content rules")
+        .iter()
+        .map(|r| ContentRule {
+            re: re(&r["pattern"]),
+            ignore_ascii_case: r.get("ignoreAsciiCase").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        })
+        .collect();
+    SecretRules { filename, content }
 });
 
-/// High-confidence secret content markers. A hit on any candidate blob's
-/// working-tree content excludes that path from the commit, regardless of
-/// its name. Kept in parity with the Node twin's `SECRET_CONTENT_PATTERNS`.
-static SECRET_CONTENT_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
-    [
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-        r"AKIA[0-9A-Z]{16}",
-        r"sk-ant-",
-        r"gh[po]_[A-Za-z0-9]{20,}",
-        r"github_pat_[A-Za-z0-9_]{20,}",
-        r"xox[baprs]-[A-Za-z0-9-]+",
-    ]
-    .iter()
-    .map(|p| Regex::new(p).expect("static secret content pattern"))
-    .collect()
-});
+/// One char per byte (identical to Node's `Buffer#toString('latin1')`).
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
 
-fn matches_secret_filename(vault_relative_path: &str) -> bool {
-    SECRET_FILENAME_PATTERNS.iter().any(|re| re.is_match(vault_relative_path))
+/// Secret filename rules, matched against the ASCII-lowercased path.
+fn matches_secret_filename(path: &[u8]) -> bool {
+    let p = latin1(&path.to_ascii_lowercase());
+    SECRET_RULES
+        .filename
+        .iter()
+        .any(|r| r.re.is_match(&p) && !r.unless.as_ref().is_some_and(|u| u.is_match(&p)))
+}
+
+/// Secret content rules, matched against the exact blob bytes (one char per
+/// byte) and, if it has NULs, again with every NUL removed (UTF-16 text).
+fn matches_secret_content(bytes: &[u8]) -> bool {
+    let mut views = vec![latin1(bytes)];
+    if bytes.contains(&0) {
+        let stripped: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+        views.push(latin1(&stripped));
+    }
+    views.iter().any(|view| {
+        let lower = view.to_ascii_lowercase();
+        SECRET_RULES
+            .content
+            .iter()
+            .any(|r| r.re.is_match(if r.ignore_ascii_case { &lower } else { view }))
+    })
+}
+
+fn display_path(p: &[u8]) -> String {
+    String::from_utf8_lossy(p).into_owned()
 }
 
 /// Outcome of one autocommit tick.
@@ -165,6 +214,26 @@ impl AutocommitOutcome {
     pub fn committed(&self) -> bool {
         !matches!(self, AutocommitOutcome::NoOp)
     }
+}
+
+/// Result of [`recover_pending_sync`].
+#[allow(dead_code)] // fields are surfaced for logging/tests; not all callers read them
+#[derive(Debug, Clone)]
+pub struct RecoveryOutcome {
+    pub synced: bool,
+    pub new_sha: Option<String>,
+    /// Set when the marker was discarded without touching the index.
+    pub dropped: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Full result of one tick (mirrors the Node twin's return value).
+#[derive(Debug, Clone)]
+pub(crate) struct AutocommitReport {
+    pub outcome: AutocommitOutcome,
+    /// Vault paths withheld from the commit (user-staged, flagged, secret).
+    pub skipped: Vec<String>,
+    pub recovered: Option<RecoveryOutcome>,
 }
 
 /// Find the workspace root by walking up from cwd looking for `.git/`. Returns
@@ -237,39 +306,69 @@ pub fn spawn_autocommit(bus: Arc<EventBus>) {
     });
 }
 
-/// Run a git subcommand with `-C root`, returning stdout (trimmed) on
-/// success or an error containing stderr on failure. `extra_env` is applied
-/// on top of the inherited environment (used for `GIT_INDEX_FILE`).
-async fn git(root: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Result<String> {
+/// Run `git -C root <args>` with `GIT_LITERAL_PATHSPECS=1` plus `extra_env`,
+/// feeding `input` on stdin, returning raw stdout or an error with stderr.
+async fn git_raw<S: AsRef<OsStr>>(
+    root: &Path,
+    args: &[S],
+    extra_env: &[(&str, &OsStr)],
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(root);
     cmd.args(args);
+    cmd.env("GIT_LITERAL_PATHSPECS", "1");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn git {args:?}"))?;
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let describe = || {
+        args.iter()
+            .map(|a| a.as_ref().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut child = cmd.spawn().with_context(|| format!("failed to spawn git {}", describe()))?;
+    let stdin = child.stdin.take();
+    let write = async move {
+        match (stdin, input) {
+            (Some(mut s), Some(data)) => {
+                let r = s.write_all(data).await;
+                drop(s);
+                r
+            }
+            _ => Ok(()),
+        }
+    };
+    let (written, output) = tokio::join!(write, child.wait_with_output());
+    let output = output.with_context(|| format!("failed to run git {}", describe()))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git {args:?} failed: {}", stderr.trim());
+        bail!("git {} failed: {}", describe(), stderr.trim());
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    written.with_context(|| format!("failed to write stdin of git {}", describe()))?;
+    Ok(output.stdout)
 }
 
-/// Same as [`git`] but tolerates any nonzero exit (used for boolean-style
-/// commands like `diff --quiet`); returns the raw exit status alongside
-/// stdout/stderr.
-async fn git_status_only(root: &Path, args: &[&str]) -> Result<std::process::ExitStatus> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(root);
-    cmd.args(args);
-    let output = cmd
-        .output()
-        .await
-        .with_context(|| format!("failed to spawn git {args:?}"))?;
-    Ok(output.status)
+/// [`git_raw`] without stdin, returning trimmed UTF-8 stdout. `extra_env` is
+/// applied on top of the inherited environment (used for `GIT_INDEX_FILE`).
+async fn git(root: &Path, args: &[&str], extra_env: &[(&str, &OsStr)]) -> Result<String> {
+    let out = git_raw(root, args, extra_env, None).await?;
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// Split `-z` output into records.
+fn split_z(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
+    buf.split(|&b| b == 0).filter(|r| !r.is_empty())
+}
+
+/// `(meta fields, path)` of a `<meta>\t<path>` record.
+fn split_record(rec: &[u8]) -> Option<(Vec<String>, BPath)> {
+    let tab = rec.iter().position(|&b| b == b'\t')?;
+    let meta = latin1(&rec[..tab]).split(' ').map(str::to_string).collect();
+    Some((meta, rec[tab + 1..].to_vec()))
 }
 
 /// Resolve the git directory (handles worktrees/submodules where `.git` is a
@@ -285,131 +384,148 @@ async fn resolve_git_dir(root: &Path) -> Result<PathBuf> {
 /// `Some(sha)` if `HEAD` resolves to a commit, `None` if HEAD is unborn
 /// (fresh repo, no commits yet).
 async fn resolve_head(root: &Path) -> Result<Option<String>> {
-    let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(root).args(["rev-parse", "--verify", "-q", "HEAD"]);
-    let output = cmd.output().await.context("failed to spawn git rev-parse HEAD")?;
-    if output.status.success() {
-        Ok(Some(String::from_utf8_lossy(&output.stdout).trim().to_string()))
-    } else {
-        Ok(None)
-    }
+    Ok(git(root, &["rev-parse", "--verify", "-q", "HEAD"], &[]).await.ok())
 }
 
-fn lines(s: &str) -> Vec<String> {
-    s.split('\n').filter(|l| !l.is_empty()).map(str::to_string).collect()
-}
-
-/// True if `tree` differs from what `head` (or the empty tree, if unborn)
-/// currently has for the vault pathspec.
-async fn vault_tree_changed(root: &Path, head: Option<&str>, tree: &str) -> Result<bool> {
-    let base = head.unwrap_or(EMPTY_TREE);
-    let status = git_status_only(root, &["diff", "--quiet", base, tree, "--", VAULT_PATHSPEC])
+/// The ref HEAD points at (`refs/heads/main`), or `None` when detached.
+async fn resolve_symbolic_head(root: &Path) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .stdin(Stdio::null())
+        .output()
         .await
-        .context("git diff --quiet base..tree failed to run")?;
-    match status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => bail!("git diff --quiet exited abnormally ({status:?})"),
+        .context("failed to spawn git symbolic-ref")?;
+    match output.status.code() {
+        Some(0) => {
+            let r = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            Ok(if r.is_empty() { None } else { Some(r) })
+        }
+        Some(1) => Ok(None), // detached
+        _ => bail!(
+            "git symbolic-ref -q HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
     }
 }
 
-/// Vault paths that changed between `base` and `tree`.
-async fn changed_vault_paths(root: &Path, base: &str, tree: &str) -> Vec<String> {
-    match git(root, &["diff", "--name-only", base, tree, "--", VAULT_PATHSPEC], &[]).await {
-        Ok(out) => lines(&out),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// skip-worktree (`S` tag) and assume-unchanged (any lowercase tag) vault
-/// paths, from the REAL index (not the throwaway one).
-async fn list_flagged_vault_paths(root: &Path) -> Vec<String> {
-    let out = match git(root, &["ls-files", "-v", "--", VAULT_PATHSPEC], &[]).await {
-        Ok(out) => out,
-        Err(_) => return Vec::new(),
+/// Vault entries of a tree-ish (empty for `None` / the empty tree).
+async fn tree_entries(root: &Path, treeish: Option<&str>) -> Result<Entries> {
+    let mut map = Entries::new();
+    let Some(treeish) = treeish.filter(|t| *t != EMPTY_TREE) else {
+        return Ok(map);
     };
-    let mut flagged = Vec::new();
-    for line in lines(&out) {
-        if line.len() < 3 {
+    let out = git_raw(root, &["ls-tree", "-r", "-z", treeish, "--", VAULT_PATHSPEC], &[], None)
+        .await
+        .context("git ls-tree failed")?;
+    for rec in split_z(&out) {
+        let (meta, path) = split_record(rec).ok_or_else(|| anyhow!("malformed ls-tree record"))?;
+        if meta.len() < 3 {
+            bail!("malformed ls-tree record");
+        }
+        map.insert(path, format!("{} {}", meta[0], meta[2]));
+    }
+    Ok(map)
+}
+
+/// Real-index vault snapshot.
+struct IndexSnapshot {
+    /// Stage-0 entries.
+    entries: Entries,
+    /// skip-worktree (`S`) / assume-unchanged (lowercase tag) paths.
+    flagged: BTreeSet<BPath>,
+    /// Paths with any nonzero stage.
+    unmerged: BTreeSet<BPath>,
+}
+
+async fn real_index_snapshot(root: &Path) -> Result<IndexSnapshot> {
+    let out = git_raw(root, &["ls-files", "-s", "-v", "-z", "--", VAULT_PATHSPEC], &[], None)
+        .await
+        .context("git ls-files -s -v failed")?;
+    let mut snap = IndexSnapshot {
+        entries: Entries::new(),
+        flagged: BTreeSet::new(),
+        unmerged: BTreeSet::new(),
+    };
+    for rec in split_z(&out) {
+        let (meta, path) = split_record(rec).ok_or_else(|| anyhow!("malformed ls-files record"))?;
+        if meta.len() < 4 {
+            bail!("malformed ls-files record");
+        }
+        if meta[3] != "0" {
+            snap.unmerged.insert(path);
             continue;
         }
-        let tag = line.as_bytes()[0];
-        let path = line[2..].to_string();
+        let tag = meta[0].as_bytes().first().copied().unwrap_or(b'H');
         if tag == b'S' || tag.is_ascii_lowercase() {
-            flagged.push(path);
+            snap.flagged.insert(path.clone());
+        }
+        snap.entries.insert(path, format!("{} {}", meta[1], meta[2]));
+    }
+    Ok(snap)
+}
+
+/// Paths whose entry differs between two entry maps, in byte order.
+fn differing_paths(a: &Entries, b: &Entries) -> Vec<BPath> {
+    let mut out: BTreeSet<BPath> = BTreeSet::new();
+    for (p, v) in a {
+        if b.get(p) != Some(v) {
+            out.insert(p.clone());
         }
     }
-    flagged
-}
-
-/// Vault paths whose staged blob differs from BOTH HEAD and the working
-/// tree ("staged-vs-worktree conflict" — a partially-staged vault edit).
-async fn list_staged_vs_worktree_conflicts(root: &Path) -> Vec<String> {
-    let staged = match git(root, &["diff", "--cached", "--name-only", "--", VAULT_PATHSPEC], &[]).await {
-        Ok(out) => lines(&out),
-        Err(_) => Vec::new(),
-    };
-    let worktree: std::collections::HashSet<String> =
-        match git(root, &["diff", "--name-only", "--", VAULT_PATHSPEC], &[]).await {
-            Ok(out) => lines(&out).into_iter().collect(),
-            Err(_) => std::collections::HashSet::new(),
-        };
-    staged.into_iter().filter(|p| worktree.contains(p)).collect()
-}
-
-/// Restore `path` in the temp index to its HEAD state, or remove it
-/// entirely if HEAD doesn't have it — undoing whatever `add -A` staged
-/// there so it's never part of this auto-commit.
-async fn restore_path_to_head(root: &Path, temp_index: &str, head: Option<&str>, path: &str) -> Result<()> {
-    let env = [("GIT_INDEX_FILE", temp_index)];
-    let mut head_entry = String::new();
-    if let Some(head) = head {
-        head_entry = git(root, &["ls-tree", head, "--", path], &[]).await.unwrap_or_default();
-    }
-    if let Some((mode, sha)) = parse_ls_tree_blob(&head_entry) {
-        // --add: the path may have been removed from the temp index
-        // entirely (e.g. `add -A` staged a deletion for a skip-worktree
-        // file that no longer exists on disk), in which case a bare
-        // --cacheinfo update would fail with "missing --add option".
-        let cacheinfo = format!("{mode},{sha},{path}");
-        git(root, &["update-index", "--add", "--cacheinfo", &cacheinfo], &env)
-            .await
-            .context("git update-index --cacheinfo failed while restoring an excluded vault path")?;
-        return Ok(());
-    }
-    // Not in HEAD (or not a blob): ensure it's absent from the temp index.
-    // `--force-remove` errors if the path is already absent; that's fine.
-    let _ = git(root, &["update-index", "--force-remove", "--", path], &env).await;
-    Ok(())
-}
-
-fn parse_ls_tree_blob(entry: &str) -> Option<(String, String)> {
-    // "<mode> blob <sha>\t<path>"
-    let (head, _) = entry.split_once('\t')?;
-    let mut parts = head.split_whitespace();
-    let mode = parts.next()?;
-    let kind = parts.next()?;
-    let sha = parts.next()?;
-    if kind != "blob" {
-        return None;
-    }
-    Some((mode.to_string(), sha.to_string()))
-}
-
-async fn scan_working_tree_for_secrets(root: &Path, paths: &[String]) -> Vec<String> {
-    let mut hits = Vec::new();
-    for p in paths {
-        let abs = root.join(p);
-        let content = match tokio::fs::read(&abs).await {
-            Ok(bytes) => bytes,
-            Err(_) => continue, // deletion, or unreadable: nothing to scan
-        };
-        let text = String::from_utf8_lossy(&content);
-        if SECRET_CONTENT_PATTERNS.iter().any(|re| re.is_match(&text)) {
-            hits.push(p.clone());
+    for p in b.keys() {
+        if !a.contains_key(p) {
+            out.insert(p.clone());
         }
     }
-    hits
+    out.into_iter().collect()
+}
+
+/// Vault paths the user has staged something for (real index != HEAD).
+fn user_owned_paths(snap: &IndexSnapshot, head_entries: &Entries) -> BTreeSet<BPath> {
+    let mut owned = snap.unmerged.clone();
+    owned.extend(differing_paths(&snap.entries, head_entries));
+    owned
+}
+
+/// Content-scan blobs by oid with one `cat-file --batch`. Returns hit oids.
+async fn scan_blobs_for_secrets(root: &Path, oids: &[String]) -> Result<BTreeSet<String>> {
+    let unique: Vec<String> = oids.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
+    let mut hits = BTreeSet::new();
+    if unique.is_empty() {
+        return Ok(hits);
+    }
+    let input: String = unique.iter().map(|o| format!("{o}\n")).collect();
+    let out = git_raw(root, &["cat-file", "--batch"], &[], Some(input.as_bytes()))
+        .await
+        .context("git cat-file --batch failed")?;
+    let mut pos = 0usize;
+    for oid in &unique {
+        let nl = out[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| pos + i)
+            .ok_or_else(|| anyhow!("cat-file --batch: truncated output"))?;
+        let header = latin1(&out[pos..nl]);
+        let fields: Vec<&str> = header.split(' ').collect();
+        pos = nl + 1;
+        if fields.get(1) == Some(&"missing") {
+            bail!("cat-file --batch: blob {oid} missing");
+        }
+        let size: usize = fields
+            .get(2)
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow!("cat-file --batch: unexpected header"))?;
+        if fields[0] != oid || pos + size > out.len() {
+            bail!("cat-file --batch: unexpected header");
+        }
+        if matches_secret_content(&out[pos..pos + size]) {
+            hits.insert(oid.clone());
+        }
+        pos += size + 1; // trailing LF
+    }
+    Ok(hits)
 }
 
 /// Build the commit object for `tree` (parented on `head`, if any) and
@@ -443,15 +559,15 @@ async fn commit_and_advance_head(
     Ok(new_commit)
 }
 
-async fn with_retries<F, Fut>(mut f: F) -> Result<()>
+async fn with_retries<T, F, Fut>(mut f: F) -> Result<T>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<T>>,
 {
     let mut last_err = None;
     for attempt in 0..SYNC_RETRY_ATTEMPTS {
         match f().await {
-            Ok(()) => return Ok(()),
+            Ok(v) => return Ok(v),
             Err(e) => {
                 last_err = Some(e);
                 if attempt + 1 < SYNC_RETRY_ATTEMPTS {
@@ -463,22 +579,53 @@ where
     Err(last_err.unwrap())
 }
 
-/// Bring the real index's vault entries that actually changed in line with
-/// `commit`, excluding every path in `excluded` (skip-worktree,
-/// assume-unchanged, staged-vs-worktree conflicts, secret hits — none of
-/// which changed in `commit` to begin with, but excluded defensively so a
-/// `git reset` can never strip their flags).
-async fn sync_real_index_after_commit(root: &Path, commit: &str, excluded: &[String]) -> Result<()> {
+/// Bring the real index in line with `new_commit` for exactly `paths` (the
+/// paths the autocommit changed), skipping any path whose real-index entry
+/// no longer equals `parent_entries` (the user staged something since), is
+/// flagged, or is unmerged. Literal, NUL-delimited pathspec file; never a
+/// whole-vault reset. Returns the number of paths synced.
+async fn sync_real_index(
+    root: &Path,
+    git_dir: &Path,
+    new_commit: &str,
+    parent_entries: &Entries,
+    paths: &[BPath],
+) -> Result<usize> {
     with_retries(|| async {
-        let mut args: Vec<String> = vec!["reset".into(), "-q".into(), commit.into(), "--".into(), VAULT_PATHSPEC.into()];
-        for p in excluded {
-            args.push(format!(":(exclude){p}"));
+        let snap = real_index_snapshot(root).await?;
+        let safe: Vec<&BPath> = paths
+            .iter()
+            .filter(|p| {
+                !snap.flagged.contains(*p)
+                    && !snap.unmerged.contains(*p)
+                    && snap.entries.get(*p) == parent_entries.get(*p)
+            })
+            .collect();
+        if safe.is_empty() {
+            return Ok(0); // never run a pathspec-less reset
         }
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        git(root, &arg_refs, &[])
+        let spec_file = git_dir.join(format!("skippy-autocommit-pathspec-{}", uuid::Uuid::new_v4()));
+        let mut content = Vec::new();
+        for p in &safe {
+            content.extend_from_slice(p);
+            content.push(0);
+        }
+        tokio::fs::write(&spec_file, &content)
             .await
-            .context("git reset -q <commit> -- vault failed to sync real index")?;
-        Ok(())
+            .context("failed to write pathspec file")?;
+        let mut spec_arg = OsString::from("--pathspec-from-file=");
+        spec_arg.push(&spec_file);
+        let args: Vec<OsString> = vec![
+            "reset".into(),
+            "-q".into(),
+            new_commit.into(),
+            spec_arg,
+            "--pathspec-file-nul".into(),
+        ];
+        let result = git_raw(root, &args, &[], None).await;
+        let _ = tokio::fs::remove_file(&spec_file).await;
+        result.context("git reset -q <commit> --pathspec-from-file failed to sync the real index")?;
+        Ok(safe.len())
     })
     .await
 }
@@ -487,100 +634,132 @@ fn pending_marker_path(git_dir: &Path) -> PathBuf {
     git_dir.join(PENDING_MARKER_NAME)
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PendingMarker {
-    new: String,
-    parent: Option<String>,
-}
-
-async fn write_pending_marker(git_dir: &Path, new_sha: &str, parent_sha: Option<&str>) -> Result<()> {
-    let marker = PendingMarker {
-        new: new_sha.to_string(),
-        parent: parent_sha.map(str::to_string),
-    };
-    let json = serde_json::to_string(&marker)?;
-    tokio::fs::write(pending_marker_path(git_dir), json).await?;
+async fn write_pending_marker(
+    git_dir: &Path,
+    head_ref: Option<&str>,
+    new_sha: &str,
+    parent_sha: Option<&str>,
+) -> Result<()> {
+    let json = serde_json::json!({
+        "version": PENDING_MARKER_VERSION,
+        "ref": head_ref,
+        "new": new_sha,
+        "parent": parent_sha,
+    });
+    tokio::fs::write(pending_marker_path(git_dir), json.to_string()).await?;
     Ok(())
 }
 
-async fn real_index_blob_for(root: &Path, path: &str) -> Option<String> {
-    let out = git(root, &["ls-files", "-s", "--", path], &[]).await.ok()?;
-    let line = out.lines().next()?;
-    let mut parts = line.split_whitespace();
-    let _mode = parts.next()?;
-    Some(parts.next()?.to_string())
+struct PendingMarker {
+    new: String,
+    parent: Option<String>,
+    /// `None` = legacy (v1) marker without a ref; `Some(None)` = detached.
+    head_ref: Option<Option<String>>,
 }
 
-async fn tree_blob_for(root: &Path, tree: &str, path: &str) -> Option<String> {
-    if tree == EMPTY_TREE {
-        return None;
-    }
-    let out = git(root, &["ls-tree", tree, "--", path], &[]).await.ok()?;
-    parse_ls_tree_blob(&out).map(|(_, sha)| sha)
+fn is_oid(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Result of [`recover_pending_sync`].
-#[allow(dead_code)] // new_sha/error are surfaced for logging/tests; not all callers read them
-#[derive(Debug, Clone)]
-pub struct RecoveryOutcome {
-    pub synced: bool,
-    pub new_sha: String,
-    pub error: Option<String>,
+/// Validate a marker's JSON; `None` if unusable.
+fn parse_marker(raw: &str) -> Option<PendingMarker> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = v.as_object()?;
+    let new = obj.get("new")?.as_str().filter(|s| is_oid(s))?.to_string();
+    let parent = match obj.get("parent") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) if is_oid(s) => Some(s.clone()),
+        Some(_) => return None,
+    };
+    let head_ref = match obj.get("ref") {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) if s.starts_with("refs/") => Some(Some(s.clone())),
+        Some(_) => return None,
+    };
+    Some(PendingMarker { new, parent, head_ref })
 }
 
-/// Step 0 of every tick: if a previous tick's commit landed but its
-/// real-index sync failed, finish the job now, before touching anything
-/// else. Only paths whose real-index entry still equals the PARENT commit's
-/// blob (i.e. untouched by the user since) are synced — anything the user
-/// has since staged differently is left alone and stays pending rather than
-/// being clobbered.
+/// Step 0 of every tick. See the module docs. `None` if there was no marker.
 async fn recover_pending_sync(root: &Path, git_dir: &Path) -> Option<RecoveryOutcome> {
     let marker_path = pending_marker_path(git_dir);
-    let raw = tokio::fs::read_to_string(&marker_path).await.ok()?;
-    let marker: PendingMarker = match serde_json::from_str(&raw) {
-        Ok(m) => m,
-        Err(_) => {
-            // Corrupt marker: drop it rather than getting stuck forever.
-            let _ = tokio::fs::remove_file(&marker_path).await;
-            return None;
+    let raw = match tokio::fs::read(&marker_path).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(RecoveryOutcome {
+                synced: false,
+                new_sha: None,
+                dropped: None,
+                error: Some(format!("cannot read pending marker: {e}")),
+            })
         }
     };
+    let Some(marker) = parse_marker(&raw) else {
+        let _ = tokio::fs::remove_file(&marker_path).await;
+        return Some(RecoveryOutcome {
+            synced: false,
+            new_sha: None,
+            dropped: Some("corrupt pending marker".into()),
+            error: None,
+        });
+    };
 
-    let base = marker.parent.clone().unwrap_or_else(|| EMPTY_TREE.to_string());
-    let new_sha = marker.new.clone();
-
-    let result = with_retries(|| {
-        let base = base.clone();
-        let new_sha = new_sha.clone();
-        async move {
-            let changed = changed_vault_paths(root, &base, &new_sha).await;
-            let mut safe = Vec::new();
-            for p in &changed {
-                let index_blob = real_index_blob_for(root, p).await;
-                let parent_blob = tree_blob_for(root, &base, p).await;
-                if index_blob == parent_blob {
-                    safe.push(p.clone());
-                }
-            }
-            if !safe.is_empty() {
-                let mut args: Vec<String> = vec!["reset".into(), "-q".into(), new_sha.clone(), "--".into()];
-                args.extend(safe);
-                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                git(root, &arg_refs, &[])
-                    .await
-                    .context("recovery: git reset -q <new> -- <safe paths> failed")?;
-            }
-            Ok(())
+    let checked = async {
+        let head = resolve_head(root).await?;
+        let head_ref = resolve_symbolic_head(root).await?;
+        Ok::<_, anyhow::Error>((head, head_ref))
+    }
+    .await;
+    let (head, head_ref) = match checked {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(RecoveryOutcome {
+                synced: false,
+                new_sha: Some(marker.new),
+                dropped: None,
+                error: Some(format!("{e:#}")),
+            })
         }
-    })
+    };
+    // Legacy (v1) markers carry no ref: only the HEAD check applies.
+    let ref_ok = match &marker.head_ref {
+        None => true,
+        Some(r) => *r == head_ref,
+    };
+    if head.as_deref() != Some(marker.new.as_str()) || !ref_ok {
+        let _ = tokio::fs::remove_file(&marker_path).await;
+        let on = match &marker.head_ref {
+            Some(r) => format!(" on {}", r.as_deref().unwrap_or("(detached)")),
+            None => String::new(),
+        };
+        return Some(RecoveryOutcome {
+            synced: false,
+            new_sha: Some(marker.new.clone()),
+            dropped: Some(format!("HEAD is no longer {}{on}; index left untouched", marker.new)),
+            error: None,
+        });
+    }
+
+    let result = async {
+        let parent_entries = tree_entries(root, marker.parent.as_deref()).await?;
+        let new_entries = tree_entries(root, Some(&marker.new)).await?;
+        let paths = differing_paths(&parent_entries, &new_entries);
+        sync_real_index(root, git_dir, &marker.new, &parent_entries, &paths).await
+    }
     .await;
 
     match result {
-        Ok(()) => {
+        Ok(_) => {
             let _ = tokio::fs::remove_file(&marker_path).await;
-            Some(RecoveryOutcome { synced: true, new_sha, error: None })
+            Some(RecoveryOutcome { synced: true, new_sha: Some(marker.new), dropped: None, error: None })
         }
-        Err(e) => Some(RecoveryOutcome { synced: false, new_sha, error: Some(e.to_string()) }),
+        Err(e) => Some(RecoveryOutcome {
+            synced: false,
+            new_sha: Some(marker.new),
+            dropped: None,
+            error: Some(format!("{e:#}")),
+        }),
     }
 }
 
@@ -589,26 +768,47 @@ async fn recover_pending_sync(root: &Path, git_dir: &Path) -> Option<RecoveryOut
 /// but-sync-pending result is `Ok`, not `Err` — HEAD has already moved and
 /// this is not a failed commit.
 pub async fn try_commit(root: &Path, bus: &Arc<EventBus>) -> Result<AutocommitOutcome> {
-    match run_autocommit(root).await {
-        Ok(AutocommitOutcome::Committed) => {
-            info!("git_autocommit: committed vault/");
-            bus.publish(Envelope::log(
-                "info",
-                "git_autocommit",
-                "committed vault/ via isolated index",
-            ));
-            Ok(AutocommitOutcome::Committed)
+    match run_autocommit_report(root).await {
+        Ok(report) => {
+            if let Some(r) = &report.recovered {
+                if let Some(reason) = &r.dropped {
+                    warn!("git_autocommit: dropped pending index sync marker: {reason}");
+                    bus.publish(Envelope::log(
+                        "warn",
+                        "git_autocommit",
+                        format!("dropped stale pending index sync marker: {reason}"),
+                    ));
+                } else if r.synced {
+                    info!("git_autocommit: recovered pending index sync");
+                }
+            }
+            if !report.skipped.is_empty() {
+                debug!(
+                    "git_autocommit: skipped vault paths (user-staged/flagged/secret): {}",
+                    report.skipped.join(", ")
+                );
+            }
+            match report.outcome {
+                AutocommitOutcome::Committed => {
+                    info!("git_autocommit: committed vault/");
+                    bus.publish(Envelope::log(
+                        "info",
+                        "git_autocommit",
+                        "committed vault/ via isolated index",
+                    ));
+                }
+                AutocommitOutcome::CommittedIndexSyncPending => {
+                    info!("git_autocommit: committed vault/ but index sync is pending");
+                    bus.publish(Envelope::log(
+                        "warn",
+                        "git_autocommit",
+                        "committed vault/ but real-index sync is pending; will retry next tick",
+                    ));
+                }
+                AutocommitOutcome::NoOp => {}
+            }
+            Ok(report.outcome)
         }
-        Ok(AutocommitOutcome::CommittedIndexSyncPending) => {
-            info!("git_autocommit: committed vault/ but index sync is pending");
-            bus.publish(Envelope::log(
-                "warn",
-                "git_autocommit",
-                "committed vault/ but real-index sync is pending; will retry next tick",
-            ));
-            Ok(AutocommitOutcome::CommittedIndexSyncPending)
-        }
-        Ok(AutocommitOutcome::NoOp) => Ok(AutocommitOutcome::NoOp),
         Err(e) => {
             bus.publish(Envelope::log(
                 "warn",
@@ -620,19 +820,33 @@ pub async fn try_commit(root: &Path, bus: &Arc<EventBus>) -> Result<AutocommitOu
     }
 }
 
-/// Core algorithm, free of `EventBus` so it's directly unit-testable against
-/// real temporary git repos. See module docs for the full isolated-index
-/// transaction.
+/// Core algorithm (outcome only). See [`run_autocommit_report`].
+#[allow(dead_code)] // used by tests; the app goes through try_commit
 async fn run_autocommit(root: &Path) -> Result<AutocommitOutcome> {
+    Ok(run_autocommit_report(root).await?.outcome)
+}
+
+/// Core algorithm, free of `EventBus` so it's directly unit-testable against
+/// real temporary git repos. See module docs for the full transaction.
+pub(crate) async fn run_autocommit_report(root: &Path) -> Result<AutocommitReport> {
     let vault = root.join("vault");
     if !vault.exists() {
-        return Ok(AutocommitOutcome::NoOp);
+        return Ok(AutocommitReport { outcome: AutocommitOutcome::NoOp, skipped: Vec::new(), recovered: None });
     }
 
     let git_dir = resolve_git_dir(root).await.context("not a git repository")?;
 
-    // Step 0: finish any interrupted sync from a previous tick first.
-    let _recovered = recover_pending_sync(root, &git_dir).await;
+    // Step 0: finish (or safely discard) an interrupted sync first.
+    let recovered = recover_pending_sync(root, &git_dir).await;
+    if let Some(r) = &recovered {
+        if !r.synced && r.dropped.is_none() {
+            bail!(
+                "pending index sync for {} still unresolved ({}); skipping autocommit",
+                r.new_sha.as_deref().unwrap_or("?"),
+                r.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+    }
 
     // Fail fast and explicitly if the real index is locked. We never delete
     // someone else's lock file.
@@ -645,13 +859,15 @@ async fn run_autocommit(root: &Path) -> Result<AutocommitOutcome> {
     }
 
     let head = resolve_head(root).await?;
+    let head_ref = resolve_symbolic_head(root).await?;
 
     let temp_index =
         git_dir.join(format!("skippy-autocommit-index-{}", uuid::Uuid::new_v4()));
     // Always clean up the temp index file, whatever the outcome.
-    let outcome = run_autocommit_inner(root, &git_dir, &temp_index, head.as_deref()).await;
+    let result = run_autocommit_inner(root, &git_dir, &temp_index, head.as_deref(), head_ref.as_deref()).await;
     let _ = tokio::fs::remove_file(&temp_index).await;
-    outcome
+    let (outcome, skipped) = result?;
+    Ok(AutocommitReport { outcome, skipped, recovered })
 }
 
 async fn run_autocommit_inner(
@@ -659,69 +875,98 @@ async fn run_autocommit_inner(
     git_dir: &Path,
     temp_index: &Path,
     head: Option<&str>,
-) -> Result<AutocommitOutcome> {
-    let idx = temp_index.to_string_lossy().into_owned();
-    let env = [("GIT_INDEX_FILE", idx.as_str())];
+    head_ref: Option<&str>,
+) -> Result<(AutocommitOutcome, Vec<String>)> {
+    let env = [("GIT_INDEX_FILE", temp_index.as_os_str())];
+
+    let head_entries = tree_entries(root, head).await?;
+    let snapshot = real_index_snapshot(root).await?;
+    let owned = user_owned_paths(&snapshot, &head_entries);
 
     if let Some(head) = head {
         git(root, &["read-tree", head], &env)
             .await
             .context("git read-tree HEAD into temp index failed")?;
     }
-    // -A (not just add) so vault deletions are captured too; pathspec keeps
-    // this scoped to vault/ only. .gitignore is respected by default.
+    // -A so deletions are captured; .gitignore respected; vault/ only.
     git(root, &["add", "-A", "--", VAULT_PATHSPEC], &env)
         .await
         .context("git add -A -- vault into temp index failed")?;
-
-    let flagged = list_flagged_vault_paths(root).await;
-    let conflicts = list_staged_vs_worktree_conflicts(root).await;
-    let excluded: std::collections::HashSet<String> = flagged.iter().chain(conflicts.iter()).cloned().collect();
-
-    let base = head.map(str::to_string).unwrap_or_else(|| EMPTY_TREE.to_string());
     let preliminary_tree = git(root, &["write-tree"], &env)
         .await
         .context("git write-tree from temp index failed")?;
-    let all_changed = changed_vault_paths(root, &base, &preliminary_tree).await;
+    let prelim_entries = tree_entries(root, Some(&preliminary_tree)).await?;
+    let all_changed = differing_paths(&head_entries, &prelim_entries);
 
-    let secret_name_hits: Vec<String> = all_changed
+    let flagged_hits: Vec<BPath> = all_changed.iter().filter(|p| snapshot.flagged.contains(*p)).cloned().collect();
+    let owned_hits: Vec<BPath> = all_changed
         .iter()
-        .filter(|p| !excluded.contains(*p) && matches_secret_filename(p))
+        .filter(|p| !snapshot.flagged.contains(*p) && owned.contains(*p))
         .cloned()
         .collect();
-    let remaining: Vec<String> = all_changed
+    let candidates: Vec<BPath> = all_changed
         .iter()
-        .filter(|p| !excluded.contains(*p) && !secret_name_hits.contains(p))
+        .filter(|p| !snapshot.flagged.contains(*p) && !owned.contains(*p))
         .cloned()
         .collect();
-    let secret_content_hits = scan_working_tree_for_secrets(root, &remaining).await;
+    let name_hits: Vec<BPath> = candidates.iter().filter(|p| matches_secret_filename(p)).cloned().collect();
+    let blob_of = |p: &BPath| -> Option<String> {
+        let entry = prelim_entries.get(p)?;
+        let (mode, oid) = entry.split_once(' ')?;
+        (mode != "160000").then(|| oid.to_string()) // gitlinks have no content here
+    };
+    let to_scan: Vec<(BPath, String)> = candidates
+        .iter()
+        .filter(|p| !name_hits.contains(p))
+        .filter_map(|p| blob_of(p).map(|oid| (p.clone(), oid)))
+        .collect();
+    let hit_oids =
+        scan_blobs_for_secrets(root, &to_scan.iter().map(|(_, o)| o.clone()).collect::<Vec<_>>()).await?;
+    let content_hits: Vec<BPath> = to_scan
+        .iter()
+        .filter(|(_, oid)| hit_oids.contains(oid))
+        .map(|(p, _)| p.clone())
+        .collect();
 
-    let mut to_restore: Vec<String> = excluded.iter().cloned().collect();
-    to_restore.extend(secret_name_hits.iter().cloned());
-    to_restore.extend(secret_content_hits.iter().cloned());
+    let mut excluded: Vec<BPath> = flagged_hits;
+    excluded.extend(owned_hits);
+    excluded.extend(name_hits);
+    excluded.extend(content_hits);
+    let excluded_set: BTreeSet<&BPath> = excluded.iter().collect();
+    let commit_paths: Vec<BPath> = all_changed.iter().filter(|p| !excluded_set.contains(p)).cloned().collect();
+    let skipped: Vec<String> = excluded.iter().map(|p| display_path(p)).collect();
 
-    for p in &to_restore {
-        restore_path_to_head(root, &idx, head, p).await?;
+    if commit_paths.is_empty() {
+        return Ok((AutocommitOutcome::NoOp, skipped));
     }
 
-    let tree = if !to_restore.is_empty() {
+    let tree = if excluded.is_empty() {
+        preliminary_tree
+    } else {
+        let zero = "0".repeat(preliminary_tree.len());
+        let mut info: Vec<u8> = Vec::new();
+        for p in &excluded {
+            match head_entries.get(p) {
+                Some(entry) => info.extend_from_slice(entry.as_bytes()),
+                None => info.extend_from_slice(format!("0 {zero}").as_bytes()),
+            }
+            info.push(b'\t');
+            info.extend_from_slice(p);
+            info.push(0);
+        }
+        git_raw(root, &["update-index", "-z", "--index-info"], &env, Some(&info))
+            .await
+            .context("git update-index --index-info failed while restoring excluded vault paths")?;
         git(root, &["write-tree"], &env)
             .await
             .context("git write-tree (post-exclusion) from temp index failed")?
-    } else {
-        preliminary_tree
     };
-
-    let mut skipped = flagged;
-    skipped.extend(conflicts);
-    skipped.extend(secret_name_hits);
-    skipped.extend(secret_content_hits);
-    if !skipped.is_empty() {
-        debug!("git_autocommit: skipped vault paths (excluded/secret): {}", skipped.join(", "));
-    }
-
-    if !vault_tree_changed(root, head, &tree).await? {
-        return Ok(AutocommitOutcome::NoOp);
+    let head_tree = match head {
+        Some(h) => git(root, &["rev-parse", &format!("{h}^{{tree}}")], &[]).await?,
+        None => EMPTY_TREE.to_string(),
+    };
+    if tree == head_tree {
+        return Ok((AutocommitOutcome::NoOp, skipped));
     }
 
     let stamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
@@ -729,13 +974,13 @@ async fn run_autocommit_inner(
 
     let new_commit = commit_and_advance_head(root, &tree, head, &message).await?;
 
-    let excluded_for_sync: Vec<String> = to_restore;
-    match sync_real_index_after_commit(root, &new_commit, &excluded_for_sync).await {
-        Ok(()) => Ok(AutocommitOutcome::Committed),
-        Err(_e) => {
+    match sync_real_index(root, git_dir, &new_commit, &head_entries, &commit_paths).await {
+        Ok(_) => Ok((AutocommitOutcome::Committed, skipped)),
+        Err(e) => {
             // HEAD already advanced — this is NOT a failed commit.
-            write_pending_marker(git_dir, &new_commit, head).await?;
-            Ok(AutocommitOutcome::CommittedIndexSyncPending)
+            debug!("git_autocommit: real-index sync failed: {e:#}");
+            write_pending_marker(git_dir, head_ref, &new_commit, head).await?;
+            Ok((AutocommitOutcome::CommittedIndexSyncPending, skipped))
         }
     }
 }
@@ -1006,8 +1251,7 @@ mod tests {
         let git_dir = resolve_git_dir(repo.path()).await.unwrap();
         let head = resolve_head(repo.path()).await.unwrap();
         let temp_index = git_dir.join(format!("race-index-{}", uuid::Uuid::new_v4()));
-        let idx = temp_index.to_string_lossy().into_owned();
-        let env = [("GIT_INDEX_FILE", idx.as_str())];
+        let env = [("GIT_INDEX_FILE", temp_index.as_os_str())];
         if let Some(h) = head.as_deref() {
             git(repo.path(), &["read-tree", h], &env).await.unwrap();
         }
@@ -1142,7 +1386,7 @@ mod tests {
         repo.git_ok(&["reset", "-q", &parent_sha, "--", "vault"]);
 
         let git_dir = repo.dir.join(".git");
-        write_pending_marker(&git_dir, &new_sha, Some(&parent_sha)).await.unwrap();
+        write_pending_marker(&git_dir, Some("refs/heads/main"), &new_sha, Some(&parent_sha)).await.unwrap();
 
         // The user stages their OWN edit to note.md before the next tick
         // runs — this must NOT be clobbered by recovery.
@@ -1268,5 +1512,467 @@ mod tests {
         assert_eq!(staged_blob_after, staged_blob_before, "user's staged blob must be left alone");
         let worktree_diff = repo.git_ok(&["diff", "--", "vault/partial.md"]);
         assert!(worktree_diff.contains("worktree version"));
+    }
+
+    // --- E5-8: shared secret list self-test (same vectors as the Node suite).
+
+    fn utf16(s: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        if bom {
+            v.extend_from_slice(if big_endian { &[0xfe, 0xff] } else { &[0xff, 0xfe] });
+        }
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&if big_endian { u.to_be_bytes() } else { u.to_le_bytes() });
+        }
+        v
+    }
+
+    #[test]
+    fn shared_secret_patterns_pass_their_self_test_vectors() {
+        let v: serde_json::Value = serde_json::from_str(SECRET_PATTERNS_JSON).unwrap();
+        let list = |k: &str| -> Vec<String> {
+            v["selfTest"][k].as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+        };
+        for s in list("filenameHits") {
+            assert!(matches_secret_filename(s.as_bytes()), "filename should be a secret: {s}");
+        }
+        for s in list("filenameMisses") {
+            assert!(!matches_secret_filename(s.as_bytes()), "filename false positive: {s}");
+        }
+        for s in list("contentHits") {
+            assert!(matches_secret_content(s.as_bytes()), "content should be a secret: {s}");
+            for (be, bom) in [(false, true), (false, false), (true, true), (true, false)] {
+                assert!(matches_secret_content(&utf16(&s, be, bom)), "UTF-16 (be={be}, bom={bom}) content missed: {s}");
+            }
+        }
+        for s in list("contentMisses") {
+            assert!(!matches_secret_content(s.as_bytes()), "content false positive: {s}");
+            assert!(!matches_secret_content(&utf16(&s, false, true)), "UTF-16 content false positive: {s}");
+        }
+    }
+}
+
+/// Round-3 red-team regressions (E5-1 .. E5-9). Self-contained on purpose:
+/// it only uses `run_autocommit` / `AutocommitOutcome` plus the git CLI, so
+/// the exact same module also compiles against the pre-fix implementation
+/// (baseline verification that every case fails there).
+#[cfg(test)]
+mod e5_regression_tests {
+    use super::{run_autocommit, AutocommitOutcome};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const CAFE: &str = "vault/caf\u{e9}.md";
+    const RESUME: &str = "vault/r\u{e9}sum\u{e9}.md";
+    const UBER: &str = "vault/\u{fc}ber.md";
+    const KANJI: &str = "vault/\u{79c1}.md";
+
+    struct Repo {
+        dir: PathBuf,
+    }
+
+    impl Repo {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("skippy-e5-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let r = Self { dir };
+            r.ok(&["init", "-q", "-b", "main"]);
+            r.ok(&["config", "user.name", "Skippy Test"]);
+            r.ok(&["config", "user.email", "skippy-test@example.invalid"]);
+            r.ok(&["config", "commit.gpgsign", "false"]);
+            r.ok(&["config", "core.hooksPath", ".no-hooks"]);
+            r
+        }
+
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        fn run(&self, args: &[&str]) -> std::process::Output {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["-c", "core.quotepath=false"])
+                .args(args)
+                .output()
+                .expect("git spawn")
+        }
+
+        fn ok(&self, args: &[&str]) -> String {
+            let out = self.run(args);
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn write(&self, rel: &str, contents: impl AsRef<[u8]>) {
+            let p = self.dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+
+        fn remove(&self, rel: &str) {
+            std::fs::remove_file(self.dir.join(rel)).unwrap();
+        }
+
+        fn commit_all(&self, msg: &str) {
+            self.ok(&["add", "-A", "."]);
+            self.ok(&["commit", "-q", "-m", msg]);
+        }
+
+        fn head_tree(&self) -> Vec<String> {
+            let out = self.run(&["ls-tree", "-r", "-z", "--name-only", "HEAD"]);
+            String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn show(&self, spec: &str) -> String {
+            self.ok(&["show", spec])
+        }
+
+        fn status(&self) -> String {
+            self.ok(&["status", "--porcelain", "-uno"])
+        }
+
+        fn marker(&self) -> PathBuf {
+            self.dir.join(".git").join("skippy-autocommit-pending")
+        }
+
+        fn lock(&self) -> PathBuf {
+            self.dir.join(".git").join("index.lock")
+        }
+
+        /// A reference-transaction hook that grabs the index lock right after
+        /// our update-ref lands, so the real-index sync fails (pending-sync).
+        fn arm_lock_after_ref_update(&self) {
+            let hooks = self.dir.join(".hooks");
+            std::fs::create_dir_all(&hooks).unwrap();
+            let lock = self.lock().to_string_lossy().replace('\\', "/");
+            let hook = hooks.join("reference-transaction");
+            std::fs::write(
+                &hook,
+                format!("#!/bin/sh\ncat >/dev/null\nif [ \"$1\" = \"committed\" ]; then : > \"{lock}\"\nfi\nexit 0\n"),
+            )
+            .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            self.ok(&["config", "core.hooksPath", ".hooks"]);
+        }
+
+        fn disarm(&self) {
+            self.ok(&["config", "core.hooksPath", ".no-hooks"]);
+            let _ = std::fs::remove_file(self.lock());
+        }
+
+        /// Seed `vault/n.md` = v1 plus `a`, then autocommit a v2 edit whose
+        /// real-index sync fails (marker left behind), then disarm.
+        async fn pending_commit_of(&self, path: &str, v2: &str) {
+            self.write(path, "v1\n");
+            self.write("a", "a\n");
+            self.commit_all("init");
+            self.arm_lock_after_ref_update();
+            self.write(path, v2);
+            let outcome = run_autocommit(self.path()).await.expect("autocommit ok");
+            assert_eq!(outcome, AutocommitOutcome::CommittedIndexSyncPending);
+            assert!(self.marker().exists(), "pending marker must be written");
+            self.disarm();
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn utf16le_with_bom(s: &str) -> Vec<u8> {
+        let mut v = vec![0xff, 0xfe];
+        for u in s.encode_utf16() {
+            v.extend_from_slice(&u.to_le_bytes());
+        }
+        v
+    }
+
+    fn utf16be_no_bom(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()
+    }
+
+    // --- E5-1: non-ASCII paths must not bypass any exclusion. -------------
+
+    #[tokio::test]
+    async fn e5_1_non_ascii_path_with_secret_content_is_not_committed() {
+        let r = Repo::new("na-secret");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        r.write(CAFE, "my aws key AKIAABCDEFGHIJKLMNOP\n");
+        r.write("vault/n.md", "x\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        let tree = r.head_tree();
+        assert!(tree.contains(&"vault/n.md".to_string()));
+        assert!(!tree.contains(&CAFE.to_string()), "AKIA key in a non-ASCII path was committed: {tree:?}");
+    }
+
+    #[tokio::test]
+    async fn e5_1_non_ascii_skip_worktree_path_is_not_committed_as_deleted_and_keeps_its_flag() {
+        let r = Repo::new("na-skipwt");
+        r.write("vault/keep.md", "k\n");
+        r.write(RESUME, "s\n");
+        r.commit_all("init");
+        r.ok(&["update-index", "--skip-worktree", "--", RESUME]);
+        r.remove(RESUME);
+        r.write("vault/keep.md", "k2\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert!(r.head_tree().contains(&RESUME.to_string()), "skip-worktree file committed as deleted");
+        let flag = r.ok(&["ls-files", "-v", "--", RESUME]);
+        assert!(flag.starts_with("S "), "skip-worktree flag lost: {flag}");
+    }
+
+    #[tokio::test]
+    async fn e5_1_non_ascii_assume_unchanged_edit_is_not_committed_and_keeps_its_flag() {
+        let r = Repo::new("na-au");
+        r.write(KANJI, "orig\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.ok(&["update-index", "--assume-unchanged", "--", KANJI]);
+        r.write(KANJI, "LOCAL PRIVATE EDIT\n");
+        r.write("vault/n.md", "y\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.show(&format!("HEAD:{KANJI}")), "orig");
+        let flag = r.ok(&["ls-files", "-v", "--", KANJI]);
+        assert!(flag.starts_with("h "), "assume-unchanged flag lost: {flag}");
+    }
+
+    #[tokio::test]
+    async fn e5_1_non_ascii_partially_staged_path_is_left_alone() {
+        let r = Repo::new("na-partial");
+        r.write(UBER, "v1\n");
+        r.commit_all("init");
+        r.write(UBER, "STAGED\n");
+        r.ok(&["add", "--", UBER]);
+        r.write(UBER, "WORKTREE\n");
+        let _ = run_autocommit(r.path()).await;
+        assert_eq!(r.show(&format!("HEAD:{UBER}")), "v1");
+        assert_eq!(r.show(&format!(":{UBER}")), "STAGED", "user's staged blob was lost");
+    }
+
+    #[tokio::test]
+    async fn e5_1_non_ascii_pending_sync_recovery_really_syncs_the_index() {
+        let r = Repo::new("na-pending");
+        r.pending_commit_of(CAFE, "v2\n").await;
+        run_autocommit(r.path()).await.expect("recovery tick ok");
+        assert!(!r.marker().exists(), "marker must be cleared after recovery");
+        assert_eq!(r.status(), "", "index must match HEAD after recovery");
+        r.write("a", "user\n");
+        r.ok(&["add", "a"]);
+        r.ok(&["commit", "-q", "-m", "user"]);
+        assert_eq!(r.show(&format!("HEAD:{CAFE}")), "v2", "user's next commit reverted the vault change");
+    }
+
+    // --- E5-2: a stale pending marker must never re-stage anything. -------
+
+    #[tokio::test]
+    async fn e5_2_marker_is_dropped_after_reset_hard_without_touching_the_index() {
+        let r = Repo::new("stale-reset");
+        r.pending_commit_of("vault/n.md", "v2 DISCARD ME\n").await;
+        r.ok(&["reset", "-q", "--hard", "HEAD~1"]);
+        run_autocommit(r.path()).await.expect("tick ok");
+        assert!(!r.marker().exists(), "stale marker must be dropped");
+        assert_eq!(r.status(), "");
+        assert_eq!(r.show(":vault/n.md"), "v1", "discarded content was re-staged");
+    }
+
+    #[tokio::test]
+    async fn e5_2_marker_is_dropped_after_switching_branches() {
+        let r = Repo::new("stale-branch");
+        // `other` holds the same vault blob as the autocommit's parent, so a
+        // marker that isn't validated against HEAD would look "safe" there.
+        r.write("vault/n.md", "v1\n");
+        r.commit_all("pre");
+        r.ok(&["branch", "other"]);
+        r.pending_commit_of("vault/n.md", "v2 main-only\n").await;
+        r.ok(&["checkout", "-q", "-f", "other"]);
+        run_autocommit(r.path()).await.expect("tick ok");
+        assert!(!r.marker().exists(), "stale marker must be dropped");
+        assert_eq!(r.status(), "", "main's vault change was staged into other's index");
+        assert_eq!(r.ok(&["rev-list", "--count", "other"]), "1");
+    }
+
+    // --- E5-3: secret-named paths the user staged keep their staged blob. --
+
+    #[tokio::test]
+    async fn e5_3_user_staged_edit_to_a_secret_named_path_is_preserved() {
+        let r = Repo::new("env-staged");
+        r.write("vault/.env", "OLD=1\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/.env", "NEW=2\n");
+        r.ok(&["add", "vault/.env"]);
+        r.write("vault/n.md", "y\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.show("HEAD:vault/.env"), "OLD=1");
+        assert_eq!(r.show("HEAD:vault/n.md"), "y");
+        assert_eq!(r.show(":vault/.env"), "NEW=2", "user's staged .env edit was wiped");
+    }
+
+    // --- E5-4: paths are literal, never pathspec magic. -------------------
+
+    #[tokio::test]
+    async fn e5_4_glob_like_vault_path_is_matched_literally() {
+        let r = Repo::new("glob");
+        r.write("vault/a.md", "a1\n");
+        r.write("vault/[ab].md", "x1\n");
+        r.commit_all("init");
+        r.write("vault/[ab].md", "x2\n");
+        r.ok(&["add", "--", ":(literal)vault/[ab].md"]);
+        r.write("vault/[ab].md", "x3\n");
+        r.write("vault/a.md", "a2\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.show("HEAD:vault/a.md"), "a2");
+        assert_eq!(r.show(":vault/a.md"), "a2", "index lags HEAD; the user's next commit would revert");
+        assert_eq!(r.show(":vault/[ab].md"), "x2", "user's staged blob was lost");
+    }
+
+    // --- E5-5: no per-path command-line arguments. ------------------------
+
+    #[tokio::test]
+    async fn e5_5_many_skip_worktree_paths_do_not_overflow_the_command_line() {
+        let r = Repo::new("many");
+        for i in 0..1200 {
+            r.write(&format!("vault/archive/some-long-archived-note-name-number-{i:05}.md"), format!("n{i}\n"));
+        }
+        r.write("vault/live.md", "l\n");
+        r.commit_all("init");
+        r.ok(&["sparse-checkout", "set", "--no-cone", "/vault/live.md"]);
+        r.write("vault/live.md", "l2\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert!(!r.marker().exists());
+        assert_eq!(r.show("HEAD:vault/live.md"), "l2");
+        assert_eq!(r.show(":vault/live.md"), "l2");
+        assert_eq!(r.head_tree().len(), 1201, "sparse (skip-worktree) files were committed as deleted");
+        let flag = r.ok(&["ls-files", "-v", "--", "vault/archive/some-long-archived-note-name-number-00007.md"]);
+        assert!(flag.starts_with("S "), "skip-worktree flag lost: {flag}");
+    }
+
+    // --- E5-6 / E5-7: user-staged vault paths are user-owned. -------------
+
+    #[tokio::test]
+    async fn e5_6_rm_cached_vault_path_stays_staged_for_removal() {
+        let r = Repo::new("rm-cached");
+        r.write("vault/x.md", "x\n");
+        r.write("vault/n.md", "n\n");
+        r.commit_all("init");
+        r.ok(&["rm", "-q", "--cached", "vault/x.md"]);
+        r.write("vault/n.md", "n2\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.show("HEAD:vault/n.md"), "n2");
+        assert!(r.head_tree().contains(&"vault/x.md".to_string()));
+        let status = r.status();
+        assert!(status.lines().any(|l| l == "D  vault/x.md"), "staged rm --cached was undone: {status}");
+    }
+
+    #[tokio::test]
+    async fn e5_6_intent_to_add_and_fully_staged_vault_paths_are_user_owned() {
+        let r = Repo::new("ita");
+        r.write("vault/m.md", "m1\n");
+        r.write("vault/o.md", "o1\n");
+        r.commit_all("init");
+        r.write("vault/new.md", "n\n");
+        r.ok(&["add", "-N", "vault/new.md"]);
+        r.write("vault/m.md", "m2 staged\n");
+        r.ok(&["add", "vault/m.md"]);
+        r.write("vault/o.md", "o2\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.show("HEAD:vault/o.md"), "o2");
+        assert_eq!(r.show("HEAD:vault/m.md"), "m1");
+        assert!(!r.head_tree().contains(&"vault/new.md".to_string()));
+        let status = r.status();
+        assert!(status.lines().any(|l| l == "M  vault/m.md"), "{status}");
+        assert!(status.lines().any(|l| l == " A vault/new.md"), "intent-to-add lost: {status}");
+    }
+
+    #[tokio::test]
+    async fn e5_7_staged_rename_with_unstaged_edit_is_left_alone() {
+        let r = Repo::new("rename");
+        r.write("vault/a.md", "line1\nline2\nline3\nline4\nline5\n");
+        r.commit_all("init");
+        r.ok(&["mv", "vault/a.md", "vault/b.md"]);
+        r.write("vault/b.md", "line1\nline2\nline3\nline4\nline5\nline6 unstaged\n");
+        let before = r.status();
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::NoOp);
+        assert_eq!(r.head_tree(), vec!["vault/a.md".to_string()], "half of the rename was committed");
+        assert_eq!(r.status(), before, "the user's staged rename changed");
+    }
+
+    // --- E5-8: secret guard gaps and false positives. ---------------------
+
+    #[tokio::test]
+    async fn e5_8_secret_filenames_match_case_insensitively() {
+        let r = Repo::new("case");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        r.write("vault/.ENV", "API_KEY=plain-no-marker\n");
+        r.write("vault/ID_RSA", "not a pem header\n");
+        r.write("vault/server.PEM", "x\n");
+        r.write("vault/Prod.Key", "x\n");
+        r.write("vault/n.md", "x\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.head_tree(), vec!["a".to_string(), "vault/n.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn e5_8_env_lookalike_and_secrets_notes_are_not_false_positives() {
+        let r = Repo::new("false-pos");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        r.write("vault/sub/.env.local", "K=1\n");
+        r.write("vault/.envelope.md", "# Envelope design note\n");
+        r.write("vault/secrets.md", "# Secrets of the Magnificent (a normal note)\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        let tree = r.head_tree();
+        assert!(!tree.contains(&"vault/sub/.env.local".to_string()));
+        assert!(tree.contains(&"vault/.envelope.md".to_string()), "{tree:?}");
+        assert!(tree.contains(&"vault/secrets.md".to_string()), "{tree:?}");
+        assert_eq!(r.status(), "", "false-positive notes must be committed and synced");
+    }
+
+    #[tokio::test]
+    async fn e5_8_content_scan_catches_pgp_utf16_openai_and_aws_secret_keys() {
+        let r = Repo::new("content-gaps");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        r.write("vault/key.asc", "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBF\n-----END PGP PRIVATE KEY BLOCK-----\n");
+        r.write("vault/utf16le.md", utf16le_with_bom("aws AKIAABCDEFGHIJKLMNOP\n"));
+        r.write("vault/utf16be.md", utf16be_no_bom("aws AKIAABCDEFGHIJKLMNOP\n"));
+        let mut bin = vec![0u8, 1, 2, 0xff, 0];
+        bin.extend_from_slice(b"AKIAABCDEFGHIJKLMNOP");
+        bin.extend_from_slice(&[0, 0xfe]);
+        r.write("vault/blob.bin", bin);
+        r.write("vault/.aws/credentials", "[default]\naws_secret_access_key = wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY\n");
+        r.write("vault/openai.md", "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\n");
+        r.write("vault/n.md", "x\n");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert_eq!(r.head_tree(), vec!["a".to_string(), "vault/n.md".to_string()]);
+    }
+
+    // --- E5-9: documented pending window heals on the next tick. ----------
+
+    #[tokio::test]
+    async fn e5_9_user_commit_inside_the_pending_window_is_healed_next_tick() {
+        let r = Repo::new("window");
+        r.pending_commit_of("vault/n.md", "v2\n").await;
+        r.write("a", "user\n");
+        r.ok(&["add", "a"]);
+        r.ok(&["commit", "-q", "-m", "user commit before next tick"]);
+        // Known window: the user's commit recorded the parent blob.
+        assert_eq!(r.show("HEAD:vault/n.md"), "v1");
+        assert_eq!(run_autocommit(r.path()).await.unwrap(), AutocommitOutcome::Committed);
+        assert!(!r.marker().exists());
+        assert_eq!(r.show("HEAD:vault/n.md"), "v2", "next tick must re-commit the vault change");
+        assert_eq!(r.status(), "");
     }
 }
