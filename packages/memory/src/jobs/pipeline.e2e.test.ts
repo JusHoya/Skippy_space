@@ -9,7 +9,7 @@
 //
 // Run via: node --import tsx --test src/jobs/pipeline.e2e.test.ts
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -17,6 +17,18 @@ import * as path from 'node:path';
 
 import { runPipeline, mockDistill } from './index.js';
 import { parseNote, validateFrontmatter } from '../frontmatter.js';
+
+// Temp dirs this file creates; removed after all of its tests (best effort:
+// a Windows handle still open on one must not fail the run).
+const tmpDirs: string[] = [];
+async function trackTmp(p: Promise<string>): Promise<string> {
+  const dir = await p;
+  tmpDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+});
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Fixture: a realistic multi-paragraph paper with a `# title`, ≥10 sentences, and
@@ -31,7 +43,7 @@ Atomic notes capture a single claim each so that a retriever can use them in iso
 When Karpathy distills a paper, he extracts irreducible facts and links them into the existing graph. The link job walks the graph and fills wikilinks between related atomic notes and topic pages. The lint job is read-only and proposes cleanups without ever overwriting the record.`;
 
 async function makeVault(): Promise<string> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-pipeline-'));
+  const root = await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-pipeline-')));
   for (const sub of ['00_Inbox', '10_Atomic', '20_Topics', '60_Sources', '_index/proposals']) {
     await fs.mkdir(path.join(root, sub), { recursive: true });
   }

@@ -59,7 +59,17 @@ export type IngestRejectReason =
   | 'hardlinked'
   | 'not-a-file'
   | 'too-large'
-  | 'read-error';
+  | 'read-error'
+  // Watcher-level reports (M0 final #6): entries the watcher never hands to
+  // ingest, each still reported instead of silently skipped.
+  /** A dot-prefixed file or directory in the inbox. */
+  | 'hidden'
+  /** A name with a suffix the pipeline reserves (`.tmp`, `.lock`, `.ingest-tmp`, `.ingest-error.json`) that is not a provably-owned pipeline artifact. */
+  | 'reserved-name'
+  /** A directory nested deeper than the scan depth; its contents are not scanned. */
+  | 'too-deep'
+  /** A user file inside the pipeline's `_ingest-errors/` folder. */
+  | 'internal-folder';
 
 /** An inbox path that ingest refuses to read, delete or write next to. */
 export class IngestSourceRejectedError extends Error {

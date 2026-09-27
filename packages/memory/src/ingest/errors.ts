@@ -5,8 +5,11 @@
 // `<original>.ingest-error.json` next to it in `00_Inbox/` so the failure is
 // visible on disk (the watcher/UI can surface it, a human browsing the inbox
 // sees it immediately) without touching the original bytes.
-// `vault-watcher.ts` ignores `*.ingest-error.json` so the sidecar itself is
-// never re-enqueued.
+// `vault-watcher.ts` never enqueues a `*.ingest-error.json`; it stays silent
+// only about records whose CONTENT proves they are ours (`kind` marker, known
+// reason, and a location that matches the drop the record names:
+// `isOwnIngestErrorSidecar`) and reports any other file with that suffix as
+// `reserved-name` (M0 final #6).
 //
 // Containment (E3-2, round-2 N1): the sidecar's path is derived from the
 // untrusted `sourcePath`, so it must satisfy the same strict inbox rules as an
@@ -42,7 +45,18 @@ import { sha256Hex } from './originals.js';
 
 export const INGEST_ERROR_SUFFIX = '.ingest-error.json';
 
+/**
+ * Ownership marker inside every record this module writes (M0 final #6). The
+ * watcher treats a `*.ingest-error.json` as the pipeline's own artifact only if
+ * its CONTENT proves it (`isOwnIngestErrorSidecar`), never by suffix alone.
+ */
+export const INGEST_ERROR_KIND = 'skippy.ingest-error';
+
 export interface IngestErrorRecord {
+  /** Ownership marker (absent in records written before M0 final #6). */
+  kind?: typeof INGEST_ERROR_KIND;
+  /** The drop's path relative to `00_Inbox/` (POSIX), when it is inside it. */
+  inboxRel?: string;
   sourcePath: string;
   reason:
     | 'unsupported-format'
@@ -105,7 +119,10 @@ export async function writeIngestError(
   extension: string,
   contentSha256?: string,
 ): Promise<string> {
+  const inboxRel = inboxRelPath(vaultRoot, sourcePath);
   const record: IngestErrorRecord = {
+    kind: INGEST_ERROR_KIND,
+    ...(inboxRel !== null ? { inboxRel } : {}),
     sourcePath,
     reason,
     detail,
@@ -188,6 +205,61 @@ async function readSidecarAt(vaultRoot: string, sidecarAbs: string): Promise<Ing
   } finally {
     await handle.close();
   }
+}
+
+const RECORD_REASONS: ReadonlySet<string> = new Set([
+  'unsupported-format',
+  'invalid-encoding',
+  'integrity-check-failed',
+  'wikilink-violation',
+  'unexpected-failure',
+  'path-rejected',
+  'reparse-point',
+  'hardlinked',
+  'not-a-file',
+  'too-large',
+  'read-error',
+  'hidden',
+  'reserved-name',
+  'too-deep',
+  'internal-folder',
+]);
+
+function sameRel(a: string, b: string): boolean {
+  const norm = (s: string) => {
+    const p = s.replace(/\\/g, '/');
+    return process.platform === 'win32' ? p.toLowerCase() : p;
+  };
+  return norm(a) === norm(b);
+}
+
+/**
+ * True iff `sidecarAbs` is provably a record this pipeline wrote (M0 final #6):
+ * it lies inside the real inbox, parses as an ingest-error record with a known
+ * reason, carries the ownership marker (or the full pre-marker record shape),
+ * and sits exactly where `writeIngestError` puts the record for the drop it
+ * names (the natural `<drop>.ingest-error.json`, or the `_ingest-errors/`
+ * fallback keyed on that drop). A user file that merely has the suffix is not.
+ */
+export async function isOwnIngestErrorSidecar(vaultRoot: string, sidecarAbs: string): Promise<boolean> {
+  let rec: IngestErrorRecord | null;
+  try {
+    rec = await readSidecarAt(vaultRoot, sidecarAbs);
+  } catch {
+    return false;
+  }
+  if (!rec || typeof rec.reason !== 'string' || !RECORD_REASONS.has(rec.reason) || typeof rec.at !== 'string') {
+    return false;
+  }
+  if (rec.kind !== undefined && rec.kind !== INGEST_ERROR_KIND) return false;
+  const sidecarRel = inboxRelPath(vaultRoot, sidecarAbs);
+  if (sidecarRel === null) return false;
+  const dropRel = typeof rec.inboxRel === 'string' ? rec.inboxRel : inboxRelPath(vaultRoot, rec.sourcePath);
+  if (dropRel === null) return false;
+  if (sameRel(sidecarRel, `${dropRel}${INGEST_ERROR_SUFFIX}`)) return true;
+  const fallback = fallbackIngestErrorPath(vaultRoot, path.join(vaultRoot, INBOX_DIR, ...dropRel.split('/')));
+  const fallbackRel = fallback === null ? null : inboxRelPath(vaultRoot, fallback);
+  return fallbackRel !== null && sameRel(sidecarRel, fallbackRel);
 }
 
 /**

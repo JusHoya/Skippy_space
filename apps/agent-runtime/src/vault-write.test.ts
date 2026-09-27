@@ -9,7 +9,7 @@
 // preserving note identity, and cannot touch append-only notes. The Letta
 // archival mirror cannot be steered out of the vault by a hostile board name.
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import * as fsSync from 'node:fs';
@@ -29,6 +29,18 @@ import {
 import { handleObsidianWriteNote, handleLettaAppend } from './mcp-handlers.js';
 import type { PathGuard } from './tool-policy.js';
 
+// Temp dirs this file creates; removed after all of its tests (best effort:
+// a Windows handle still open on one must not fail the run).
+const tmpDirs: string[] = [];
+async function trackTmp(p: Promise<string>): Promise<string> {
+  const dir = await p;
+  tmpDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+});
+
 // Compile-time proof that the memory containment adapter plugs into WS-C's
 // tool-policy hook (`EnforcementHooks.pathGuard`) without a wrapper.
 const vaultPathGuard: PathGuard = containmentPathGuard;
@@ -41,7 +53,7 @@ function textOf(r: { content: { type: string; text?: string }[] }): string {
 
 /** base/{v (vault), vault-evil (prefix-sibling target)}. */
 async function sandbox(): Promise<{ base: string; vault: string; evil: string }> {
-  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-mcp-vault-'));
+  const base = await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-mcp-vault-')));
   const vault = path.join(base, 'v');
   const evil = path.join(base, 'vault-evil');
   await fs.mkdir(vault);

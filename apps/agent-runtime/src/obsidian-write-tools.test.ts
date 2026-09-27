@@ -32,6 +32,18 @@ import {
   handleObsidianWriteNote,
 } from './mcp-handlers.js';
 
+// Temp dirs this file creates; removed after all of its tests (best effort:
+// a Windows handle still open on one must not fail the run).
+const tmpDirs: string[] = [];
+async function trackTmp(p: Promise<string>): Promise<string> {
+  const dir = await p;
+  tmpDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+});
+
 function textOf(r: { content: { type: string; text?: string }[] }): string {
   return r.content.map((c) => c.text ?? '').join('');
 }
@@ -56,7 +68,7 @@ after(async () => {
 });
 
 async function vaultWithNotes(): Promise<{ vault: string; broker: VaultBroker; topicHash: string; dailyRel: string }> {
-  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-rest-write-'));
+  const base = await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-rest-write-')));
   const vault = path.join(base, 'v');
   await fs.mkdir(vault);
   const broker = new VaultBroker(vault);

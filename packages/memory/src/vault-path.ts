@@ -13,7 +13,17 @@
 //      (`CON`, `nul.md`, `COM1`...); 8.3 short-name segments (anything with
 //      `~<digit>`, e.g. `OBSIDI~1`, which NTFS resolves to `.obsidian`); and, by
 //      default, dot-prefixed segments (`.git`, `.obsidian`, `.skippy` are
-//      control directories, not notes; G0 denied paths).
+//      control directories, not notes; G0 denied paths); segments ending in
+//      `.lock` (the broker's proper-lockfile directories are `<note>.md.lock`,
+//      so a note created inside one would pin that lock forever; M0 final
+//      red-team #3); and Unicode look-alikes (#8): every segment is
+//      NFC-normalized, invisible characters (format/bidi controls `Cf` such as
+//      U+200B and U+202E, line/paragraph separators, non-ASCII spaces,
+//      variation selectors, Hangul fillers, private use) are rejected, and a
+//      segment whose NFKC form differs is re-checked in that form, so fullwidth
+//      `．obsidian`, `４０_Daily` or `ｘ.lock` cannot alias a hidden, reserved
+//      or control name. (A fullwidth `ｘ.md` that folds to an ordinary name is
+//      accepted: it is a distinct file on NTFS, not an alias.)
 //
 //   2. REAL (`resolveContained`, async): resolve the vault root with native
 //      realpath, then find the nearest EXISTING ancestor of the target and
@@ -36,6 +46,7 @@
 // the write, to narrow the window for a junction swap. See vault-broker.ts for
 // the residual TOCTOU note.
 
+import * as fsSync from 'node:fs';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
@@ -61,7 +72,10 @@ export type VaultPathViolation =
   | 'short_name'
   | 'hardlinked_target'
   | 'parent_not_directory'
-  | 'root_changed';
+  | 'root_changed'
+  | 'lock_segment'
+  | 'invisible_char'
+  | 'lookalike';
 
 export class VaultPathError extends Error {
   readonly code = 'VAULT_PATH_REJECTED';
@@ -95,6 +109,11 @@ export interface VaultPathOptions {
   allowLinkTarget?: boolean;
   /** Accept an existing regular file with more than one hard link. Default false. */
   allowHardlinkTarget?: boolean;
+  /**
+   * Accept segments ending in `.lock` (e.g. `Cargo.lock` in a worktree). Default
+   * false: inside the vault a `.lock` segment is a lock directory's name.
+   */
+  allowLockSegments?: boolean;
 }
 
 const MAX_REL_LEN = 1024;
@@ -109,6 +128,37 @@ const RESERVED_RE = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\
 // An 8.3 short name (`OBSIDI~1`, `LONGNA~2.MD`). Fail closed: any segment with
 // `~<digit>` is rejected, since NTFS may resolve it to a different long name.
 const SHORT_NAME_RE = /~\d/;
+
+// proper-lockfile's lock-directory suffix (`<note>.md.lock`).
+const LOCK_SEGMENT_RE = /\.lock$/i;
+
+// Invisible or look-alike-making characters (#8): format/bidi controls (Cf:
+// U+00AD, U+200B-U+200F, U+202A-U+202E, U+2060-U+2064, U+2066-U+2069, U+FEFF,
+// tag characters), line/paragraph separators, private use, every space other
+// than U+0020, the combining grapheme joiner, variation selectors, Hangul
+// fillers and the braille blank.
+const INVISIBLE_RE =
+  /[\p{Cf}\p{Zl}\p{Zp}\p{Co}ᅟᅠㅤﾠ⠀]|͏|\p{Variation_Selector}|(?! )\p{Zs}/u;
+
+/**
+ * Vault folder and control names (case-folded) that an NFKC look-alike may not
+ * fold onto: the PRD §8.2 top-level folders, the originals store, the ingest
+ * error folder and the reserved agent_log file name.
+ */
+const RESERVED_VAULT_NAMES: ReadonlySet<string> = new Set([
+  '00_inbox',
+  '10_atomic',
+  '20_topics',
+  '30_projects',
+  '40_daily',
+  '50_agents',
+  '60_sources',
+  '90_archive',
+  '_index',
+  'originals',
+  '_ingest-errors',
+  'agent_log.md',
+]);
 
 const IS_WIN = process.platform === 'win32';
 
@@ -148,19 +198,27 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
     throw new VaultPathError('absolute', input);
   }
 
-  const segments = input.split(/[\\/]+/).filter((s) => s !== '' && s !== '.');
+  const segments = input
+    .split(/[\\/]+/)
+    .filter((s) => s !== '' && s !== '.')
+    .map((s) => s.normalize('NFC'));
   if (segments.length === 0) throw new VaultPathError('empty', input);
 
   for (const seg of segments) {
-    if (seg === '..') throw new VaultPathError('traversal', input);
-    if (seg.length > MAX_SEGMENT_LEN) throw new VaultPathError('too_long', input);
-    if (INVALID_SEGMENT_CHARS_RE.test(seg)) throw new VaultPathError('invalid_char', input);
-    // Win32 silently strips trailing dots/spaces (`foo.` -> `foo`, `.. ` -> `..`).
-    if (/[. ]$/.test(seg)) throw new VaultPathError('trailing_dot_space', input);
-    if (RESERVED_RE.test(seg)) throw new VaultPathError('reserved_name', input);
-    if (SHORT_NAME_RE.test(seg)) throw new VaultPathError('short_name', input);
-    if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) {
-      throw new VaultPathError('hidden_segment', input);
+    const violation = segmentViolation(seg, opts);
+    if (violation) throw new VaultPathError(violation, input);
+    // NFKC look-alikes (#8): a segment that folds to something else under
+    // compatibility normalization (fullwidth `．obsidian`, `４０_Daily`) must
+    // pass every rule in its folded form too, and may not fold onto a reserved
+    // vault name it does not literally spell.
+    const folded = seg.normalize('NFKC');
+    if (folded !== seg) {
+      if (/[\\/:]/.test(folded) || segmentViolation(folded, opts) !== null) {
+        throw new VaultPathError('lookalike', input, `"${seg}" folds to "${folded}"`);
+      }
+      if (RESERVED_VAULT_NAMES.has(folded.toLowerCase())) {
+        throw new VaultPathError('lookalike', input, `"${seg}" looks like the reserved name "${folded}"`);
+      }
     }
   }
 
@@ -169,6 +227,22 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
     throw new VaultPathError('not_markdown', input);
   }
   return segments.join('/');
+}
+
+/** The first rule a single (NFC) path segment violates, or null. */
+function segmentViolation(seg: string, opts: VaultPathOptions): VaultPathViolation | null {
+  if (seg === '..') return 'traversal';
+  if (seg.length > MAX_SEGMENT_LEN) return 'too_long';
+  if (CONTROL_RE.test(seg)) return 'control_char';
+  if (INVISIBLE_RE.test(seg)) return 'invisible_char';
+  if (INVALID_SEGMENT_CHARS_RE.test(seg)) return 'invalid_char';
+  // Win32 silently strips trailing dots/spaces (`foo.` -> `foo`, `.. ` -> `..`).
+  if (/[. ]$/.test(seg)) return 'trailing_dot_space';
+  if (RESERVED_RE.test(seg)) return 'reserved_name';
+  if (SHORT_NAME_RE.test(seg)) return 'short_name';
+  if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) return 'hidden_segment';
+  if (!opts.allowLockSegments && LOCK_SEGMENT_RE.test(seg)) return 'lock_segment';
+  return null;
 }
 
 /** Case-normalize for comparison: NTFS is case-insensitive on win32. */
@@ -223,6 +297,60 @@ export async function realVaultRoot(vaultRoot: string): Promise<string> {
   return fs.realpath(abs);
 }
 
+/** The configured vault root cannot be canonicalized (missing, unreadable, dangling). */
+export class VaultRootError extends Error {
+  readonly code = 'VAULT_ROOT_UNRESOLVABLE';
+  constructor(readonly vaultRoot: string, cause: unknown) {
+    super(`Vault root ${JSON.stringify(vaultRoot)} cannot be canonicalized: ${String(cause)}`);
+    this.name = 'VaultRootError';
+  }
+}
+
+/**
+ * The canonical form of a configured vault root (M0 final red-team #5): the
+ * native realpath, i.e. long names instead of 8.3 aliases (`LONGVA~1`), on-disk
+ * case, junctions resolved. Components that compare paths against the root
+ * (the inbox watcher, runIngest, the runtime wiring) canonicalize ONCE through
+ * here, so an alias root behaves exactly like its long form. Never creates
+ * anything; throws `VaultRootError` when the root cannot be resolved, so the
+ * caller fails loudly instead of silently doing nothing.
+ */
+export async function canonicalVaultRoot(vaultRoot: string): Promise<string> {
+  let real: string;
+  try {
+    real = await fs.realpath(path.resolve(vaultRoot));
+    if (!(await fs.stat(real)).isDirectory()) throw new Error('not a directory');
+  } catch (err) {
+    throw new VaultRootError(vaultRoot, err);
+  }
+  return real;
+}
+
+/** Synchronous `canonicalVaultRoot` (native realpath) for synchronous startup wiring. */
+export function canonicalVaultRootSync(vaultRoot: string): string {
+  let real: string;
+  try {
+    real = fsSync.realpathSync.native(path.resolve(vaultRoot));
+    if (!fsSync.statSync(real).isDirectory()) throw new Error('not a directory');
+  } catch (err) {
+    throw new VaultRootError(vaultRoot, err);
+  }
+  return real;
+}
+
+/**
+ * Re-base `absPath` from `givenRoot` onto `canonicalRoot` when it lies
+ * lexically under `givenRoot` (e.g. an 8.3-form path under an 8.3-form root);
+ * otherwise return it resolved but otherwise unchanged.
+ */
+export function rebaseOntoRoot(givenRoot: string, canonicalRoot: string, absPath: string): string {
+  const given = path.resolve(givenRoot);
+  const target = path.resolve(absPath);
+  if (!isPathInside(given, target)) return target;
+  const rel = path.relative(given, target);
+  return rel === '' ? canonicalRoot : path.join(canonicalRoot, rel);
+}
+
 /**
  * Apply the segment rules to a REAL path: re-derive it relative to the real
  * root and reject hidden (unless allowed) and reserved-name segments. Native
@@ -243,6 +371,16 @@ function assertRealSegments(
     }
     if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) {
       throw new VaultPathError('hidden_segment', input, `real path segment "${seg}"`);
+    }
+    if (!opts.allowLockSegments && LOCK_SEGMENT_RE.test(seg)) {
+      throw new VaultPathError('lock_segment', input, `real path segment "${seg}"`);
+    }
+    if (INVISIBLE_RE.test(seg)) {
+      throw new VaultPathError('invisible_char', input, `real path segment ${JSON.stringify(seg)}`);
+    }
+    const folded = seg.normalize('NFKC');
+    if (folded !== seg && folded.startsWith('.') && !hiddenAllowed(folded, opts)) {
+      throw new VaultPathError('lookalike', input, `real path segment "${seg}" folds to "${folded}"`);
     }
   }
 }
@@ -415,13 +553,14 @@ export async function containmentPathGuard(
       const realRoot = await fs.realpath(rootAbs);
       const rel = path.relative(rootAbs, lexical);
       if (rel === '') return { ok: true };
-      const safeRel = normalizeVaultRelPath(rel, { allowHidden: true });
+      const safeRel = normalizeVaultRelPath(rel, { allowHidden: true, allowLockSegments: true });
       const abs = path.join(realRoot, ...safeRel.split('/'));
       await assertRealContainment(realRoot, abs, target, {
         allowHidden: true,
         allowNonFileTarget: true,
         allowLinkTarget: true,
         allowHardlinkTarget: true, // pnpm stores hardlink package files
+        allowLockSegments: true, // Cargo.lock, yarn.lock, ...
       });
       return { ok: true };
     } catch (err) {

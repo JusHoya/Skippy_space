@@ -10,7 +10,7 @@
 // The broker/ingest tests fail on 956c208. Run via:
 //   node --import tsx --test src/safe-write.test.ts
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import * as crypto from 'node:crypto';
 import { promises as fs } from 'node:fs';
@@ -23,6 +23,18 @@ import { makeFrontmatter } from './frontmatter.js';
 import { runIngest } from './jobs/ingest.js';
 import { sha256Hex } from './ingest/originals.js';
 import { resolveContained } from './vault-path.js';
+
+// Temp dirs this file creates; removed after all of its tests (best effort:
+// a Windows handle still open on one must not fail the run).
+const tmpDirs: string[] = [];
+async function trackTmp(p: Promise<string>): Promise<string> {
+  const dir = await p;
+  tmpDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+});
 
 const VICTIM_TEXT = 'ORIGINAL OUTSIDE CONTENT';
 
@@ -54,7 +66,7 @@ function predictedTempNames(target: string, n = 200): string[] {
 }
 
 async function setup(): Promise<{ vault: string; victim: string }> {
-  const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-rt2-safewrite-')));
+  const base = await fs.realpath(await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-rt2-safewrite-'))));
   const vault = path.join(base, 'vault');
   await fs.mkdir(path.join(vault, '10_Atomic'), { recursive: true });
   await fs.mkdir(path.join(vault, '00_Inbox'), { recursive: true });

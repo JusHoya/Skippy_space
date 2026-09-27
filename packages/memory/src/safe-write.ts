@@ -16,7 +16,9 @@
 //   2. Temp name `.skippy-<32 hex from crypto.randomBytes(16)>.tmp` in that same
 //      directory, opened with 'wx' (O_CREAT|O_EXCL / CREATE_NEW): it fails if the
 //      name exists in any form, so it can never follow a planted link. The
-//      leading dot and `.tmp` suffix keep the inbox watcher away from it.
+//      inbox watcher skips this exact pattern in live events (a write in
+//      flight) and reports a leftover one found by its startup scan; both
+//      forms are git-ignored (`.skippy-*.tmp`).
 //   3. The open handle must be a single-link regular file; write, fsync, close.
 //   4. Recheck containment of the target (same options it was resolved with),
 //      re-verify the temp file is still our single-link regular file (same

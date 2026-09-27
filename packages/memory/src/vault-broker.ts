@@ -15,7 +15,10 @@
 //     `atomicWriteContained` (safe-write.ts) after `resolveContained`.
 //   - ingest's removal of a fully preserved inbox drop (jobs/ingest.ts), only
 //     for single-link regular files whose real path is inside the real
-//     `00_Inbox/` with no reparse point in between (ingest/containment.ts).
+//     `00_Inbox/` with no reparse point in between (ingest/containment.ts),
+//     and the never-clobbering restore of a frozen drop / startup recovery of
+//     a leftover `.ingest-tmp` inside that same real inbox directory
+//     (ingest/recovery.ts: hard link or COPYFILE_EXCL, never a replacing rename).
 //   - the per-session replay stream `.skippy/replays/<ulid>.jsonl`
 //     (apps/agent-runtime/src/replay-writer.ts): an append-only JSONL log, not
 //     a note, so it has no §8.3 frontmatter and needs a long-lived O_APPEND fd
@@ -60,10 +63,27 @@
 //   so case and junction aliases cannot squat a reserved path either.
 //     YAML is parsed without the timestamp type, so unknown dates keep their
 //     type and spelling, and only the frontmatter lines of changed keys are
-//     rewritten (comments and untouched values survive). Known limitation: when
-//     that surgical edit cannot be proven equivalent by re-parsing (anchors,
-//     multi-line flow collections, ...), the note is re-serialized canonically
-//     and YAML comments in its frontmatter are dropped.
+//     rewritten (comments, untouched values and their own line endings, a
+//     leading BOM and the body bytes survive; M0 final #4). Known limitation:
+//     when that surgical edit cannot be proven equivalent by re-parsing
+//     (anchors, multi-line flow collections, ...), the frontmatter block is
+//     re-serialized canonically and YAML comments in it are dropped.
+//
+//   Reserved ingest subtree and provenance keys (M0 final #1; see
+//   ingest/provenance.ts): every note under `60_Sources/` (lexical or real
+//   path) and the keys in PROVENANCE_KEYS belong to the ingest pipeline. A
+//   broker constructed without the ingest capability refuses to create,
+//   update, patch or append there, and refuses to set or change a provenance
+//   key anywhere (`ProvenanceViolationError`), so an agent's vault tools cannot
+//   plant or edit a source note that a later ingest would adopt.
+//
+//   Encoding (M0 final #4): notes are decoded with a FATAL UTF-8 decoder that
+//   keeps a BOM; a note that is not valid UTF-8 is refused with
+//   `NoteEncodingError`, never decoded lossily and rewritten.
+//
+//   Locks (M0 final #3): `<note>.md.lock` is proper-lockfile's directory. The
+//   path rules reject `.lock` segments, and a squatted lock path (non-empty
+//   directory, file, link) is an explicit `VaultLockPathError` (vault-lock.ts).
 //
 //   patchFrontmatter(path, expectedHash, key, value)
 //     `updateNote` for one key. The key must be a plain lowercase snake_case
@@ -102,9 +122,9 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import { lock } from 'proper-lockfile';
-
 import { assertNoRelativeMdLinks } from './atomic.js';
+import { INGEST_WRITER, SOURCES_DIR } from './ingest/provenance.js';
+import { acquireVaultLock } from './vault-lock.js';
 import {
   parseNote,
   serializeNote,
@@ -165,6 +185,57 @@ function assertNotReservedForEdit(notePath: string, checkedRel: string): void {
       notePath,
       `"${checkedRel}" is reserved for append-only "${reserved}" notes; use appendNote`,
     );
+  }
+}
+
+/**
+ * Frontmatter keys that record ingest provenance (FR-WIKI-03). Only the ingest
+ * pipeline may set them (M0 final #1; ingest/provenance.ts).
+ */
+export const PROVENANCE_KEYS: readonly string[] = [
+  'source_sha256',
+  'original_path',
+  'extractor_name',
+  'extractor_version',
+  'source_encoding',
+  'source_bom_stripped',
+];
+
+/** True if a vault-relative path (lexical or real) lies under `60_Sources/`. */
+export function isSourcesPath(relPath: string): boolean {
+  const first = relPath.split(/[\\/]+/).find((x) => x !== '' && x !== '.');
+  return first !== undefined && first.toLowerCase() === SOURCES_DIR.toLowerCase();
+}
+
+/** A non-ingest writer touched the reserved ingest subtree or a provenance key. */
+export class ProvenanceViolationError extends Error {
+  readonly code = 'VAULT_PROVENANCE_RESERVED';
+  constructor(readonly notePath: string, detail: string) {
+    super(`Provenance violation on "${notePath}": ${detail}`);
+    this.name = 'ProvenanceViolationError';
+  }
+}
+
+/** A note whose bytes are not valid UTF-8 (never decoded lossily, never rewritten). */
+export class NoteEncodingError extends Error {
+  readonly code = 'VAULT_NOTE_ENCODING';
+  constructor(readonly notePath: string, detail: string) {
+    super(
+      `Note "${notePath}" is not valid UTF-8 (${detail}); refusing to read or edit it lossily. ` +
+        'Re-save it as UTF-8 first.',
+    );
+    this.name = 'NoteEncodingError';
+  }
+}
+
+const UTF8_FATAL = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** Decode note bytes strictly; a leading BOM is kept as U+FEFF. */
+function decodeNote(bytes: Buffer, rel: string): string {
+  try {
+    return UTF8_FATAL.decode(bytes);
+  } catch (err) {
+    throw new NoteEncodingError(rel, err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -318,13 +389,14 @@ export interface VaultBrokerOptions {
   now?: () => Date;
   /** proper-lockfile retry count. Default 5. */
   lockRetries?: number;
+  /**
+   * The ingest capability (ingest/provenance.ts). Only `runIngest` holds it;
+   * without it `60_Sources/` and PROVENANCE_KEYS are refused.
+   */
+  ingestWriter?: symbol;
 }
 
 const NOTE_PATH_OPTS: VaultPathOptions = { requireMarkdown: true };
-
-function isLockedErr(err: unknown): boolean {
-  return (err as { code?: string } | null)?.code === 'ELOCKED';
-}
 
 /** Copy frontmatter and normalize YAML timestamps (parsed as Date) to ISO strings. */
 function normalizeFrontmatter(fm: Record<string, unknown>): Record<string, unknown> {
@@ -356,6 +428,7 @@ function sameValue(a: unknown, b: unknown): boolean {
 export class VaultBroker {
   private readonly now: () => Date;
   private readonly lockRetries: number;
+  private readonly ingestPrivileged: boolean;
 
   constructor(
     readonly vaultRoot: string,
@@ -363,6 +436,34 @@ export class VaultBroker {
   ) {
     this.now = opts.now ?? (() => new Date());
     this.lockRetries = opts.lockRetries ?? 5;
+    this.ingestPrivileged = opts.ingestWriter === INGEST_WRITER;
+  }
+
+  /** Refuse the reserved ingest subtree to a non-ingest broker (lexical or real path). */
+  private assertSourcesWritable(notePath: string, checkedRel: string): void {
+    if (!this.ingestPrivileged && isSourcesPath(checkedRel)) {
+      throw new ProvenanceViolationError(
+        notePath,
+        `"${checkedRel}" is under ${SOURCES_DIR}/, which only the ingest pipeline writes`,
+      );
+    }
+  }
+
+  /** Refuse setting or changing a provenance key to a non-ingest broker. */
+  private assertProvenanceUnchanged(
+    notePath: string,
+    patch: Record<string, unknown>,
+    current: Record<string, unknown> = {},
+  ): void {
+    if (this.ingestPrivileged) return;
+    for (const key of PROVENANCE_KEYS) {
+      if (patch[key] === undefined) continue;
+      if (key in current && sameValue(patch[key], current[key])) continue;
+      throw new ProvenanceViolationError(
+        notePath,
+        `frontmatter key "${key}" records ingest provenance and only the ingest pipeline may set it`,
+      );
+    }
   }
 
   /** Resolve an untrusted note path to a contained target (throws VaultPathError). */
@@ -383,7 +484,7 @@ export class VaultBroker {
   }
 
   private snapshot(cp: ContainedPath, bytes: Buffer): NoteSnapshot {
-    const raw = bytes.toString('utf8');
+    const raw = decodeNote(bytes, cp.rel);
     const parsed = parseNote(raw);
     return {
       path: cp.rel,
@@ -416,20 +517,16 @@ export class VaultBroker {
     }
 
     let compromised: unknown = null;
-    let release: () => Promise<void>;
-    try {
-      release = await lock(target, {
-        realpath: false,
-        stale: 30_000,
-        retries: { retries: this.lockRetries, factor: 2, minTimeout: 50, maxTimeout: 1000 },
-        onCompromised: (err) => {
-          compromised = err;
-        },
-      });
-    } catch (err) {
-      if (isLockedErr(err)) return { lockedOut: true };
-      throw err;
-    }
+    // A squatted lock path (non-empty dir, file, link) throws VaultLockPathError
+    // instead of reading as "locked" forever (M0 final #3).
+    const release = await acquireVaultLock(target, {
+      stale: 30_000,
+      retries: { retries: this.lockRetries, factor: 2, minTimeout: 50, maxTimeout: 1000 },
+      onCompromised: (err) => {
+        compromised = err;
+      },
+    });
+    if (release === null) return { lockedOut: true };
     const assertLockHeld = () => {
       if (compromised !== null) throw new VaultLockCompromisedError(cp.rel, compromised);
     };
@@ -457,12 +554,15 @@ export class VaultBroker {
   ): Promise<BrokerResult> {
     const cp = await this.resolve(relPath);
     assertReservedCreate(cp.rel, cp.rel, frontmatter['type']);
+    this.assertSourcesWritable(cp.rel, cp.rel);
+    this.assertProvenanceUnchanged(cp.rel, frontmatter);
     assertNoRelativeMdLinks(body, cp.rel);
     const contents = serializeNote(frontmatter, body); // throws on invalid §8.3
     const absPath = this.reportPath(cp);
 
     const out = await this.withLock(cp, async (target, assertLockHeld, realRel) => {
       assertReservedCreate(cp.rel, realRel, frontmatter['type']);
+      this.assertSourcesWritable(cp.rel, realRel);
       const existsResult = async () => {
         const current = await readRegularFile(target, cp.rel);
         return {
@@ -509,11 +609,13 @@ export class VaultBroker {
   ): Promise<BrokerResult> {
     const cp = await this.resolve(relPath);
     assertNotReservedForEdit(cp.rel, cp.rel);
+    this.assertSourcesWritable(cp.rel, cp.rel);
     const absPath = this.reportPath(cp);
     if (!cp.exists) return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
 
     const out = await this.withLock(cp, async (target, assertLockHeld, realRel): Promise<BrokerResult> => {
       assertNotReservedForEdit(cp.rel, realRel);
+      this.assertSourcesWritable(cp.rel, realRel);
       if (!(await recheckContained(cp, target))) {
         return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
       }
@@ -555,6 +657,7 @@ export class VaultBroker {
           `cannot convert a note to append-only type "${String(patchFm['type'])}"`,
         );
       }
+      this.assertProvenanceUnchanged(cp.rel, patchFm, curFm);
 
       const merged: Record<string, unknown> = { ...curFm };
       for (const [k, v] of Object.entries(patchFm)) {
@@ -579,7 +682,7 @@ export class VaultBroker {
       const latestBytes = await readRegularFile(target, cp.rel);
       const latest = hashContent(latestBytes);
       if (latest !== snap.hash) {
-        const raw = latestBytes.toString('utf8');
+        const raw = latestBytes.toString('utf8'); // informational conflict copy only; never written back
         return { ok: false, path: cp.rel, absPath, reason: 'conflict', currentHash: latest, current: raw };
       }
       await atomicWriteContained(cp, contents, { target, beforeCommit: assertLockHeld });
@@ -609,6 +712,12 @@ export class VaultBroker {
   ): Promise<BrokerResult> {
     assertPatchableFrontmatterKey(relPath, key);
     if (value === undefined) throw new NoteFrontmatterError(relPath, `no value given for "${key}"`);
+    if (!this.ingestPrivileged && PROVENANCE_KEYS.includes(key)) {
+      throw new ProvenanceViolationError(
+        relPath,
+        `frontmatter key "${key}" records ingest provenance and only the ingest pipeline may set it`,
+      );
+    }
     return this.updateNote(relPath, expectedHash, () => ({ frontmatter: { [key]: value } }));
   }
 
@@ -624,6 +733,7 @@ export class VaultBroker {
   ): Promise<BrokerResult> {
     const cp = await this.resolve(relPath);
     const absPath = this.reportPath(cp);
+    this.assertSourcesWritable(cp.rel, cp.rel);
     assertNoRelativeMdLinks(text, cp.rel);
     const chunk = `\n${text.replace(/\s+$/, '')}\n`;
 
@@ -641,6 +751,7 @@ export class VaultBroker {
     }
 
     const out = await this.withLock(cp, async (target, assertLockHeld, realRel): Promise<BrokerResult> => {
+      this.assertSourcesWritable(cp.rel, realRel);
       const reserved = reservedAppendOnlyType(realRel);
       const exists = await recheckContained(cp, target);
       if (!exists) {

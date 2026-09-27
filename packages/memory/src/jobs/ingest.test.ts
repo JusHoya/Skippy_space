@@ -16,7 +16,7 @@
 //
 // Run via: node --import tsx --test src/jobs/ingest.test.ts
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -28,8 +28,20 @@ import { sha256Hex } from '../ingest/originals.js';
 import { WikilinkViolationError } from '../atomic.js';
 import { parseNote, validateFrontmatter } from '../frontmatter.js';
 
+// Temp dirs this file creates; removed after all of its tests (best effort:
+// a Windows handle still open on one must not fail the run).
+const tmpDirs: string[] = [];
+async function trackTmp(p: Promise<string>): Promise<string> {
+  const dir = await p;
+  tmpDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+});
+
 async function makeVault(): Promise<string> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-ingest-'));
+  const root = await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-ingest-')));
   for (const sub of ['00_Inbox', '60_Sources']) {
     await fs.mkdir(path.join(root, sub), { recursive: true });
   }
@@ -431,7 +443,7 @@ test('E4-4: content changed in the inbox just before removal is not deleted', as
 // and the inbox drop must be left untouched (nothing "partially succeeded").
 test('E3-2: a junction at 60_Sources/originals pointing outside the vault is rejected, not followed', async (t) => {
   const vaultRoot = await makeVault();
-  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-outside-'));
+  const outside = await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-outside-')));
   const originalsPath = path.join(vaultRoot, '60_Sources', 'originals');
 
   const made = await trySymlinkJunction(outside, originalsPath);
@@ -458,7 +470,7 @@ test('E3-2: a junction at 60_Sources/originals pointing outside the vault is rej
 // outside the vault must also be rejected before any write is attempted.
 test('E3-2: a junction at 60_Sources pointing outside the vault is rejected, not followed', async (t) => {
   const vaultRoot = await makeVault();
-  const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-outside2-'));
+  const outside = await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-outside2-')));
   const sourcesPath = path.join(vaultRoot, '60_Sources');
 
   // Replace the real 60_Sources with a junction to `outside`.

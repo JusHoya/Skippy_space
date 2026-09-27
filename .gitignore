@@ -31,6 +31,9 @@ apps/shell/src-tauri/.tauri/
 # Vault — local-only state
 vault/.smart-env/
 vault/.obsidian/workspace*.json
+# Ingest freeze files and contained atomic-write temps (also in vault/.gitignore)
+*.ingest-tmp
+.skippy-*.tmp
 
 # Replay artifacts
 .replay

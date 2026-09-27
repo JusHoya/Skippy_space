@@ -5,7 +5,7 @@
 // Every test here fails on 956c208. Run via:
 //   node --import tsx --test src/vault-broker.reserved.test.ts
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
@@ -16,8 +16,20 @@ import { makeFrontmatter } from './frontmatter.js';
 import { dailyNoteRelPath, generateDailyNote } from './daily.js';
 import { mirrorArchivalToVault } from './jobs/archival-mirror.js';
 
+// Temp dirs this file creates; removed after all of its tests (best effort:
+// a Windows handle still open on one must not fail the run).
+const tmpDirs: string[] = [];
+async function trackTmp(p: Promise<string>): Promise<string> {
+  const dir = await p;
+  tmpDirs.push(dir);
+  return dir;
+}
+after(async () => {
+  await Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+});
+
 async function makeVault(): Promise<string> {
-  const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'skippy-rt2-reserved-')));
+  const base = await fs.realpath(await trackTmp(fs.mkdtemp(path.join(os.tmpdir(), 'skippy-rt2-reserved-'))));
   const vault = path.join(base, 'vault');
   for (const d of ['40_Daily', '50_Agents/research', '20_Topics']) {
     await fs.mkdir(path.join(vault, d), { recursive: true });

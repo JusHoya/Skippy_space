@@ -26,6 +26,7 @@ import {
   runLint,
   mockDistill,
   watchInbox,
+  canonicalVaultRootSync,
   recordUnsupported,
   recordIngestRejection,
   type DistillFn,
@@ -179,7 +180,19 @@ export function startMemoryJobs(): MemoryJobsHandle {
     return { stop: async () => {} };
   }
 
-  const vaultRoot = resolveVaultRoot();
+  // M0 final #5: canonicalize the configured root ONCE (native realpath: an
+  // 8.3 alias or junction root becomes its long form) and use that one form
+  // for the watcher, runIngest and the scheduled jobs. A root that cannot be
+  // canonicalized is a loud error event, not a silently idle watcher.
+  const configuredRoot = resolveVaultRoot();
+  let vaultRoot: string;
+  try {
+    vaultRoot = canonicalVaultRootSync(configuredRoot);
+  } catch (err) {
+    logger.error({ msg: 'memory jobs disabled: vault root cannot be canonicalized', vaultRoot: configuredRoot, err: String(err) });
+    emitJob({ job: 'ingest', phase: 'error', detail: `vault root unusable, memory jobs not started: ${String(err)}` });
+    return { stop: async () => {} };
+  }
   const distill = selectDistiller();
   logger.info({
     msg: 'memory jobs starting',
@@ -244,6 +257,23 @@ export function startMemoryJobs(): MemoryJobsHandle {
           detail: `rejected (${reason}); original left intact, see .ingest-error.json`,
         });
       })();
+    },
+    onError: (err) => {
+      // M0 final #5: a watcher that cannot run is an explicit error event.
+      logger.error({ msg: 'inbox watcher error', err: String(err) });
+      emitJob({ job: 'ingest', phase: 'error', detail: `inbox watcher: ${err.message}` });
+    },
+    onRecovered: (r) => {
+      // M0 final #7: leftover .ingest-tmp freeze files are surfaced, never hidden.
+      const entry = { msg: 'ingest-tmp recovery', tmpPath: r.tmpPath, action: r.action, detail: r.detail };
+      if (r.action === 'left') logger.error(entry);
+      else logger.warn(entry);
+      emitJob({
+        job: 'ingest',
+        phase: r.action === 'left' ? 'error' : 'progress',
+        sourcePath: r.restoredAs ?? r.tmpPath,
+        detail: `recovered interrupted ingest (${r.action}): ${r.detail}`,
+      });
     },
   });
 
