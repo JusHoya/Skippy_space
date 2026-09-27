@@ -35,6 +35,7 @@
 import { mkdirSync } from 'node:fs';
 
 import type { ExecutorTerminal, ModelId } from '@skippy/shared';
+import { isNormalStopReason, TRUNCATED_STREAM_DETAIL } from '@skippy/shared';
 import type {
   CanUseTool,
   HookCallback,
@@ -144,9 +145,13 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  *   |   `deferred_tool_use` present                          |             |                         |
  *   | `terminal_reason === 'aborted_tools'`                  | interrupted | tool_execution_aborted  |
  *   | `stop_reason === 'refusal'` (N6a)                      | failed      | model_refused           |
+ *   | subtype `'success'`, `is_error === false`,             | failed      | provider_error          |
+ *   |   `terminal_reason` absent or `'completed'`, and       |             |   (truncated, OQ-20)    |
+ *   |   `stop_reason` null/absent, OR the stream shows the   |             |                         |
+ *   |   final main-thread turn never got a stop reason       |             |                         |
  *   | subtype `'success'`, `is_error === false`,             | succeeded   | —                       |
  *   |   `terminal_reason` absent or `'completed'`, and       |             |                         |
- *   |   `stop_reason` absent/null/`end_turn`/`stop_sequence` |             |                         |
+ *   |   `stop_reason` `end_turn`/`stop_sequence`             |             |                         |
  *   | anything else (error subtype, `is_error` on a          | failed      | executor_error          |
  *   |   success subtype, `model_error`, `prompt_too_long`,   |             |                         |
  *   |   `max_turns`, any other/unknown terminal_reason, or   |             |                         |
@@ -155,8 +160,24 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  *
  * `stop_reason` is typed `string | null` in sdk.d.ts (0.3.162) and carries
  * the final model turn's Messages API stop reason. Only `end_turn` /
- * `stop_sequence` (or no value) mean the model finished normally; every other
- * value is a truncated, paused or refused turn and fails closed.
+ * `stop_sequence` mean the model finished normally; every other value is a
+ * truncated, paused or refused turn and fails closed.
+ *
+ * A missing stop reason is a truncated provider stream, not a normal stop
+ * (OQ-20, FR-RUN-01, G0). Verified live with the bundled CLI 2.1.162 against a
+ * local mock: a main-thread SSE stream that sends `message_start` + a text
+ * block and ends without `message_delta`/`message_stop` yields `subtype:
+ * "success"`, `is_error: false`, `terminal_reason: "completed"`, `stop_reason:
+ * null` and the partial text as `result`; every complete run (including CLI
+ * max_tokens recovery, 529/429 retries and the non-streaming fallback after a
+ * dropped stream) carries `end_turn`/`stop_sequence`. The result's
+ * `stop_reason` is the last main-thread `message_delta` of the segment, so a
+ * truncated final turn after a `tool_use` turn reports a stale `"tool_use"`;
+ * `stream` (the {@link RunStreamObserver}'s view of the final main-thread
+ * turn, from `includePartialMessages` stream events) catches that case and
+ * any stale normal value. Forwarded `assistant` messages always carry
+ * `stop_reason: null` (emitted at `content_block_stop`), so they are not a
+ * signal on their own.
  *
  * A succeeded result's `summary` is always a string (`result` when it is a
  * string, otherwise {@link NO_SUMMARY}) so the emitted `delegation_complete`
@@ -180,7 +201,11 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  * gets its more specific reason code instead of the generic
  * `executor_error` catch-all.
  */
-function mapSdkResultMessage(msg: SDKResultMessage, boardId: string): SdkBoardResult {
+function mapSdkResultMessage(
+  msg: SDKResultMessage,
+  boardId: string,
+  stream: FinalTurnEvidence = {},
+): SdkBoardResult {
   const costUsd = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : undefined;
   const withCost = (r: SdkBoardResult): SdkBoardResult => {
     if (costUsd !== undefined) r.costUsd = costUsd;
@@ -274,13 +299,34 @@ function mapSdkResultMessage(msg: SDKResultMessage, boardId: string): SdkBoardRe
     });
   }
 
-  const normalStop = stopReason === undefined || stopReason === null || NORMAL_STOP_REASONS.has(stopReason);
-  const normalCompletion =
+  const missingStop = stopReason === undefined || stopReason === null;
+  const cleanSuccess =
     msg.subtype === 'success' &&
     msg.is_error === false &&
-    (terminalReason === undefined || terminalReason === 'completed') &&
-    normalStop;
-  if (normalCompletion) {
+    (terminalReason === undefined || terminalReason === 'completed');
+
+  // OQ-20: a "success" whose provider stream never reported a stop reason is a
+  // truncated turn (the partial text is the `result`), never success.
+  if (cleanSuccess && (missingStop || stream.truncated !== undefined)) {
+    const evidence = [
+      `result stop_reason: ${describeValue(stopReason ?? null)}`,
+      stream.truncated,
+      resultText !== undefined ? `partial result: ${describeValue(resultText)}` : '',
+    ]
+      .filter(Boolean)
+      .join('; ');
+    return withCost({
+      status: 'failed',
+      reason: {
+        code: 'provider_error',
+        message: `Board ${boardId} executor's ${TRUNCATED_STREAM_DETAIL}.`,
+        detail: `${TRUNCATED_STREAM_DETAIL}: ${evidence}`,
+      },
+    });
+  }
+
+  const normalStop = isNormalStopReason(stopReason);
+  if (cleanSuccess && normalStop) {
     return withCost({ status: 'succeeded', summary: resultText ?? NO_SUMMARY });
   }
 
@@ -289,9 +335,10 @@ function mapSdkResultMessage(msg: SDKResultMessage, boardId: string): SdkBoardRe
   // blocking_limit, rapid_refill_breaker, aborted_streaming, image_error, or
   // an unrecognised future value) or an abnormal stop_reason (max_tokens,
   // pause_turn, …) never becomes success.
+  const abnormalStop = !missingStop && !normalStop;
   const suffix = [
     terminalReason ? `terminal_reason: ${terminalReason}` : '',
-    normalStop ? '' : `stop_reason: ${describeValue(stopReason)}`,
+    abnormalStop ? `stop_reason: ${describeValue(stopReason)}` : '',
   ]
     .filter(Boolean)
     .join(', ');
@@ -299,7 +346,7 @@ function mapSdkResultMessage(msg: SDKResultMessage, boardId: string): SdkBoardRe
   const detail =
     msg.subtype === 'success'
       ? `success result ${msg.is_error === false ? 'ended abnormally' : 'flagged is_error'}: ${resultText ?? NO_SUMMARY}${suffix ? ` (${suffix})` : ''}`
-      : [msg.subtype, terminalReason, normalStop ? '' : `stop_reason: ${describeValue(stopReason)}`, ...errors.map(String)]
+      : [msg.subtype, terminalReason, abnormalStop ? `stop_reason: ${describeValue(stopReason)}` : '', ...errors.map(String)]
           .filter(Boolean)
           .join(': ');
   return withCost({
@@ -317,9 +364,6 @@ function mapSdkResultMessage(msg: SDKResultMessage, boardId: string): SdkBoardRe
 /** Summary of a succeeded result whose `result` text is missing (N6c). The
  * wire schema requires `summary: string`, so it is never `undefined`. */
 export const NO_SUMMARY = '(no summary)';
-
-/** Messages API stop reasons meaning the final model turn ended normally. */
-const NORMAL_STOP_REASONS: ReadonlySet<unknown> = new Set(['end_turn', 'stop_sequence']);
 
 /** Short, redaction-safe description of an unexpected value for diagnostics. */
 function describeValue(v: unknown): string {
@@ -662,6 +706,23 @@ interface TaskInfo {
 }
 
 /**
+ * What the stream showed about the final main-thread model turn before a
+ * `result` (OQ-20). `truncated` is set, with the evidence, when that turn
+ * never received a stop reason; absent when complete or not observable.
+ */
+export interface FinalTurnEvidence {
+  truncated?: string;
+}
+
+/** The latest main-thread model turn, from `stream_event` messages. */
+interface MainTurn {
+  id: string | undefined;
+  /** `message_delta` stop reason (or a non-streamed message's); null = none yet. */
+  stopReason: string | null;
+  source: 'stream' | 'non-streamed';
+}
+
+/**
  * Watches every SDK stream message for task-agent failures (→ `failures`)
  * and for calls to tools the executor was never offered (→ `denials`, D2).
  * Stateless with respect to the result mapping: it only records.
@@ -673,6 +734,10 @@ export class RunStreamObserver {
   private readonly toolNames = new Map<string, string>();
   /** Tools the CLI offered (system/init `tools`), canonicalized. */
   private offered: Set<string> | null = null;
+  /** Final main-thread turn of the current result segment (OQ-20). */
+  private mainTurn: MainTurn | null = null;
+  /** Main-thread `stream_event`s seen, i.e. partial messages are flowing. */
+  private streamEvents = false;
 
   constructor(
     private readonly policy: Pick<ExecutionPolicy, 'allowedTools' | 'mcpServers'>,
@@ -718,6 +783,61 @@ export class RunStreamObserver {
     if (msg.type === 'system') this.observeSystem(msg);
     else if (msg.type === 'assistant') this.observeAssistant(msg);
     else if (msg.type === 'user') this.observeUser(msg);
+    else if (msg.type === 'stream_event') this.observeStreamEvent(msg);
+  }
+
+  /**
+   * Evidence about the final main-thread turn for the `result` being mapped
+   * now; resets for the next result segment (a background task can wake the
+   * board and produce another result). With `includePartialMessages` the CLI
+   * forwards the main thread's raw SSE events (verified, CLI 2.1.162); a
+   * turn whose `message_start` was never followed by a `message_delta` stop
+   * reason is truncated. Without stream events nothing is claimed and the
+   * result's own `stop_reason` decides.
+   */
+  takeFinalTurnEvidence(): FinalTurnEvidence {
+    const turn = this.mainTurn;
+    this.mainTurn = null;
+    if (!turn || turn.stopReason !== null) return {};
+    const how =
+      turn.source === 'stream' ? 'message_start without a message_delta stop reason' : 'non-streamed message with stop_reason null';
+    return { truncated: `final main-thread turn ${turn.id ?? '(no id)'} got no stop reason (${how})` };
+  }
+
+  /**
+   * Main-thread SSE events only: the CLI does not forward a task agent's
+   * stream events (verified: none with `parent_tool_use_id` set), so task-
+   * agent turns are not tracked here.
+   */
+  private observeStreamEvent(msg: Record<string, unknown>): void {
+    const parent = msg.parent_tool_use_id;
+    if (typeof parent === 'string' && parent.length > 0) return;
+    const ev = asRecord(msg.event);
+    if (!ev) return;
+    this.streamEvents = true;
+    if (ev.type === 'message_start') {
+      const id = asRecord(ev.message)?.id;
+      this.mainTurn = { id: typeof id === 'string' ? id : undefined, stopReason: null, source: 'stream' };
+    } else if (ev.type === 'message_delta' && this.mainTurn) {
+      const stop = asRecord(ev.delta)?.stop_reason;
+      if (typeof stop === 'string' && stop.length > 0) this.mainTurn.stopReason = stop;
+    }
+  }
+
+  /**
+   * A main-thread assistant message that no `message_start` announced is a
+   * non-streamed turn (the CLI's non-streaming fallback after a dropped
+   * stream, verified): its own `stop_reason` is final. Streamed messages are
+   * emitted at `content_block_stop` with `stop_reason: null`, so they never
+   * update the turn. The CLI's `<synthetic>` error messages are left to the
+   * result mapping (they come with an `is_error` result).
+   */
+  private observeMainAssistant(message: Record<string, unknown> | undefined): void {
+    if (!this.streamEvents || !message || message.model === '<synthetic>') return;
+    const id = typeof message.id === 'string' ? message.id : undefined;
+    if (id !== undefined && id === this.mainTurn?.id) return;
+    const stop = message.stop_reason;
+    this.mainTurn = { id, stopReason: typeof stop === 'string' && stop.length > 0 ? stop : null, source: 'non-streamed' };
   }
 
   private observeSystem(msg: Record<string, unknown>): void {
@@ -794,7 +914,10 @@ export class RunStreamObserver {
     // Task-agent terminal failure (signal 2). Main-thread assistant errors are
     // covered by the result message mapping and are not recorded here.
     const parent = msg.parent_tool_use_id;
-    if (typeof parent !== 'string' || parent.length === 0) return;
+    if (typeof parent !== 'string' || parent.length === 0) {
+      this.observeMainAssistant(message);
+      return;
+    }
     const error = msg.error;
     const stopReason = message?.stop_reason;
     const hasError = error !== undefined && error !== null;
@@ -851,16 +974,18 @@ export class RunStreamObserver {
 
 /**
  * Add the run observers the SDK needs to surface task-agent failures:
- * a `StopFailure` hook (signal 1) and `forwardSubagentText: true` (signal 2).
- * Returned as part of the permission options object so the executor's query
- * options literal is unchanged; neither affects tool authority (the hook
- * always returns `{}` — it observes, never decides).
+ * a `StopFailure` hook (signal 1) and `forwardSubagentText: true` (signal 2),
+ * plus `includePartialMessages: true` so the main thread's raw SSE events
+ * reveal a truncated final turn (OQ-20). Returned as part of the permission
+ * options object so the executor's query options literal is unchanged; none
+ * affects tool authority (the hook always returns `{}` — it observes, never
+ * decides).
  */
 export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
   permission: T,
   observer: RunStreamObserver,
   failures: RunFailureLedger,
-): T & { forwardSubagentText: true } {
+): T & { forwardSubagentText: true; includePartialMessages: true } {
   const stopFailure: HookCallback = (input) => {
     try {
       const rec = input as unknown as Record<string, unknown>;
@@ -884,7 +1009,7 @@ export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
   };
   const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = { ...permission.hooks };
   hooks.StopFailure = [...(hooks.StopFailure ?? []), { hooks: [stopFailure] }];
-  return { ...permission, hooks, forwardSubagentText: true };
+  return { ...permission, hooks, forwardSubagentText: true, includePartialMessages: true };
 }
 
 /**
@@ -1023,7 +1148,7 @@ export async function executeBoardMissionViaSdk(
           });
         }
       }
-      const mapped = mapSdkResultMessage(msg, params.boardId);
+      const mapped = mapSdkResultMessage(msg, params.boardId, observer.takeFinalTurnEvidence());
       if (mapped.status === 'succeeded' && sawNonSuccessResult) {
         logger.warn({
           msg: 'SDK board: later success result ignored after an earlier non-success result',

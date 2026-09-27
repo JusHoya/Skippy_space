@@ -14,6 +14,7 @@ import {
   nonSuccessRecord,
   readDelegationCompleteRecord,
   terminalRecordViolations,
+  TRUNCATED_STREAM_DETAIL,
 } from '@skippy/shared';
 
 import { resolveExecutionGate } from './execution-gate.js';
@@ -197,7 +198,7 @@ test('sdk executor: genuine terminal success → succeeded with summary + cost',
   const r = await executeBoardMissionViaSdk(params, {
     loadSdk: fakeSdk([
       { type: 'assistant' },
-      { type: 'result', subtype: 'success', is_error: false, result: 'Implemented the thing.', total_cost_usd: 0.05 },
+      { type: 'result', subtype: 'success', is_error: false, result: 'Implemented the thing.', stop_reason: 'end_turn', total_cost_usd: 0.05 },
     ]),
   });
   assert.deepEqual(r, { status: 'succeeded', summary: 'Implemented the thing.', costUsd: 0.05 });
@@ -206,7 +207,7 @@ test('sdk executor: genuine terminal success → succeeded with summary + cost',
 test('sdk executor: success subtype with terminal_reason "completed" → succeeded', async () => {
   const r = await executeBoardMissionViaSdk(params, {
     loadSdk: fakeSdk([
-      { type: 'result', subtype: 'success', is_error: false, result: 'done', terminal_reason: 'completed' },
+      { type: 'result', subtype: 'success', is_error: false, result: 'done', stop_reason: 'end_turn', terminal_reason: 'completed' },
     ]),
   });
   assert.equal(r.status, 'succeeded');
@@ -301,7 +302,7 @@ test('sdk executor: error result followed by a later success result → the erro
   const r = await executeBoardMissionViaSdk(params, {
     loadSdk: fakeSdk([
       { type: 'result', subtype: 'error_during_execution', is_error: true, errors: ['tool crashed'], total_cost_usd: 0.1 },
-      { type: 'result', subtype: 'success', is_error: false, result: 'looked done', total_cost_usd: 0.15 },
+      { type: 'result', subtype: 'success', is_error: false, result: 'looked done', stop_reason: 'end_turn', total_cost_usd: 0.15 },
     ]),
   });
   assert.equal(r.status, 'failed');
@@ -338,7 +339,7 @@ test('sdk executor: options actually passed to query() are locked down (D6)', as
     const query = ((opts: { options: Record<string, unknown> }) => {
       captured = opts.options;
       async function* gen(): AsyncGenerator<unknown> {
-        yield { type: 'result', subtype: 'success', is_error: false, result: 'ok' };
+        yield { type: 'result', subtype: 'success', is_error: false, result: 'ok', stop_reason: 'end_turn' };
       }
       return gen();
     }) as unknown as ClaudeAgentSdkModule['query'];
@@ -532,13 +533,56 @@ test('N6a: abnormal stop_reason (max_tokens, pause_turn, tool_use, unknown) on a
   }
 });
 
-test('N6a: normal stop_reason (end_turn, stop_sequence, null, absent) still succeeds', async () => {
-  for (const stop_reason of ['end_turn', 'stop_sequence', null, undefined]) {
+test('N6a: normal stop_reason (end_turn, stop_sequence) still succeeds', async () => {
+  for (const stop_reason of ['end_turn', 'stop_sequence']) {
     const r = await executeBoardMissionViaSdk(params, {
       loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, result: 'ok', stop_reason }]),
     });
     assert.equal(r.status, 'succeeded', String(stop_reason));
   }
+});
+
+// OQ-20 (FR-RUN-01, G0): the bundled CLI 2.1.162 reports a main-thread SSE
+// stream that ended after a text block, without message_delta/message_stop, as
+// `success` / `is_error: false` / `terminal_reason: "completed"` with
+// `stop_reason: null` and the partial text as `result` (live-mock maintruncend).
+test('OQ-20: a "success" result with stop_reason null/absent (truncated stream) → failed(provider_error), never succeeded', async () => {
+  for (const extra of [{ stop_reason: null }, { stop_reason: undefined }, {}]) {
+    const r = await executeBoardMissionViaSdk(params, {
+      loadSdk: fakeSdk([
+        {
+          type: 'result',
+          subtype: 'success',
+          is_error: false,
+          api_error_status: null,
+          result: 'partial answer',
+          terminal_reason: 'completed',
+          permission_denials: [],
+          total_cost_usd: 0,
+          ...extra,
+        },
+      ]),
+    });
+    const label = JSON.stringify(extra);
+    assert.equal(r.status, 'failed', label);
+    assert.equal(r.status === 'failed' && r.reason.code, 'provider_error', label);
+    assert.match(r.status === 'failed' ? r.reason.message : '', /without a stop reason \(truncated\)/, label);
+    assert.ok(r.status === 'failed' && r.reason.detail?.startsWith(TRUNCATED_STREAM_DETAIL), label);
+    assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /partial answer/, label);
+    assert.equal(deriveTaskOutcome(r, 'not_defined').outcome, 'failed', label);
+  }
+});
+
+test('OQ-20: stop_reason null on an is_error or error-subtype result keeps its executor_error mapping', async () => {
+  const flagged = await executeBoardMissionViaSdk(params, {
+    loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: true, result: 'API Error', stop_reason: null }]),
+  });
+  assert.equal(flagged.status === 'failed' && flagged.reason.code, 'executor_error');
+  const errSubtype = await executeBoardMissionViaSdk(params, {
+    loadSdk: fakeSdk([{ type: 'result', subtype: 'error_max_turns', is_error: true, stop_reason: null }]),
+  });
+  assert.equal(errSubtype.status === 'failed' && errSubtype.reason.code, 'executor_error');
+  assert.doesNotMatch(errSubtype.status === 'failed' ? (errSubtype.reason.detail ?? '') : '', /stop_reason/);
 });
 
 test('N6b: non-array permission_denials ({}, string, null, number) → failed(executor_error), never "no denials"', async () => {
@@ -555,7 +599,7 @@ test('N6b: non-array permission_denials ({}, string, null, number) → failed(ex
 test('N6c: success with a missing/non-string result → succeeded with a string summary', async () => {
   for (const extra of [{}, { result: undefined }, { result: null }, { result: 42 }]) {
     const r = await executeBoardMissionViaSdk(params, {
-      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, ...extra }]),
+      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, stop_reason: 'end_turn', ...extra }]),
     });
     assert.equal(r.status, 'succeeded', JSON.stringify(extra));
     assert.equal(typeof (r.status === 'succeeded' ? r.summary : null), 'string', JSON.stringify(extra));

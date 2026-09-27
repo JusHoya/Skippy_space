@@ -270,7 +270,8 @@ function sdkStream(messages: unknown[], throwAfter?: Error): () => Promise<Claud
   return () => Promise.resolve({ query });
 }
 
-const ok = { type: 'result', subtype: 'success', is_error: false } as const;
+// A complete CLI result always carries its final stop reason (OQ-20).
+const ok = { type: 'result', subtype: 'success', is_error: false, stop_reason: 'end_turn' } as const;
 
 const MAPPING_ROWS: Array<[string, unknown[], string, string | undefined, Error?]> = [
   ['success', [{ ...ok, result: 'Parser done.', total_cost_usd: 0.01 }], 'succeeded', undefined],
@@ -285,6 +286,7 @@ const MAPPING_ROWS: Array<[string, unknown[], string, string | undefined, Error?
   ['aborted_tools', [{ ...ok, terminal_reason: 'aborted_tools' }], 'interrupted', 'tool_execution_aborted'],
   ['stop_reason refusal', [{ ...ok, stop_reason: 'refusal' }], 'failed', 'model_refused'],
   ['stop_reason max_tokens', [{ ...ok, stop_reason: 'max_tokens' }], 'failed', 'executor_error'],
+  ['stop_reason null (truncated stream, OQ-20)', [{ ...ok, result: 'partial', stop_reason: null }], 'failed', 'provider_error'],
   ['is_error success', [{ ...ok, is_error: true }], 'failed', 'executor_error'],
   ['error subtype', [{ type: 'result', subtype: 'error_max_turns', is_error: true }], 'failed', 'executor_error'],
   ['model_error', [{ ...ok, terminal_reason: 'model_error' }], 'failed', 'executor_error'],

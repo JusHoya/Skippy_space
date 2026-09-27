@@ -10,7 +10,10 @@
 // reports `permission_denials: []` and a `success` result for the parent.
 // EC1 D1: a task agent whose provider call fails (401/400) or is refused must
 // end the run `failed` (the CLI still reports a parent `success`). EC1 D2: a
-// main-thread call to a tool the charter withheld is `blocked`.
+// main-thread call to a tool the charter withheld is `blocked`. OQ-20: a
+// main-thread SSE stream that ends without `message_delta`/`message_stop` is
+// reported by the CLI as a `success` with `stop_reason: null` — it must end
+// `failed(provider_error)`, never `succeeded`.
 
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -38,6 +41,9 @@ interface Scenario {
   mainTools: ToolUse[];
   subTools: ToolUse[];
   subFailure?: SubFailure;
+  /** OQ-20: the main thread's final (text) turn stream ends after its text
+   * block, without `message_delta`/`message_stop`. */
+  mainTruncEnd?: boolean;
 }
 
 let scenario: Scenario = { mainTools: [], subTools: [] };
@@ -55,7 +61,14 @@ const ENV_OVERRIDES = [
   'CLAUDE_CODE_MAX_RETRIES',
 ] as const;
 
-function sse(res: http.ServerResponse, model: unknown, id: string, blocks: Array<Record<string, unknown>>, stop: string): void {
+function sse(
+  res: http.ServerResponse,
+  model: unknown,
+  id: string,
+  blocks: Array<Record<string, unknown>>,
+  stop: string,
+  truncEnd = false,
+): void {
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
   const ev = (e: string, d: unknown): void => {
     res.write(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`);
@@ -83,6 +96,10 @@ function sse(res: http.ServerResponse, model: unknown, id: string, blocks: Array
     }
     ev('content_block_stop', { type: 'content_block_stop', index });
   });
+  if (truncEnd) {
+    res.end();
+    return;
+  }
   ev('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 5 } });
   ev('message_stop', { type: 'message_stop' });
   res.end();
@@ -134,7 +151,7 @@ function startMock(): Promise<http.Server> {
         sse(res, j.model, id, toolBlocks(scenario.mainTools), 'tool_use');
       } else {
         const text = isMain ? 'All done, monkeys! Magnificent.' : isSub ? 'sub done' : 'Title';
-        sse(res, j.model, id, [{ type: 'text', text }], 'end_turn');
+        sse(res, j.model, id, [{ type: 'text', text: isMain && scenario.mainTruncEnd ? 'partial answer' : text }], 'end_turn', isMain && scenario.mainTruncEnd === true);
       }
     });
   });
@@ -272,4 +289,22 @@ test('live CLI (D2 unknowntool): main-thread WebSearch + NotebookEdit withheld b
   assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
   assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /WebSearch/);
   assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /NotebookEdit/);
+});
+
+// ── OQ-20: truncated main-thread provider stream (FR-RUN-01, G0) ─────────────
+
+test('live CLI (OQ-20 maintruncend): main stream ends without message_delta/message_stop → failed(provider_error), not succeeded', { skip, timeout: 120_000 }, async () => {
+  scenario = { mainTools: [], subTools: [], mainTruncEnd: true };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+  assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /without a stop reason \(truncated\)/);
+  assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /final main-thread turn/);
+});
+
+test('live CLI (OQ-20 maintooltrunc): truncated final turn after a tool turn (stale result stop_reason) → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
+  scenario = { mainTools: [{ name: 'Read', input: { file_path: path.join(tmp, 'work', 'inside.txt') } }], subTools: [], mainTruncEnd: true };
+  const r = await executeBoardMissionViaSdk(mission());
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
 });

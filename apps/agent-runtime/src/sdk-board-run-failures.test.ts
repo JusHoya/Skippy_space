@@ -475,9 +475,152 @@ test('D1: query() options forward subagent text and register a StopFailure obser
   assert.equal(r.status, 'succeeded');
   const opts = captured.options!;
   assert.equal(opts.forwardSubagentText, true);
+  // OQ-20: main-thread SSE events are needed to see a truncated final turn.
+  assert.equal(opts.includePartialMessages, true);
   const hooks = opts.hooks as Record<string, unknown[] | undefined>;
   assert.ok(hooks.StopFailure && hooks.StopFailure.length > 0, 'StopFailure hook must be registered');
   assert.ok(hooks.PreToolUse && hooks.PreToolUse.length > 0, 'the policy PreToolUse hook must remain');
+});
+
+// ── OQ-20: truncated main-thread provider stream never succeeds ─────────────
+//
+// Captured with `includePartialMessages: true` from the bundled CLI 2.1.162
+// against the local mock (maintruncend, subthenmaintrunc, bgoktrunc,
+// maindropmidrecover, mainmaxtok, ctrl). The CLI forwards the main thread's
+// raw SSE events as `stream_event`s; its `assistant` messages are emitted at
+// `content_block_stop` and always carry `stop_reason: null`. A turn whose
+// `message_start` never got a `message_delta` stop reason was truncated. The
+// result's `stop_reason` is the last main-thread `message_delta` of the
+// segment, so after a `tool_use` turn it is stale.
+
+const se = (event: Record<string, unknown>): Record<string, unknown> => ({
+  type: 'stream_event',
+  event,
+  parent_tool_use_id: null,
+});
+const msgStart = (id: string): Record<string, unknown> =>
+  se({ type: 'message_start', message: { id, type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', content: [], stop_reason: null } });
+const msgDelta = (stop: string): Record<string, unknown> =>
+  se({ type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 5 } });
+const msgStop = se({ type: 'message_stop' });
+const mainText = (id: string, text: string, stop: string | null = null): Record<string, unknown> => ({
+  type: 'assistant',
+  message: { id, type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', content: [{ type: 'text', text }], stop_reason: stop },
+  parent_tool_use_id: null,
+});
+/** One complete streamed main-thread turn. */
+const streamedTurn = (id: string, text: string, stop: string): Step[] => [
+  msgStart(id),
+  mainText(id, text),
+  se({ type: 'content_block_stop', index: 0 }),
+  msgDelta(stop),
+  msgStop,
+];
+/** A streamed main-thread turn whose SSE stream ended after the text block. */
+const truncatedTurn = (id: string, text: string): Step[] => [msgStart(id), mainText(id, text), se({ type: 'content_block_stop', index: 0 })];
+const streamedAgentCall: Step[] = [msgStart('msg_2'), agentCall(), se({ type: 'content_block_stop', index: 0 }), msgDelta('tool_use'), msgStop];
+const truncResult = (stop: string | null, text: string): Record<string, unknown> => ({
+  ...successResult,
+  result: text,
+  stop_reason: stop,
+});
+
+test('OQ-20 maintruncend: main-thread stream ends without message_delta/message_stop (result stop_reason null) → failed(provider_error)', async () => {
+  const r = await run([init, ...truncatedTurn('msg_1', 'partial answer'), { ...truncResult(null, 'partial answer'), num_turns: 1, total_cost_usd: 0 }]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  const { code, message, detail } = reasonOf(r);
+  assert.equal(code, 'provider_error');
+  assert.match(message, /provider stream ended without a stop reason \(truncated\)/);
+  assert.match(detail, /final main-thread turn msg_1 got no stop reason/);
+  assert.match(detail, /result stop_reason: null/);
+  assert.equal(deriveTaskOutcome(r, 'not_defined').outcome, 'failed');
+});
+
+test('OQ-20: the replayed result alone (no stream events) with stop_reason null still fails', async () => {
+  const r = await run([init, mainText('msg_1', 'partial answer'), truncResult(null, 'partial answer')]);
+  assert.equal(reasonOf(r).code, 'provider_error');
+});
+
+test('OQ-20 subthenmaintrunc: truncated final turn after a tool_use turn (stale result stop_reason "tool_use") → failed(provider_error)', async () => {
+  const r = await run([
+    init,
+    ...streamedAgentCall,
+    taskStarted,
+    subPrompt,
+    taskNotification('completed'),
+    agentToolResult('sub done'),
+    ...truncatedTurn('msg_4', 'partial after sub'),
+    truncResult('tool_use', 'partial after sub'),
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(reasonOf(r).code, 'provider_error');
+  assert.match(reasonOf(r).detail, /final main-thread turn msg_4/);
+  assert.match(reasonOf(r).detail, /result stop_reason: "tool_use"/);
+});
+
+test('OQ-20: a stale NORMAL result stop_reason cannot mask a truncated final main-thread turn', async () => {
+  for (const stale of ['end_turn', 'stop_sequence']) {
+    const r = await run([init, ...streamedTurn('msg_1', 'first', 'end_turn'), ...truncatedTurn('msg_2', 'partial'), truncResult(stale, 'partial')]);
+    assert.equal(r.status, 'failed', stale);
+    assert.equal(reasonOf(r).code, 'provider_error', stale);
+  }
+});
+
+test('OQ-20 bgoktrunc: a background wake-up turn that is truncated fails the run even though the first segment completed', async () => {
+  const r = await run([
+    init,
+    ...streamedAgentCall,
+    { ...taskStarted, prompt: 'SUBMARK bg' },
+    ...streamedTurn('msg_4', 'waiting on bg', 'end_turn'),
+    { ...successResult, result: 'waiting on bg' },
+    { ...taskNotification('completed'), summary: 'Agent "sub" completed' },
+    ...truncatedTurn('msg_5', 'partial after bg'),
+    { ...truncResult(null, 'partial after bg'), num_turns: 1 },
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(reasonOf(r).code, 'provider_error');
+  assert.match(reasonOf(r).detail, /msg_5/);
+});
+
+test('OQ-20 controls: complete streamed runs, CLI max_tokens recovery and the non-streaming fallback still succeed', async () => {
+  // ctrl: tool_use turn then an end_turn turn.
+  const ctrl = await run([init, ...streamedAgentCall, taskStarted, taskNotification('completed'), agentToolResult('sub done'), ...streamedTurn('msg_4', 'All done', 'end_turn'), successResult]);
+  assert.equal(ctrl.status, 'succeeded', JSON.stringify(ctrl));
+  // mainmaxtok: the CLI recovers a max_tokens turn with a continuation turn.
+  const maxtok = await run([init, ...streamedTurn('msg_1', 'partial wor', 'max_tokens'), ...streamedTurn('msg_2', 'All done', 'end_turn'), successResult]);
+  assert.equal(maxtok.status, 'succeeded', JSON.stringify(maxtok));
+  // maindropmidrecover: the stream dropped after message_start; the CLI fell
+  // back to a non-streamed request whose message carries its own stop_reason.
+  const fallback = await run([init, msgStart('msg_1'), mainText('msg_2', 'recovered', 'end_turn'), { ...successResult, result: 'recovered', num_turns: 1 }]);
+  assert.equal(fallback.status, 'succeeded', JSON.stringify(fallback));
+  // stop_sequence is a normal stop.
+  const stopSeq = await run([init, ...streamedTurn('msg_1', 'done at seq', 'stop_sequence'), { ...successResult, stop_reason: 'stop_sequence' }]);
+  assert.equal(stopSeq.status, 'succeeded', JSON.stringify(stopSeq));
+  // Two complete segments (background wake-up): each result sees its own turn.
+  const twoSegments = await run([init, ...streamedTurn('msg_1', 'a', 'end_turn'), successResult, ...streamedTurn('msg_2', 'b', 'end_turn'), successResult]);
+  assert.equal(twoSegments.status, 'succeeded', JSON.stringify(twoSegments));
+});
+
+test('OQ-20: a non-streamed fallback message with stop_reason null is not a completed turn', async () => {
+  const r = await run([init, msgStart('msg_1'), mainText('msg_2', 'partial'), truncResult('end_turn', 'partial')]);
+  assert.equal(reasonOf(r).code, 'provider_error');
+  assert.match(reasonOf(r).detail, /non-streamed message with stop_reason null/);
+});
+
+test('OQ-20: a main-thread <synthetic> API-error message keeps its is_error executor_error mapping', async () => {
+  const synthetic = {
+    type: 'assistant',
+    message: { id: 'syn-1', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'API Error: Overloaded' }], stop_reason: 'stop_sequence' },
+    parent_tool_use_id: null,
+  };
+  const r = await run([
+    init,
+    ...truncatedTurn('msg_1', 'x'),
+    synthetic,
+    { type: 'result', subtype: 'success', is_error: true, result: 'API Error: Overloaded', stop_reason: 'stop_sequence', permission_denials: [] },
+  ]);
+  assert.equal(r.status, 'failed');
+  assert.equal(reasonOf(r).code, 'executor_error');
 });
 
 // ── D2: calls to tools the charter withheld are policy refusals ─────────────

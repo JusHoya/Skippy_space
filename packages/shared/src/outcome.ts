@@ -15,6 +15,8 @@
 //   • executor error result    → `failed`    (reason `executor_error`)
 //   • model refused the request → `failed`   (reason `model_refused`)
 //   • stream ended, no result  → `failed`    (reason `no_terminal_result`)
+//   • "success" result whose provider stream never reported a stop reason
+//     (truncated stream)       → `failed`    (reason `provider_error`, OQ-20)
 //   • validation failed        → `failed`    (reason `validation_failed`)
 //   • runtime shut down        → `interrupted` (reason `shutdown`)
 //
@@ -173,6 +175,28 @@ export type ExecutorTerminal =
       summary?: string;
       costUsd?: number;
     };
+
+/**
+ * Anthropic Messages API stop reasons that mean the final model turn ended
+ * normally (FR-RUN-01, OQ-20). An executor on Anthropic API semantics may
+ * report `succeeded` only when its final turn carries one of these: a missing
+ * (`null`/absent) stop reason means the provider stream ended before its
+ * `message_delta`/`message_stop` — a truncated turn, never a success. Every
+ * other value (`max_tokens`, `pause_turn`, `tool_use`, `refusal`, …) is a
+ * cut-short, paused or refused turn. Adapters for endpoints that cannot report
+ * a stop reason are ineligible for unattended success until qualified (OQ-20).
+ */
+export const NORMAL_STOP_REASONS = ['end_turn', 'stop_sequence'] as const;
+export type NormalStopReason = (typeof NORMAL_STOP_REASONS)[number];
+
+/** True only for a stop reason in {@link NORMAL_STOP_REASONS}. */
+export function isNormalStopReason(v: unknown): v is NormalStopReason {
+  return typeof v === 'string' && (NORMAL_STOP_REASONS as readonly string[]).includes(v);
+}
+
+/** Reason detail for a "success" whose provider stream ended without a stop
+ * reason (OQ-20). Stable text so readers and tests can recognise it. */
+export const TRUNCATED_STREAM_DETAIL = 'provider stream ended without a stop reason (truncated)';
 
 /**
  * Combine a live executor's terminal result with the task's validation
