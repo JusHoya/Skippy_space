@@ -634,7 +634,7 @@ test('D2: home-relative and env-var paths are refused on Grep/Glob/Read/Write (h
   await assertAllowed(policy, 'Read', { file_path: path.join(wt, 'README.md') });
 });
 
-test('D2: Windows path forms are interpreted like the CLI or refused', { skip: !isWin }, async () => {
+test('D2: Windows path forms are interpreted like the CLI or refused', { skip: isWin ? false : 'drive letters, backslash separators, ADS and 8.3 names are Win32 path semantics' }, async () => {
   const wt = await tmpDir('skippy-policy-wt-');
   const policy = fsPolicy(wt);
   // CLI maps `/c/...` to `C:\...` (msys form): an in-root msys path is allowed,
@@ -659,6 +659,17 @@ test('D2: Windows path forms are interpreted like the CLI or refused', { skip: !
     await assertDeniedEverywhere(policy, 'Read', { file_path: p }, 'path_outside_roots');
     await assertDeniedEverywhere(policy, 'Grep', { pattern: 'x', path: p }, 'path_outside_roots');
   }
+});
+
+test('D2: POSIX path forms — no msys rewrite, `//` is refused, absolute paths outside the roots are denied', { skip: isWin ? 'POSIX path semantics' : false }, async () => {
+  const wt = await tmpDir('skippy-policy-wt-');
+  const policy = fsPolicy(wt);
+  for (const p of ['/etc/passwd', '/c/Windows/win.ini', '//server/share/x', `${wt}/../outside.txt`, '/']) {
+    await assertDeniedEverywhere(policy, 'Read', { file_path: p }, 'path_outside_roots');
+    await assertDeniedEverywhere(policy, 'Grep', { pattern: 'x', path: p }, 'path_outside_roots');
+  }
+  await assertAllowed(policy, 'Read', { file_path: `${wt}/x.txt` });
+  await assertAllowed(policy, 'Grep', { pattern: 'x', path: `${wt}//sub/./` });
 });
 
 test('D2: Glob patterns — braces, absolute patterns, `..` and pattern+path are all contained', async () => {

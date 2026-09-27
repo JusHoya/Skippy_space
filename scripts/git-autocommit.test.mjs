@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, chmodSync, readFileSync, readdirSync, lstatSync, symlinkSync, utimesSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, chmodSync, readFileSync, readdirSync, lstatSync, symlinkSync, utimesSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -893,10 +893,14 @@ const reasonOf = (res, path) => res.skippedDetail?.find((d) => d.path === path)?
 // --- D1: temp index lives in the OS temp dir, not the git dir. -----------
 
 test('F5-D1 a repo at a 190-char root commits and leaves nothing in the git dir', (t) => {
-  const pre = join(tmpdir(), `skippy-f5-lp-${crypto.randomBytes(4).toString('hex')}-`);
+  // The length that matters is the one git sees: the canonical long real
+  // path. `tmpdir()` can be an 8.3 alias of it (the GitHub Windows runner's
+  // TEMP is `C:\Users\RUNNER~1\...`), which git expands past the budget.
+  const base = realpathSync.native(tmpdir());
+  const pre = join(base, `skippy-f5-lp-${crypto.randomBytes(4).toString('hex')}-`);
   const need = 190 - pre.length;
   if (need < 8) {
-    t.skip(`OS temp dir is too long (${tmpdir().length} chars) to build a 190-char repo root`);
+    t.skip(`OS temp dir is too long (${base.length} chars) to build a 190-char repo root`);
     return;
   }
   const dir = pre + 'a'.repeat(need);

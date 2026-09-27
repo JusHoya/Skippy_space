@@ -160,6 +160,39 @@ test('EC2: cliGlobSplit reproduces the CLI Glob split (b3f/Au7/GK) for every pat
   }
 });
 
+/** The same CLI source on POSIX (`Zl` = path.posix, `sep` = '/', no msys
+ * `/c/` rewrite, no drive handling): `\` is an ordinary character there, so
+ * it never ends the static prefix. */
+const CWD_POSIX = '/fx/wt';
+const SPLIT_TABLE_POSIX: ReadonlyArray<readonly [string, string | undefined, string, string]> = [
+  ['**/*.ts', undefined, CWD_POSIX, '**/*.ts'],
+  ['sub', undefined, CWD_POSIX, 'sub'],
+  ['*.ts', 'clean', '/fx/wt/clean', '*.ts'],
+  ['*', '  clean/deep  ', '/fx/wt/clean/deep', '*'],
+  ['*', '', CWD_POSIX, '*'],
+  ['*', '/c/fx/wt/clean', '/c/fx/wt/clean', '*'], // no msys rewrite on POSIX
+  ['/fx/wt/sub', undefined, '/fx/wt', 'sub'],
+  ['/fx/wt/sub/', undefined, '/fx/wt', 'sub'],
+  ['/fx', undefined, '/', 'fx'],
+  ['/fx/wt/{sub,clean}', undefined, '/fx/wt', '{sub,clean}'],
+  ['/fx/wt/clean/**/*.ts', undefined, '/fx/wt/clean', '**/*.ts'],
+  ['/fx/wt/./clean/*.ts', undefined, '/fx/wt/./clean', '*.ts'],
+  ['/fx/wt/sub\\**', undefined, '/fx/wt', 'sub\\**'], // `\` is not a separator
+  ['/*.ts', undefined, '/', '*.ts'],
+  ['/fx/wt/clean/*.ts', 'sub', '/fx/wt/clean', '*.ts'], // `path` ignored
+  ['C:\\fx\\*', undefined, CWD_POSIX, 'C:\\fx\\*'], // not absolute on POSIX
+];
+
+test('EC2: cliGlobSplit reproduces the CLI Glob split on POSIX', { skip: isWin ? 'POSIX path semantics' : false }, () => {
+  for (const [pattern, pathArg, baseDir, relativePattern] of SPLIT_TABLE_POSIX) {
+    assert.deepEqual(
+      cliGlobSplit?.(pattern, pathArg, CWD_POSIX),
+      { baseDir, relativePattern },
+      `cliGlobSplit(${JSON.stringify(pattern)}, ${JSON.stringify(pathArg)})`,
+    );
+  }
+});
+
 // ── r4v2 p1: the gate enumerates the tree rg actually walks ─────────────────
 
 test('EC2 p1 G1/G2: an absolute Glob with no metacharacter, or a brace-first one, is gated on the tree rg walks (the parent)', async () => {
@@ -193,7 +226,8 @@ test('EC2 p1 G3 control: the same patterns narrowed below the credential are all
   const wt = await p1Worktree();
   const policy = readPolicy(wt);
   for (const input of [
-    { pattern: `${path.join(wt, 'sub')}\\**` }, // G3: rg walks <wt>\sub
+    { pattern: `${path.join(wt, 'sub')}${path.sep}**` }, // G3: rg walks <wt>\sub (the platform separator)
+    { pattern: `${fwd(path.join(wt, 'sub'))}/**` }, // `/` is a separator on every OS
     { pattern: path.join(wt, 'sub', '*.txt') },
     { pattern: path.join(wt, 'clean', 'a.ts') }, // no metachar: rg walks <wt>\clean
     { pattern: path.join(wt, 'clean', '{a,b}.ts') },
@@ -201,6 +235,13 @@ test('EC2 p1 G3 control: the same patterns narrowed below the credential are all
     { pattern: 'a.ts', path: path.join(wt, 'clean') },
   ]) {
     allowed(await evaluateToolCall(policy, { toolName: 'Glob', input }), JSON.stringify(input));
+  }
+  if (!isWin) {
+    // On POSIX `\` is a glob escape, not a separator: the CLI (`b3f`, `sep`
+    // = '/') cuts `<wt>/sub\**` at the last `/`, so rg walks <wt> itself —
+    // which holds deep/sub/.env — and the gate must refuse it.
+    const d = denied(await evaluateToolCall(policy, { toolName: 'Glob', input: { pattern: `${path.join(wt, 'sub')}\\**` } }), 'POSIX backslash');
+    assert.equal(d.code, 'credential_path', JSON.stringify(d));
   }
 });
 
@@ -248,7 +289,7 @@ test('EC2: normal work — Grep/Glob inside apps/agent-runtime/src of this repo 
 
 // ── D2: TOCTOU swap of a single-file Grep `path` ────────────────────────────
 
-test('EC2 D2: a Grep `path` swapped to a credential location after the gate is withheld at PostToolUse', { skip: isWin ? false : 'junctions are Windows-only' }, async () => {
+test('EC2 D2: a Grep `path` swapped to a credential location after the gate is withheld at PostToolUse', async () => {
   const wt = await tmpDir('skippy-ec2-toctou-');
   // The secret line looks like an absolute path, so no line-based rule sees
   // it: only the re-resolved `path` reveals where rg actually read.
@@ -293,13 +334,15 @@ test('EC2 D2: a single-file Grep `path` swapped to a symlink onto `.env` is with
   assert.ok(verdict, 'withheld');
 });
 
-test('EC2: redaction resolves a relative output path against the session cwd, as the CLI prints it (JBH)', { skip: isWin ? false : 'junctions are Windows-only' }, async () => {
+test('EC2: redaction resolves a relative output path against the session cwd, as the CLI prints it (JBH)', async () => {
   const wt = await tmpDir('skippy-ec2-jbh-');
   await writeFiles(wt, { 'sub/x.txt': 'x\n', '.aws/x.txt': 'x\n' });
   // `sub/j` -> `.aws`: an alias only its real path reveals.
   await fs.symlink(path.join(wt, '.aws'), path.join(wt, 'sub', 'j'), 'junction');
   const policy = readPolicy(wt);
-  // Grep {path: "sub"} lists `sub\j\x.txt` (relative to the cwd, not to `sub`).
-  const v = redactSearchOutput(policy, 'Grep', { pattern: 'x', path: 'sub' }, { mode: 'files_with_matches', numFiles: 1, filenames: ['sub\\j\\x.txt'] });
+  // Grep {path: "sub"} lists `sub\j\x.txt` (relative to the cwd, not to
+  // `sub`), with the platform separator (`sub/j/x.txt` on POSIX).
+  const listed = path.join('sub', 'j', 'x.txt');
+  const v = redactSearchOutput(policy, 'Grep', { pattern: 'x', path: 'sub' }, { mode: 'files_with_matches', numFiles: 1, filenames: [listed] });
   assert.ok(v, 'withheld through the real path of the cwd-relative name');
 });

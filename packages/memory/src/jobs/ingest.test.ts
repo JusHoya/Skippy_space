@@ -238,7 +238,13 @@ test('E4-8: cross-extension dedup returns the actual stored original path', asyn
 
   const first = await drop(vaultRoot, 'a.md', body);
   const r1 = await runIngest({ vaultRoot, sourcePath: first });
-  assert.equal(r1.originalPath, path.join(vaultRoot, '60_Sources', 'originals', `${r1.sourceSha256}.md`));
+  // The ingest reports the canonical long real path of the stored original.
+  // `os.tmpdir()` can itself be an alias of it (the GitHub Windows runner's
+  // TEMP is the 8.3 form `C:\Users\RUNNER~1\...`; macOS `/var` -> `/private/var`),
+  // so the expectation is built on the canonical vault root, never on the
+  // alias the test happened to create the vault under.
+  const canonicalRoot = await fs.realpath(vaultRoot);
+  assert.equal(r1.originalPath, path.join(canonicalRoot, '60_Sources', 'originals', `${r1.sourceSha256}.md`));
 
   const second = await drop(vaultRoot, 'c.txt', body); // identical bytes, different extension
   const r2 = await runIngest({ vaultRoot, sourcePath: second });

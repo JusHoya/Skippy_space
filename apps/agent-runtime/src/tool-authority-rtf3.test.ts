@@ -45,8 +45,6 @@ delete process.env.OBSIDIAN_API_KEY;
 process.env.OBSIDIAN_API_URL = 'http://127.0.0.1:55555';
 process.env.LETTA_DISABLED = '1';
 
-const isWin = process.platform === 'win32';
-
 /** Exports new in F3, resolved lazily so a test fails on its own assertion
  * on the baseline rather than at module link time. */
 type F3Extras = {
@@ -129,10 +127,12 @@ async function f3Worktree(opts: { gitignore?: boolean } = {}): Promise<string> {
     await fs.writeFile(abs, content);
   }
   await fs.mkdir(path.join(wt, 'late'));
-  if (isWin) {
-    await fs.symlink(path.join(wt, '.aws'), path.join(wt, 'j1'), 'junction');
-    await fs.symlink(path.join(wt, 'sub'), path.join(wt, 'jsub'), 'junction');
-  }
+  // Directory links on every OS: a junction on Windows (no privilege needed);
+  // on POSIX the 'junction' type is ignored and a directory symlink is made.
+  // rg follows either when it is the explicit search root, and the gate must
+  // judge the tree behind it (the probes below are portable guarantees).
+  await fs.symlink(path.join(wt, '.aws'), path.join(wt, 'j1'), 'junction');
+  await fs.symlink(path.join(wt, 'sub'), path.join(wt, 'jsub'), 'junction');
   return wt;
 }
 

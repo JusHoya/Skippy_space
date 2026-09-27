@@ -152,7 +152,7 @@ function shortNameFor(wt: string, longName: string, candidate: string): string |
 
 // ── D1: 8.3 short names ──────────────────────────────────────────────────────
 
-test('D1: an 8.3 short name never reaches a credential file (literal rule + real-path rule)', { skip: !isWin }, async () => {
+test('D1: an 8.3 short name never reaches a credential file (literal rule + real-path rule)', { skip: isWin ? false : '8.3 short names are a win32/NTFS feature' }, async () => {
   const { wt } = await credentialWorktree();
   const policy = readPolicy(wt);
   // The literal rule: any `~<digit>` segment is refused, whether or not the
@@ -182,7 +182,7 @@ test('D1: an 8.3 short name never reaches a credential file (literal rule + real
 
 // ── D3: junction to an in-root credential directory ──────────────────────────
 
-test('D3: a junction inside the root that points at an in-root credential directory is denied via its real path', { skip: !isWin }, async () => {
+test('D3: a junction (a directory symlink on POSIX) inside the root that points at an in-root credential directory is denied via its real path', async () => {
   const { wt, junction } = await credentialWorktree();
   assert.ok(junction, 'junction created');
   const policy = readPolicy(wt);
@@ -454,9 +454,12 @@ test('rootRejection refuses credential locations, home dot-directories and the A
     path.join(home, 'AppData', 'LocalLow'),
     path.join(home, 'Projects', 'x', '.ssh'),
     path.join(home, 'Projects', 'x', '.ssh', 'keys'),
-    path.join(home, 'PROJEC~1', 'x'),
+    // An 8.3 short-name segment aliases another name only on Win32/NTFS.
+    ...(isWin ? [path.join(home, 'PROJEC~1', 'x')] : []),
   ];
   for (const r of rejects) assert.ok(rootRejection(r, home), `${r} rejected`);
   const accepts = [path.join(home, 'Projects', 'x'), path.join(home, 'AppData', 'Local', 'Temp', 'wt'), path.join(home, 'src')];
+  // On POSIX `~1` is an ordinary character sequence in a name, not an alias.
+  if (!isWin) accepts.push(path.join(home, 'PROJEC~1', 'x'));
   for (const r of accepts) assert.equal(rootRejection(r, home), null, `${r} accepted`);
 });
