@@ -1,6 +1,7 @@
 name: ci
 on:
-  push: { branches: [main] }
+  # m0/foundation is the trunk for the PRD v0.2 pivot until it is confirmed and merged into main.
+  push: { branches: [main, m0/foundation] }
   pull_request:
 
 # Mocked vs. live tests: every suite run by this workflow is mocked/offline
