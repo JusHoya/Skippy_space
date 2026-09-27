@@ -423,9 +423,13 @@ test('live CLI (M0-G06 D1): planted config dirs (ambient CLAUDE_CONFIG_DIR / SKI
   assert.equal(status, 'succeeded');
   // None of the planted directories was used by the CLI (it writes
   // `projects/` transcripts and `.claude.json` into the dir it uses).
-  for (const dir of [path.join(tmp, 'cfg'), path.join(tmp, 'skippy-cfg'), ...(legacyCreated ? [legacyDir] : [])]) {
+  for (const dir of [path.join(tmp, 'cfg'), path.join(tmp, 'skippy-cfg')]) {
     assert.deepEqual(fs.readdirSync(dir).sort(), ['.claude.json', '.config.json', 'remote-settings.json'], `untouched: ${dir}`);
   }
+  // The legacy persistent directory is runtime-owned and is SWEPT before
+  // every run (executor-env.ts `sweepExecutorState`): it is gone, planted
+  // files and all, and was never consulted.
+  assert.equal(fs.existsSync(legacyDir), false, `the legacy config dir is swept: ${legacyDir}`);
   // The run's own directory: a fresh `run-*` child of the base that held
   // this run's transcript while the CLI talked to the mock and is gone now.
   const fresh = [...ownRunDirs];

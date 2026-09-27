@@ -25,6 +25,7 @@ import {
   EXECUTOR_ENV_ALLOWLIST,
   buildClaudeExecutorEnv,
   createExecutorConfigDir,
+  gitNeutralisationEnv,
   removeExecutorConfigDir,
 } from './executor-env.js';
 import { executeBoardMissionViaSdk, type ClaudeAgentSdkModule } from './sdk-board.js';
@@ -135,13 +136,23 @@ test('G06: query() gets an explicit allowlisted env that forces the embedded rg 
   assert.ok(path.isAbsolute(env['CLAUDE_CONFIG_DIR'] ?? ''), 'CLAUDE_CONFIG_DIR is absolute');
   assert.equal(fs.existsSync(env['CLAUDE_CONFIG_DIR'] ?? ''), false, 'the per-execution config dir is gone after the run (D1)');
   const upper = new Map(Object.entries(env).map(([k, v]) => [k.toUpperCase(), v]));
+  // The git-neutralising values are forced per run (executor-env.ts); a
+  // hostile ambient spelling of one of them is replaced, never carried.
+  const gitForced = gitNeutralisationEnv(env['CLAUDE_CONFIG_DIR'] as string);
+  for (const [k, v] of Object.entries(gitForced)) assert.equal(env[k], v, `${k} is forced`);
   for (const k of Object.keys(HOSTILE)) {
     const K = k.toUpperCase();
     if (K in FORCED || K === 'CLAUDE_CONFIG_DIR') continue;
+    if (K in gitForced) {
+      assert.notEqual(upper.get(K), HOSTILE[k], `${k} is forced, not carried`);
+      continue;
+    }
     assert.equal(upper.has(K), false, `${k} must not reach the executor (got ${upper.get(K)})`);
   }
   // Every key is either allowlisted or forced.
-  const allowed = new Set([...EXECUTOR_ENV_ALLOWLIST, ...Object.keys(FORCED), 'CLAUDE_CONFIG_DIR'].map((k) => k.toUpperCase()));
+  const allowed = new Set(
+    [...EXECUTOR_ENV_ALLOWLIST, ...Object.keys(FORCED), ...Object.keys(gitForced), 'CLAUDE_CONFIG_DIR'].map((k) => k.toUpperCase()),
+  );
   for (const k of Object.keys(env)) assert.ok(allowed.has(k.toUpperCase()), `unexpected executor env key ${k}`);
   // What the executor needs is still there.
   assert.equal(env['ANTHROPIC_API_KEY'], 'sk-ant-dummy-000');

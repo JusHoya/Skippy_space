@@ -81,7 +81,28 @@
 //      contained. The executor's process environment is an allowlist and its
 //      config directory is ephemeral and private (executor-env.ts, M0-G06,
 //      OQ-22) so nothing ambient or agent-writable can swap the rg the OQ-18
-//      tree gate models or switch the hooks off.
+//      tree gate models or switch the hooks off. Enforcement hooks
+//      (`pathGuard`, `approver`, `onDecision`) are read ONCE, as OWN
+//      properties, into a null-prototype record (`resolveEnforcementHooks`)
+//      — at construction for the SDK gate, at call time for the direct
+//      APIs — and never through the prototype chain during evaluation, so
+//      polluting `Object.prototype` / `Function.prototype` (from an observer
+//      or anywhere else in the process) cannot substitute a guard or an
+//      approver (M1 pre-flight D-B); observer snapshots are deep copies into
+//      null-prototype objects (no `constructor` route back to a prototype).
+//      Git metadata is NEVER board-writable (`gitMetadataRejection`, D-A):
+//      the CLI runs `git status` in the worktree at startup and the repo
+//      configuration decides what that executes (executor-env.ts), so a
+//      write-class call whose target — literal or real path — is or lies
+//      inside a `.git` segment at any depth (directory or file), the gitdir a
+//      write root's `.git` file/link points to (and its `commondir`), or is
+//      named `.gitattributes`, `.gitmodules` or `.gitconfig`, is denied
+//      (`git_metadata`) before any guard runs. `.gitignore` stays writable
+//      (it selects files, it cannot run code), and reads of git metadata
+//      stay allowed (the repo is in the board's read scope; embedded tokens
+//      in remote URLs are OQ-17 content-level exposure). Bash is approval-
+//      gated (OQ-14): an owner's approval is the owner's decision, and the
+//      executor env pins git's code-running keys for it too.
 //   4. `assertExecutorEligible` refuses an adapter whose declared capabilities
 //      cannot enforce the policy.
 //   5. The in-process MCP tools dispatch through `authorizeMcpDispatch` (see
@@ -102,7 +123,7 @@
 // entries must name catalogued tools.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -351,23 +372,30 @@ export interface PolicyContext {
   projectRoot?: string;
   /** Executor working directory (absolute). Must lie inside one of the roots.
    * Defaults to the worktree, else the project root, else (no roots) the
-   * dedicated no-root scratch directory. It is NOT a root by itself. */
+   * per-execution no-root directory. It is NOT a root by itself. */
   cwd?: string;
+  /** The per-execution working directory for a board with NO roots
+   * (`noRootWorkingDirectory(configDir)`, executor-env.ts): must lie inside
+   * the executor state base, so it can never be a root and every tool path
+   * in it is denied. Used only when no root is assigned. Without it, a
+   * no-root policy gets a placeholder inside the base that is never created,
+   * so such a policy cannot be executed by accident. */
+  noRootCwd?: string;
   /** Hostnames WebFetch may reach without approval (from a future execution
    * profile, never from charter text). Default: none. */
   networkAllowedHosts?: readonly string[];
 }
 
 /**
- * Working directory handed to an executor that has NO filesystem roots. It is
- * deliberately an empty, dedicated directory (created by the executor adapter
- * before launch) and is never a read root, so a relative path resolved against
- * it is still denied. Overridable for tests via SKIPPY_NO_ROOT_CWD.
+ * The cwd of a policy with NO filesystem roots that was derived without a
+ * per-execution `noRootCwd`: a path inside the executor state base that is
+ * never created (the executor adapter always derives with the per-run
+ * directory, executor-env.ts). Never a read root, so a relative path
+ * resolved against it is still denied. No environment variable can choose
+ * it (the former `SKIPPY_NO_ROOT_CWD` override is gone).
  */
-export function noRootWorkingDirectory(env: NodeJS.ProcessEnv = process.env): string {
-  const override = env.SKIPPY_NO_ROOT_CWD;
-  if (override && path.isAbsolute(override)) return path.resolve(override);
-  return path.join(os.tmpdir(), 'skippy-agent-runtime', 'no-root');
+export function unassignedNoRootCwd(): string {
+  return path.join(executorConfigBase(), 'no-root-unassigned');
 }
 
 function fail(code: ToolPolicyErrorCode, charter: Charter, msg: string): never {
@@ -649,8 +677,16 @@ export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): Executi
       fail('invalid_context', charter, `cwd ${JSON.stringify(ctx.cwd)} must lie inside an assigned root (a cwd is never a root by itself)`);
     }
     cwd = explicitCwd;
+  } else if (worktree ?? project) {
+    cwd = (worktree ?? project) as string;
   } else {
-    cwd = worktree ?? project ?? noRootWorkingDirectory();
+    // No roots: the per-execution no-root directory, which must lie inside
+    // the executor state base (never a root; every tool path in it denied).
+    const noRoot = requireAbsolute(charter, 'noRootCwd', ctx.noRootCwd);
+    if (noRoot !== undefined && executorStateRejection(noRoot) === null) {
+      fail('invalid_context', charter, `noRootCwd ${JSON.stringify(ctx.noRootCwd)} must lie inside the executor state directory`);
+    }
+    cwd = noRoot ?? unassignedNoRootCwd();
   }
 
   const hosts = (ctx.networkAllowedHosts ?? []).map((h) => h.trim().toLowerCase());
@@ -701,6 +737,7 @@ export type DenyCode =
   | 'path_outside_vault_scope'
   | 'network_destination_denied'
   | 'credential_path'
+  | 'git_metadata'
   | 'no_grandchildren'
   | 'approval_required';
 
@@ -734,6 +771,54 @@ export interface EnforcementHooks {
   pathGuard?: PathGuard;
 }
 
+/** Enforcement hooks after `resolveEnforcementHooks`: a frozen, null-
+ * prototype record whose every field was read as an OWN property exactly
+ * once. Evaluation reads hooks from this record only. */
+export interface ResolvedEnforcementHooks {
+  readonly approver: Approver;
+  readonly pathGuard: PathGuard;
+  readonly onDecision: ((e: PolicyAuditEvent) => unknown) | undefined;
+}
+
+const RESOLVED_HOOKS = Symbol('skippy.resolvedHooks');
+
+/** Own-property function read that cannot throw and never consults the
+ * prototype chain (a hostile `has`/`get` trap or a polluted prototype yields
+ * `undefined`). */
+function ownFunction(o: unknown, k: string): ((...args: never[]) => unknown) | undefined {
+  try {
+    if (!o || (typeof o !== 'object' && typeof o !== 'function')) return undefined;
+    if (!Object.hasOwn(o, k)) return undefined;
+    const v = (o as Record<string, unknown>)[k];
+    return typeof v === 'function' ? (v as (...args: never[]) => unknown) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read `pathGuard`, `approver` and `onDecision` from `hooks` as OWN
+ * properties, once, into a frozen null-prototype record (M1 pre-flight D-B).
+ * Defaults are the deny-all approver and the default path guard, held in
+ * module constants, so no later mutation of `Object.prototype`,
+ * `Function.prototype` or the caller's hooks object changes a decision.
+ * An already-resolved record is returned as is.
+ */
+export function resolveEnforcementHooks(hooks: SdkEnforcementHooks | undefined): ResolvedEnforcementHooks {
+  if (hooks && typeof hooks === 'object' && Object.hasOwn(hooks, RESOLVED_HOOKS)) return hooks as unknown as ResolvedEnforcementHooks;
+  const resolved = Object.create(null) as {
+    approver: Approver;
+    pathGuard: PathGuard;
+    onDecision: ((e: PolicyAuditEvent) => unknown) | undefined;
+    [RESOLVED_HOOKS]: true;
+  };
+  resolved.approver = (ownFunction(hooks, 'approver') as Approver | undefined) ?? denyAllApprover;
+  resolved.pathGuard = (ownFunction(hooks, 'pathGuard') as PathGuard | undefined) ?? defaultPathGuard;
+  resolved.onDecision = ownFunction(hooks, 'onDecision') as ((e: PolicyAuditEvent) => unknown) | undefined;
+  resolved[RESOLVED_HOOKS] = true;
+  return Object.freeze(resolved);
+}
+
 function deny(code: DenyCode, reason: string, actionClass?: ActionClass): PolicyDecision {
   return actionClass ? { allow: false, code, reason, actionClass } : { allow: false, code, reason };
 }
@@ -761,8 +846,14 @@ function isDisallowed(policy: ExecutionPolicy, name: string, canonical: string):
   });
 }
 
+/** Own-property read of a tool input field: never the prototype chain, so a
+ * polluted `Object.prototype` cannot supply (or hide) an argument. */
+function own(input: Record<string, unknown>, key: string): unknown {
+  return Object.hasOwn(input, key) ? input[key] : undefined;
+}
+
 function str(input: Record<string, unknown>, key: string): string | undefined {
-  const v = input[key];
+  const v = own(input, key);
   return typeof v === 'string' ? v : undefined;
 }
 
@@ -1300,7 +1391,7 @@ const argOk: ArgCheck = { ok: true };
 
 /** Exact-field allowlist for a catalogued built-in. */
 function checkInputFields(canonical: string, input: Record<string, unknown>): ArgCheck {
-  const known = BUILTIN_INPUT_FIELDS[canonical];
+  const known = Object.hasOwn(BUILTIN_INPUT_FIELDS, canonical) ? BUILTIN_INPUT_FIELDS[canonical] : undefined;
   if (!known) return { ok: false, code: 'invalid_arguments', reason: `no input schema is catalogued for ${canonical}` };
   for (const k of Object.keys(input)) {
     if (!known.includes(k)) {
@@ -1340,6 +1431,93 @@ export function executorStateRejection(p: string, executorState: string = execut
   for (const form of [p, realish(p)]) {
     for (const s of stateForms) {
       if (contains(s, form)) return `${form} is inside the executor state directory ${s}`;
+    }
+  }
+  return null;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Git metadata (M1 pre-flight D-A; FR-SEC-01 "nothing a board can write may
+// change what the executor runs")
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// The CLI runs git in the worktree at startup and git's REPO configuration
+// decides what that executes (executor-env.ts has the audit). So the files
+// git reads its configuration, attributes and hooks from are never
+// board-writable, whatever the roots: a `.git` segment anywhere in the path
+// (the directory, the gitdir file, `.git/config`, `.git/hooks/*`,
+// `.git/info/attributes`, `.git/modules/**`, a nested repo's or submodule's
+// `.git`, a NEW `.git` entry), the gitdir a write root's `.git` file or link
+// points to and that gitdir's `commondir` (a linked worktree's shared repo,
+// which need not be named `.git`), `.gitattributes` (filter/diff drivers),
+// `.gitmodules` (submodule commands) and `.gitconfig` (an include target).
+// Judged on the literal path and on the real long path (junctions and
+// symlinks resolve to the name the rule knows); 8.3 aliases, trailing
+// dots/spaces and ADS forms are already refused by `interpretToolPath`.
+// `.gitignore` is deliberately NOT here: it selects files and cannot run
+// code (rg honours it, which can only narrow a search).
+
+/** Basenames (case-insensitive) that are git metadata wherever they are. */
+const GIT_METADATA_BASENAMES: ReadonlySet<string> = new Set(['.gitattributes', '.gitmodules', '.gitconfig']);
+
+const GITDIR_PREFIX = /^gitdir:\s*/i;
+
+/**
+ * The gitdir (and commondir) a root's `.git` entry designates when it is a
+ * file (`gitdir: <path>`) or a reparse point, as real long paths. Empty for
+ * an ordinary `.git` directory (already covered by the segment rule) or no
+ * repo. Never throws.
+ */
+export function gitDirTargets(root: string): string[] {
+  const out: string[] = [];
+  const dotGit = path.join(root, '.git');
+  try {
+    const st = lstatSync(dotGit);
+    let gitdir: string | undefined;
+    if (st.isSymbolicLink()) {
+      gitdir = realpathSync.native(dotGit);
+    } else if (st.isFile()) {
+      const line = readFileSync(dotGit, 'utf8').split(/\r?\n/)[0] ?? '';
+      if (GITDIR_PREFIX.test(line)) gitdir = path.resolve(root, line.replace(GITDIR_PREFIX, '').trim());
+    }
+    if (gitdir === undefined) return out;
+    out.push(path.resolve(gitdir), realish(path.resolve(gitdir)));
+    try {
+      const common = readFileSync(path.join(gitdir, 'commondir'), 'utf8').split(/\r?\n/)[0]?.trim();
+      if (common) {
+        const abs = path.resolve(gitdir, common);
+        out.push(abs, realish(abs));
+      }
+    } catch {
+      /* no commondir */
+    }
+  } catch {
+    /* no .git entry */
+  }
+  return [...new Set(out.map((p) => path.resolve(p)))];
+}
+
+/**
+ * Why the interpreted absolute path `p` — literally or through its real long
+ * path — is git metadata a board may never write, or null.
+ */
+export function gitMetadataRejection(p: string, writeRoots: readonly string[]): string | null {
+  const forms = [p, realish(p)];
+  for (const form of forms) {
+    const segs = form.split(/[\\/]/).filter((s) => s !== '' && s !== '.');
+    for (const seg of segs) {
+      if (seg.toLowerCase() === '.git') return `${form}: "${seg}" is git metadata (a .git directory or gitdir file); never board-writable`;
+    }
+    const last = segs[segs.length - 1];
+    if (last !== undefined && GIT_METADATA_BASENAMES.has(last.toLowerCase())) {
+      return `${form}: "${last}" is git metadata (attributes, submodules or config); never board-writable`;
+    }
+  }
+  for (const root of writeRoots) {
+    for (const target of gitDirTargets(path.resolve(root))) {
+      for (const form of forms) {
+        if (contains(target, form)) return `${form} is inside the git directory ${target} of root ${root}; never board-writable`;
+      }
     }
   }
   return null;
@@ -1542,12 +1720,14 @@ function approvalNeeded(
 export async function evaluateToolCall(
   policy: ExecutionPolicy,
   call: ToolCall,
-  hooks: EnforcementHooks = {},
+  hooks: EnforcementHooks | ResolvedEnforcementHooks = {},
 ): Promise<PolicyDecision> {
   const name = call.toolName;
   const canonical = canonicalTool(name);
   const input = call.input && typeof call.input === 'object' ? call.input : {};
-  const guard = hooks.pathGuard ?? defaultPathGuard;
+  // Own-property reads only, once (D-B): a resolved record is used as is.
+  const resolved = resolveEnforcementHooks(hooks as SdkEnforcementHooks);
+  const guard = resolved.pathGuard;
 
   if (isDisallowed(policy, name, canonical)) {
     return deny('disallowed', `tool "${name}" is disallowed for ${policy.agentId}`);
@@ -1593,20 +1773,27 @@ export async function evaluateToolCall(
       break;
     }
     case 'write': {
-      const field = WRITE_PATH_FIELD[canonical];
-      const target = field === undefined ? undefined : input[field];
+      const field = Object.hasOwn(WRITE_PATH_FIELD, canonical) ? WRITE_PATH_FIELD[canonical] : undefined;
+      const target = field === undefined ? undefined : own(input, field);
       if (typeof target !== 'string' || target.trim() === '') {
         return deny('invalid_arguments', `${name} requires a string ${field ?? 'file path'}`, actionClass);
       }
       if (policy.writeRoots.length === 0) {
         return deny('path_outside_roots', `no write root assigned to ${policy.agentId} (read-only execution)`, actionClass);
       }
+      // D-A: git metadata is never board-writable — a hard limit judged on
+      // the interpreted path before any (replaceable) guard runs.
+      const interpreted = interpretToolPath(target, policy.cwd);
+      if (interpreted.ok) {
+        const git = gitMetadataRejection(interpreted.path, policy.writeRoots);
+        if (git) return deny('git_metadata', `${field} "${target}" denied: ${git}`, actionClass);
+      }
       const r = await checkPathArg(field ?? 'path', target, policy.writeRoots, policy.cwd, guard);
       if (!r.ok) return deny(r.code, r.reason, actionClass);
       break;
     }
     case 'exec': {
-      if (input['dangerouslyDisableSandbox'] === true) {
+      if (own(input, 'dangerouslyDisableSandbox') === true) {
         return deny('invalid_arguments', 'dangerouslyDisableSandbox is never permitted', actionClass);
       }
       break;
@@ -1632,11 +1819,11 @@ export async function evaluateToolCall(
       if (call.subagentId) {
         return deny('no_grandchildren', 'task agents may not spawn agents (Skippy -> Board -> Task limit)', actionClass);
       }
-      const mode = input['mode'];
+      const mode = own(input, 'mode');
       if (mode !== undefined && mode !== 'default' && mode !== 'plan') {
         return deny('invalid_arguments', `task agent mode "${String(mode)}" would broaden authority`, actionClass);
       }
-      if (input['isolation'] !== undefined || input['team_name'] !== undefined) {
+      if (own(input, 'isolation') !== undefined || own(input, 'team_name') !== undefined) {
         return deny('invalid_arguments', 'isolation/team spawning is outside the authorized graph', actionClass);
       }
       break;
@@ -1666,7 +1853,7 @@ export async function evaluateToolCall(
   if (policy.permissionMode === 'dontAsk') {
     return deny('approval_required', `${need.why}; permission_mode dontAsk never asks`, actionClass);
   }
-  const approver = hooks.approver ?? denyAllApprover;
+  const approver = resolved.approver;
   let approved = false;
   try {
     approved = await approver({ agentId: policy.agentId, toolName: name, actionClass, input, why: need.why });
@@ -2003,26 +2190,44 @@ export interface SdkEnforcementHooks extends EnforcementHooks {
   onDecision?: (e: PolicyAuditEvent) => void;
 }
 
-/** Recursively freeze a plain data value (objects and arrays). */
-function deepFreeze<T>(v: T): T {
-  if (v !== null && typeof v === 'object' && !Object.isFrozen(v)) {
-    Object.freeze(v);
-    for (const child of Object.values(v as Record<string, unknown>)) deepFreeze(child);
+/**
+ * Deep copy of a plain data value into FROZEN NULL-PROTOTYPE objects (and
+ * null-prototype arrays): the observer's snapshot carries no `constructor`
+ * or `__proto__` route to `Object.prototype` / `Function.prototype` (D-B).
+ * Only own enumerable string-keyed data is copied; functions, symbols and
+ * exotic values are dropped. Cycles are cut (bounded depth).
+ */
+export function nullPrototypeSnapshot<T>(v: T, depth = 0): T {
+  if (v === null || typeof v !== 'object' || depth > 64) {
+    return typeof v === 'function' ? (undefined as T) : v;
   }
-  return v;
+  if (Array.isArray(v)) {
+    const arr: unknown[] = [];
+    for (const item of v as unknown[]) arr.push(nullPrototypeSnapshot(item, depth + 1));
+    Object.setPrototypeOf(arr, null);
+    return Object.freeze(arr) as unknown as T;
+  }
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const k of Object.keys(v as Record<string, unknown>)) {
+    const val = (v as Record<string, unknown>)[k];
+    if (typeof val === 'function' || typeof val === 'symbol') continue;
+    out[k] = nullPrototypeSnapshot(val, depth + 1);
+  }
+  return Object.freeze(out) as T;
 }
 
 /**
- * Invoke the audit observer with a deep-frozen structured clone of `e`; its
- * failure — or any attempt to mutate the event — never changes a decision.
- * Callers compute their return value from the live decision BEFORE calling
- * this, so even a clone failure cannot feed back into the gate.
+ * Invoke the audit observer with a frozen null-prototype deep copy of `e`;
+ * its failure — or any attempt to mutate the event — never changes a
+ * decision. Callers compute their return value from the live decision BEFORE
+ * calling this, so even a copy failure cannot feed back into the gate. The
+ * observer is the one captured at resolution time (own property, once).
  */
-function notifyDecision(hooks: SdkEnforcementHooks, e: PolicyAuditEvent): void {
+function notifyDecision(hooks: ResolvedEnforcementHooks, e: PolicyAuditEvent): void {
   try {
-    const observer = hooks.onDecision as ((e: PolicyAuditEvent) => unknown) | undefined;
+    const observer = hooks.onDecision;
     if (typeof observer !== 'function') return;
-    const snapshot = deepFreeze(structuredClone(e));
+    const snapshot = nullPrototypeSnapshot(e);
     const r: unknown = observer(snapshot);
     if (r && typeof r === 'object' && typeof (r as { then?: unknown }).then === 'function') {
       Promise.resolve(r).then(undefined, () => undefined);
@@ -2147,6 +2352,9 @@ export function buildClaudeSdkPermissionOptions(
   policy: ExecutionPolicy,
   hooks: SdkEnforcementHooks = {},
 ): ClaudeSdkPermissionOptions {
+  // The hooks are captured HERE, once, as own properties (D-B): nothing read
+  // later — not the caller's object, not a prototype — can change them.
+  const resolved = resolveEnforcementHooks(hooks);
   // Keyed by tool-use id, and only reused when the tool name, input and
   // subagent are byte-identical (canonical JSON hash) to what the hook
   // evaluated. Anything else is re-evaluated, never a stale allow (D2).
@@ -2160,7 +2368,7 @@ export function buildClaudeSdkPermissionOptions(
   // An evaluation error is a denial, never a pass-through.
   const safeEvaluate = async (call: ToolCall): Promise<PolicyDecision> => {
     try {
-      return await evaluateToolCall(policy, call, hooks);
+      return await evaluateToolCall(policy, call, resolved);
     } catch (err) {
       return deny('invalid_arguments', `policy evaluation failed: ${describeError(err)}`);
     }
@@ -2198,7 +2406,7 @@ export function buildClaudeSdkPermissionOptions(
       remember(id, callFingerprint(toolName, input, agentId), decision);
       // Computed from the live decision BEFORE the observer runs (D2).
       const out = decision.allow ? {} : preToolUseDeny(decision); // allow: defer to canUseTool
-      notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'PreToolUse' });
+      notifyDecision(resolved, { agentId: policy.agentId, toolName, decision, via: 'PreToolUse' });
       return out;
     } catch (err) {
       return failClosedHookOutput('PreToolUse', hookInput, err);
@@ -2220,7 +2428,7 @@ export function buildClaudeSdkPermissionOptions(
           additionalContext: SEARCH_REDACTION_NOTICE,
         },
       };
-      notifyDecision(hooks, {
+      notifyDecision(resolved, {
         agentId: policy.agentId,
         toolName,
         decision: deny('credential_path', verdict.reason, 'read'),
@@ -2258,7 +2466,7 @@ export function buildClaudeSdkPermissionOptions(
             message: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
             ...id,
           };
-      if (fresh) notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
+      if (fresh) notifyDecision(resolved, { agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
       return out;
     } catch (err) {
       return failClosedPermissionResult(options, err);
@@ -2317,14 +2525,16 @@ export async function authorizeMcpDispatch(
   hooks: SdkEnforcementHooks = {},
 ): Promise<PolicyDecision> {
   const toolName = mcpToolName(server, tool);
+  // Own-property reads, once per dispatch (D-B).
+  const resolved = resolveEnforcementHooks(hooks);
   let decision: PolicyDecision;
   try {
-    decision = await evaluateToolCall(policy, { toolName, input: args }, hooks);
+    decision = await evaluateToolCall(policy, { toolName, input: args }, resolved);
   } catch (err) {
     decision = deny('invalid_arguments', `policy evaluation failed: ${describeError(err)}`);
   }
-  // The returned decision is frozen and the observer sees its own clone (D2).
+  // The returned decision is frozen and the observer sees its own copy (D2).
   Object.freeze(decision);
-  notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'mcp-broker' });
+  notifyDecision(resolved, { agentId: policy.agentId, toolName, decision, via: 'mcp-broker' });
   return decision;
 }

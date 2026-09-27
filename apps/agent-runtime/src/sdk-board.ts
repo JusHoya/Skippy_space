@@ -30,9 +30,8 @@
 // `projectRoot` = an extra read-only root); the sidecar's ambient
 // `process.cwd()` is never consulted (red-team N2). Without either, the board
 // has NO read roots: every built-in filesystem read is denied and the CLI runs
-// in a dedicated empty scratch directory.
-
-import { mkdirSync } from 'node:fs';
+// in a fresh, empty, per-execution directory inside the executor state base
+// (`noRootWorkingDirectory`, executor-env.ts), gone after the run.
 
 import type { ExecutorTerminal, ModelId } from '@skippy/shared';
 import { isNormalStopReason, TRUNCATED_STREAM_DETAIL } from '@skippy/shared';
@@ -47,7 +46,13 @@ import type {
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { resolveExecutionGate } from './execution-gate.js';
-import { buildClaudeExecutorEnv, createExecutorConfigDir, removeExecutorConfigDir } from './executor-env.js';
+import {
+  buildClaudeExecutorEnv,
+  createExecutorConfigDir,
+  noRootWorkingDirectory,
+  removeExecutorConfigDir,
+  sweepExecutorState,
+} from './executor-env.js';
 import { logger } from './logger.js';
 import {
   CLAUDE_AGENT_SDK_CAPABILITIES,
@@ -115,20 +120,20 @@ export interface ExecuteBoardMissionParams {
  * Derive the enforced policy for a board mission and prove this adapter can
  * enforce it. Throws ToolPolicyError (the mission must be refused). No
  * ambient `process.cwd()` is ever used: roots are exactly the ones the caller
- * assigned; with none, the read roots are empty and the executor's cwd is the
- * dedicated no-root scratch directory (created here so the CLI can start).
+ * assigned; with none, the read roots are empty and the executor's cwd is
+ * `noRootCwd` — the per-execution no-root directory the executor created
+ * (`noRootWorkingDirectory(configDir)`) — or, when none is handed in, a
+ * placeholder inside the executor state base that is never created.
  */
-export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Promise<ExecutionPolicy> {
+export async function resolveBoardPolicy(params: ExecuteBoardMissionParams, noRootCwd?: string): Promise<ExecutionPolicy> {
   const charter =
     params.charter ?? (await loadCharter(`board.${params.boardId}` as CharterAgentId));
   const policy = derivePolicy(charter, {
     ...(params.worktreePath ? { worktreePath: params.worktreePath } : {}),
     ...(params.projectRoot ? { projectRoot: params.projectRoot } : {}),
+    ...(noRootCwd !== undefined ? { noRootCwd } : {}),
   });
   assertExecutorEligible(policy, CLAUDE_AGENT_SDK_CAPABILITIES);
-  if (policy.readRoots.length === 0) {
-    mkdirSync(policy.cwd, { recursive: true });
-  }
   return policy;
 }
 
@@ -1506,9 +1511,32 @@ export async function executeBoardMissionViaSdk(
   params: ExecuteBoardMissionParams,
   deps: ExecuteBoardMissionDeps = {},
 ): Promise<SdkBoardResult> {
+  // Stale leftovers of crashed runs and the legacy persistent directories go
+  // first (best effort; executor-env.ts). Then THIS run's private state —
+  // the CLI's config directory and its support directory (the no-root cwd,
+  // the empty global git config and hooks dir) — fresh, random, outside
+  // every tool root, deleted on every exit path, never reused (M0-G06 D1).
+  const swept = sweepExecutorState();
+  if (swept.removed.length > 0) logger.info({ msg: 'executor state swept', removed: swept.removed });
+  const configDir = createExecutorConfigDir();
+  try {
+    return await executeBoardMissionInRun(params, deps, configDir);
+  } finally {
+    const removed = await removeExecutorConfigDir(configDir);
+    if (!removed) {
+      logger.warn({ msg: 'executor config dir could not be removed', boardId: params.boardId, dir: configDir });
+    }
+  }
+}
+
+async function executeBoardMissionInRun(
+  params: ExecuteBoardMissionParams,
+  deps: ExecuteBoardMissionDeps,
+  configDir: string,
+): Promise<SdkBoardResult> {
   let policy: ExecutionPolicy;
   try {
-    policy = await resolveBoardPolicy(params);
+    policy = await resolveBoardPolicy(params, noRootWorkingDirectory(configDir));
   } catch (err) {
     const reason = err instanceof ToolPolicyError ? err.message : String(err);
     logger.warn({ msg: 'SDK board refused: tool policy', boardId: params.boardId, err: reason });
@@ -1546,20 +1574,7 @@ export async function executeBoardMissionViaSdk(
   // SDK throws "returned an error result" after an is_error result) keeps
   // that result's specific reason instead of a generic provider_error.
   let terminal: SdkBoardResult | null = null;
-  // The CLI's config directory for THIS run only: fresh, random, empty,
-  // outside every tool root, deleted on every exit path (M0-G06 D1; see
-  // executor-env.ts).
-  let configDir: string | undefined;
-  try {
-    return await runMission();
-  } finally {
-    if (configDir !== undefined) {
-      const removed = await removeExecutorConfigDir(configDir);
-      if (!removed) {
-        logger.warn({ msg: 'executor config dir could not be removed', boardId: params.boardId, dir: configDir });
-      }
-    }
-  }
+  return runMission();
 
   async function runMission(): Promise<SdkBoardResult> {
     try {
@@ -1585,9 +1600,9 @@ export async function executeBoardMissionViaSdk(
       // An explicit, allowlisted environment: `env` REPLACES the CLI's
       // environment, so nothing ambient (RIPGREP_CONFIG_PATH, a falsy
       // USE_BUILTIN_RIPGREP, CLAUDE_CODE_* toggles, …) reaches the executor,
-      // and `CLAUDE_CONFIG_DIR` is a fresh private directory nothing could
-      // have planted into (M0-G06, FR-SEC-01, OQ-18, OQ-22; executor-env.ts).
-      configDir = createExecutorConfigDir();
+      // `CLAUDE_CONFIG_DIR` is a fresh private directory nothing could have
+      // planted into, and git is neutralised whatever the worktree's repo
+      // configuration says (M0-G06, FR-SEC-01, OQ-18, OQ-22; executor-env.ts).
       const env = buildClaudeExecutorEnv(process.env, configDir, deps.executorEnvOverrides);
       const q = sdk.query({
         prompt: params.missionBrief,

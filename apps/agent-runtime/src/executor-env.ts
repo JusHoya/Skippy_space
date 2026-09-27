@@ -1,5 +1,5 @@
 // executor-env.ts — the explicit, minimal environment and the ephemeral,
-// private configuration directory handed to the Claude Code CLI that backs
+// private per-execution directories handed to the Claude Code CLI that backs
 // the Claude Agent SDK executor (FR-SEC-01, OQ-18, OQ-22, M0-G06).
 //
 // WHY: SDK `Options.env` REPLACES the CLI's environment (sdk.d.ts: "it is not
@@ -70,6 +70,77 @@
 // changes subprocess env scrubbing, MCP env allowlisting and trust branches,
 // so it is not used).
 //
+// THE RUN SUPPORT DIRECTORY (per execution, beside the config directory).
+// `<cfg>.support/` is created and destroyed with the config directory and
+// holds the other per-run state the executor needs to exist on disk:
+//   - `no-root-cwd/`  — the working directory of a board with NO filesystem
+//     roots (`noRootWorkingDirectory`). Formerly a single persistent
+//     `<tmp>/skippy-agent-runtime/no-root` shared by every no-root board and
+//     selectable through `SKIPPY_NO_ROOT_CWD`; anything one run left there
+//     (a `.git`, see below) was the next run's startup context. Now fresh
+//     and empty per run, inside the executor state base (so `rootRejection`
+//     refuses it as a root and every tool path in it is denied), and gone
+//     afterwards.
+//   - `git/config`    — an EMPTY file that is the executor's global git config.
+//   - `git/hooks/`    — an EMPTY directory that is the executor's hooks path.
+//
+// GIT IS ALSO AN ENVIRONMENT (D-A of the M1 pre-flight). At startup the CLI
+// runs, in its cwd, `git --no-optional-locks status --short`, `git log
+// --oneline -n 5`, `git config user.name` and `git rev-parse` (system
+// context `QD` -> `Dkq`; `wD()` = "is cwd inside a repo"), through execa
+// with the CLI's own environment. Git reads the REPO configuration of that
+// worktree — `<wt>/.git/config` (or the gitdir a `<wt>/.git` FILE points to,
+// plus `commondir/config` for a linked worktree), every `include.path` /
+// `includeIf` it names, `<wt>/.gitattributes` and `<wt>/.git/info/attributes`
+// — and several keys there run code during a read-only `git status`
+// (verified empirically, git 2.45):
+//   core.fsmonitor=<script>   runs the script on every status (also via an
+//                             include, a gitdir file, or the global config);
+//   filter.<x>.clean/process  run when status re-hashes a racily-clean or
+//                             same-size-modified file carrying `filter=<x>`;
+//   core.hooksPath / hooks    NOT run by status/log/rev-parse (post-index-
+//                             change needs an index write; not observed);
+//   core.pager, core.editor   never consulted (no TTY, no editing commands);
+//   credential.helper, core.sshCommand, url.*.insteadOf, protocol.*
+//                             network commands only, never spawned here.
+// A board that could write `<wt>/.git/config` (allowed before this change:
+// `.git` is not a credential name) planted `core.fsmonitor` and the NEXT run
+// — a read-only board with zero tool calls — executed it. Two independent
+// layers now close that, and each is tested on its own:
+//   1. tool-policy.ts: git metadata is never board-writable
+//      (`gitMetadataRejection`: any `.git` segment at any depth, a gitdir a
+//      `.git` file/link points to and its commondir, `.gitattributes`,
+//      `.gitmodules`, `.gitconfig`; literal and real path). So no driver,
+//      hook, include, fsmonitor or attribute assignment can be introduced.
+//   2. this file: the executor's git is neutralised whatever the repo says:
+//      `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` (verified in cli.js: `iJ8()`
+//      false => `QD` skips `Dkq`, the startup status/log/config calls, and
+//      the git section of the system prompt), `GIT_CONFIG_NOSYSTEM=1`,
+//      `GIT_CONFIG_GLOBAL=<support>/git/config` (empty: the user's global
+//      config is ambient and not consulted), `GIT_TERMINAL_PROMPT=0`, and
+//      `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` overrides,
+//      which git applies with command-line precedence over every file and
+//      include (`EXECUTOR_GIT_CONFIG_OVERRIDES`): `core.fsmonitor=false`,
+//      `core.hooksPath=<support>/git/hooks` (empty), `core.untrackedCache=false`,
+//      `core.pager=cat`. Filter drivers cannot be pinned generically (their
+//      names are arbitrary); a driver a USER configured in their own repo is
+//      that user's own command (looked up on the sidecar's PATH, never a
+//      board-writable file) and the startup status that would trigger it is
+//      off. The overrides also reach any git an owner-approved Bash command
+//      runs (the CLI's Bash env is built from its own process env), which is
+//      intended: repo hooks and fsmonitor are board-adjacent code. Cost: the
+//      user's global identity/credential helpers are not seen by executor-
+//      spawned git; no approval channel exists yet (OQ-14), so nothing is
+//      broken today — revisit with FR-SEC-03.
+//
+// SWEEPS. `sweepExecutorState()` (on runtime start and before every run)
+// removes `run-*` directories under the base older than one hour whose
+// owner process (`<support>/pid`) is no longer alive (a crashed sidecar's
+// leftovers) and the legacy persistent `<tmp>/skippy-agent-runtime/
+// claude-config` and `…/no-root` directories. Only exact runtime-owned
+// names, `lstat`ed real directories (a junction or symlink is skipped,
+// never followed or unlinked).
+//
 // MODEL: allowlist, never denylist. Only the variables below are copied from
 // the source environment; everything else (every `CLAUDE_CODE_*` toggle,
 // `CLAUDE_CONFIG_DIR`, `RIPGREP_CONFIG_PATH`, `SHELL`, proxy / CA variables,
@@ -82,7 +153,7 @@
 //                                  status) and Git Bash; rg is NOT looked up
 //                                  (embedded rg is forced).
 //   HOME, USERPROFILE,           — `os.homedir()` (the CLI refuses to rg-walk
-//   HOMEDRIVE, HOMEPATH            the home directory; git's global config).
+//   HOMEDRIVE, HOMEPATH            the home directory).
 //   TEMP, TMP, TMPDIR            — the CLI's temp files (spilled tool output).
 //   APPDATA, LOCALAPPDATA        — Windows per-user app dirs used by git/Bun.
 //   SystemRoot, SystemDrive,     — Windows system variables every Windows
@@ -112,13 +183,20 @@
 //                                  control, so it keeps egress minimal). This
 //                                  is also the configuration every live CLI
 //                                  test has been verified under.
+//   CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1, GIT_CONFIG_NOSYSTEM=1,
+//   GIT_CONFIG_GLOBAL, GIT_TERMINAL_PROMPT=0, GIT_CONFIG_COUNT/KEY_n/VALUE_n
+//                                — the git neutralisation (above). Set before
+//                                  the test-only overrides so a sensitivity
+//                                  control can prove the hostile scenario is
+//                                  real; production never passes overrides.
 //
 // Re-audit on every SDK/CLI bump (the `SX8` selection, the env list the CLI
-// reads, the files it reads under `CLAUDE_CONFIG_DIR`, `Ds()`/`q5()` and the
-// SDK's env semantics). Proxy / CA variables are deliberately not forwarded
-// (OQ-22).
+// reads, the files it reads under `CLAUDE_CONFIG_DIR`, `Ds()`/`q5()`, the
+// `iJ8()` gate of the startup git context and the git subcommands the CLI
+// spawns, and the SDK's env semantics). Proxy / CA variables are deliberately
+// not forwarded (OQ-22).
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -156,6 +234,27 @@ export const FORCED_BUILTIN_RIPGREP = '1';
 /** Prefix of every per-execution config directory under the base. */
 export const EXECUTOR_CONFIG_DIR_PREFIX = 'run-';
 
+/** Suffix of the per-execution support directory (`<cfg>.support`). */
+export const EXECUTOR_SUPPORT_DIR_SUFFIX = '.support';
+
+/** Per-run directories under the base older than this are swept as the
+ * leftovers of a crashed sidecar. */
+export const EXECUTOR_STALE_RUN_MS = 60 * 60 * 1000;
+
+/**
+ * Git configuration keys forced on every git the executor (or anything it
+ * spawns) runs, with command-line precedence over every config file and
+ * include (`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`).
+ * `hooksPath` is resolved against the run's support directory.
+ */
+export const EXECUTOR_GIT_CONFIG_OVERRIDES: ReadonlyArray<readonly [key: string, value: string | 'hooksPath']> =
+  Object.freeze([
+    ['core.fsmonitor', 'false'],
+    ['core.hooksPath', 'hooksPath'],
+    ['core.untrackedCache', 'false'],
+    ['core.pager', 'cat'],
+  ] as const);
+
 /**
  * The runtime-owned base under which every per-execution CLI config directory
  * is created: `<tmp>/skippy-agent-runtime/executor-config`. It is a fixed
@@ -169,6 +268,13 @@ export function executorConfigBase(tmp: string = os.tmpdir()): string {
   return realpathOrSelf(path.join(path.resolve(tmp), 'skippy-agent-runtime', 'executor-config'));
 }
 
+/** The legacy persistent directories earlier designs used under the runtime
+ * temp directory; swept whenever seen (never consulted any more). */
+export function legacyExecutorDirs(tmp: string = os.tmpdir()): string[] {
+  const base = path.join(path.resolve(tmp), 'skippy-agent-runtime');
+  return [path.join(base, 'claude-config'), path.join(base, 'no-root')];
+}
+
 function realpathOrSelf(p: string): string {
   try {
     return realpathSync.native(p);
@@ -177,35 +283,105 @@ function realpathOrSelf(p: string): string {
   }
 }
 
+function samePath(a: string, b: string): boolean {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
 /** True when `dir` is a per-execution config directory: a direct child of the
- * base whose name carries the prefix (compared on the real long path). */
+ * base whose name carries the prefix and is not a support directory
+ * (compared on the real long path). */
 export function isExecutorConfigDir(dir: string, base: string = executorConfigBase()): boolean {
   if (typeof dir !== 'string' || !path.isAbsolute(dir)) return false;
   const abs = realpathOrSelf(path.resolve(dir));
   const parent = path.dirname(abs);
-  const same = (a: string, b: string): boolean =>
-    process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-  return same(parent, realpathOrSelf(base)) && path.basename(abs).startsWith(EXECUTOR_CONFIG_DIR_PREFIX);
+  const name = path.basename(abs);
+  return (
+    samePath(parent, realpathOrSelf(base)) &&
+    name.startsWith(EXECUTOR_CONFIG_DIR_PREFIX) &&
+    !name.endsWith(EXECUTOR_SUPPORT_DIR_SUFFIX)
+  );
+}
+
+/** The per-run support directory beside a config directory. */
+export function executorSupportDir(configDir: string): string {
+  return `${configDir}${EXECUTOR_SUPPORT_DIR_SUFFIX}`;
+}
+
+/** The empty, per-run working directory of a board with no filesystem roots. */
+export function noRootWorkingDirectory(configDir: string): string {
+  return path.join(executorSupportDir(configDir), 'no-root-cwd');
+}
+
+/** The empty per-run global git config file and hooks directory. */
+export function executorGitPaths(configDir: string): { config: string; hooks: string } {
+  const git = path.join(executorSupportDir(configDir), 'git');
+  return { config: path.join(git, 'config'), hooks: path.join(git, 'hooks') };
+}
+
+/** Config directories created by this process and not yet removed (never
+ * swept while listed, however long the run takes). */
+const activeRuns = new Set<string>();
+
+function runKey(configDir: string): string {
+  const abs = realpathOrSelf(path.resolve(configDir));
+  return process.platform === 'win32' ? abs.toLowerCase() : abs;
+}
+
+/** `<support>/pid`: the process that owns a run. Another sidecar process
+ * (or a test runner) sweeping the base skips a run whose owner is alive,
+ * however old the directory looks. */
+function runPidFile(configDir: string): string {
+  return path.join(executorSupportDir(configDir), 'pid');
+}
+
+/** True when the process recorded as the run's owner is still alive. A
+ * missing or malformed pid file means "no live owner". */
+function runOwnerAlive(configDir: string): boolean {
+  let pid: number;
+  try {
+    const st = lstatSync(runPidFile(configDir));
+    if (!st.isFile()) return false;
+    pid = Number.parseInt(readFileSync(runPidFile(configDir), 'utf8').trim(), 10);
+  } catch {
+    return false;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
 }
 
 /**
- * Create a fresh, empty, randomly named config directory for ONE execution.
- * The base is created with mode 0700 (honoured on POSIX; on Windows the
- * per-user temp directory already carries user-only ACLs) and the run
- * directory by `mkdtemp` (0700 on POSIX). Returns the real long path.
+ * Create a fresh, empty, randomly named config directory for ONE execution,
+ * plus its support directory (`<cfg>.support/no-root-cwd`, `git/config`
+ * (empty file), `git/hooks` (empty dir)). The base is created with mode 0700
+ * (honoured on POSIX; on Windows the per-user temp directory already carries
+ * user-only ACLs) and the run directory by `mkdtemp` (0700 on POSIX).
+ * Returns the real long path of the config directory.
  */
 export function createExecutorConfigDir(base: string = executorConfigBase()): string {
   mkdirSync(base, { recursive: true, mode: 0o700 });
-  const dir = mkdtempSync(path.join(base, EXECUTOR_CONFIG_DIR_PREFIX));
-  return realpathOrSelf(dir);
+  const dir = realpathOrSelf(mkdtempSync(path.join(base, EXECUTOR_CONFIG_DIR_PREFIX)));
+  const git = executorGitPaths(dir);
+  mkdirSync(noRootWorkingDirectory(dir), { recursive: true, mode: 0o700 });
+  mkdirSync(git.hooks, { recursive: true, mode: 0o700 });
+  writeFileSync(git.config, '', { mode: 0o600 });
+  writeFileSync(runPidFile(dir), `${process.pid}\n`, { mode: 0o600 });
+  activeRuns.add(runKey(dir));
+  return dir;
 }
 
 /**
- * Delete a per-execution config directory. Refuses (returns false, deletes
- * nothing) unless `dir` is a run directory under the base — this function
- * must never be pointed at anything else. The CLI child can still hold a
- * transcript open for a moment after the stream ends (Windows), so removal
- * is retried for up to ~`maxWaitMs`. Returns true once the directory is gone.
+ * Delete a per-execution config directory and its support directory.
+ * Refuses (returns false, deletes nothing) unless `dir` is a run directory
+ * under the base — this function must never be pointed at anything else. The
+ * CLI child can still hold a transcript open for a moment after the stream
+ * ends (Windows), so removal is retried for up to ~`maxWaitMs`. Returns true
+ * once both directories are gone.
  */
 export async function removeExecutorConfigDir(
   dir: string,
@@ -213,14 +389,18 @@ export async function removeExecutorConfigDir(
   maxWaitMs = 5_000,
 ): Promise<boolean> {
   if (!isExecutorConfigDir(dir, base)) return false;
+  activeRuns.delete(runKey(dir));
+  const targets = [dir, executorSupportDir(dir)];
   const deadline = Date.now() + maxWaitMs;
   for (;;) {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-    } catch {
-      /* retried below */
+    for (const t of targets) {
+      try {
+        rmSync(t, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      } catch {
+        /* retried below */
+      }
     }
-    if (!existsDir(dir)) return true;
+    if (targets.every((t) => !existsDir(t))) return true;
     if (Date.now() >= deadline) return false;
     await new Promise((r) => setTimeout(r, 200));
   }
@@ -235,15 +415,86 @@ function existsDir(p: string): boolean {
   }
 }
 
+export interface ExecutorSweepResult {
+  /** Directories removed (real directories only). */
+  removed: string[];
+  /** Entries left alone: active runs, fresh runs, reparse points, foreign names. */
+  skipped: string[];
+}
+
+/**
+ * Remove the leftovers of crashed or interrupted runs and the legacy
+ * persistent directories. Under the base, only direct children named
+ * `run-*` (config and support directories) that `lstat` as a REAL directory
+ * (a junction/symlink named like a run is skipped, never followed or
+ * unlinked), are older than `maxAgeMs` and are not a run of this process are
+ * removed. The legacy directories are removed whatever their age when they
+ * are real directories. Never throws.
+ */
+export function sweepExecutorState(opts: {
+  base?: string;
+  tmp?: string;
+  now?: number;
+  maxAgeMs?: number;
+} = {}): ExecutorSweepResult {
+  const base = opts.base ?? executorConfigBase();
+  const now = opts.now ?? Date.now();
+  const maxAgeMs = opts.maxAgeMs ?? EXECUTOR_STALE_RUN_MS;
+  const result: ExecutorSweepResult = { removed: [], skipped: [] };
+  const removeRealDir = (p: string, minAge: number): void => {
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(p);
+    } catch {
+      return; // absent
+    }
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      result.skipped.push(p);
+      return;
+    }
+    if (minAge > 0 && now - st.mtimeMs < minAge) {
+      result.skipped.push(p);
+      return;
+    }
+    try {
+      rmSync(p, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      result.removed.push(p);
+    } catch {
+      result.skipped.push(p);
+    }
+  };
+  let children: string[] = [];
+  try {
+    children = readdirSync(base);
+  } catch {
+    children = [];
+  }
+  for (const name of children) {
+    if (!name.startsWith(EXECUTOR_CONFIG_DIR_PREFIX)) continue;
+    const full = path.join(base, name);
+    const cfg = name.endsWith(EXECUTOR_SUPPORT_DIR_SUFFIX) ? full.slice(0, -EXECUTOR_SUPPORT_DIR_SUFFIX.length) : full;
+    // A run of this process, or of any live process (the `pid` file in the
+    // run's support directory), is never swept, however old it looks.
+    if (activeRuns.has(runKey(cfg)) || runOwnerAlive(cfg)) {
+      result.skipped.push(full);
+      continue;
+    }
+    removeRealDir(full, maxAgeMs);
+  }
+  for (const legacy of legacyExecutorDirs(opts.tmp)) removeRealDir(legacy, 0);
+  return result;
+}
+
 /**
  * Build the complete environment for the executor's CLI process from
  * `source` (the sidecar's environment): the allowlisted variables, then the
  * forced values. `configDir` MUST be a per-execution directory from
- * `createExecutorConfigDir()` (anything else throws). `overrides` is a
- * test-only seam (code-level injection through `ExecuteBoardMissionDeps`,
- * never read from the environment); it is applied after the allowlist and
- * may reintroduce anything EXCEPT `CLAUDE_CONFIG_DIR`, which is forced last
- * so no seam can point the executor at a persistent or shared directory.
+ * `createExecutorConfigDir()` with its support directory present (anything
+ * else throws). `overrides` is a test-only seam (code-level injection through
+ * `ExecuteBoardMissionDeps`, never read from the environment); it is applied
+ * after the allowlist and the forced values and may reintroduce anything
+ * EXCEPT `CLAUDE_CONFIG_DIR`, which is forced last so no seam can point the
+ * executor at a persistent or shared directory.
  */
 export function buildClaudeExecutorEnv(
   source: NodeJS.ProcessEnv,
@@ -253,6 +504,10 @@ export function buildClaudeExecutorEnv(
 ): ClaudeExecutorEnv {
   if (!isExecutorConfigDir(configDir)) {
     throw new Error(`executor config dir ${JSON.stringify(configDir)} is not a per-execution directory under ${executorConfigBase()}`);
+  }
+  const git = executorGitPaths(configDir);
+  if (!existsDir(git.hooks) || !isRegularFile(git.config) || !existsDir(noRootWorkingDirectory(configDir))) {
+    throw new Error(`executor support directory ${JSON.stringify(executorSupportDir(configDir))} is incomplete`);
   }
   const fold = (k: string): string => (platform === 'win32' ? k.toUpperCase() : k);
   const byKey = new Map<string, string>();
@@ -268,6 +523,7 @@ export function buildClaudeExecutorEnv(
     ...copied,
     USE_BUILTIN_RIPGREP: FORCED_BUILTIN_RIPGREP,
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    ...gitNeutralisationEnv(configDir),
   };
   if (overrides) {
     for (const [k, v] of Object.entries(overrides)) {
@@ -277,6 +533,31 @@ export function buildClaudeExecutorEnv(
   }
   env['CLAUDE_CONFIG_DIR'] = configDir;
   return env as ClaudeExecutorEnv;
+}
+
+/** The git-neutralising variables for a run (see the header). */
+export function gitNeutralisationEnv(configDir: string): Record<string, string> {
+  const git = executorGitPaths(configDir);
+  const env: Record<string, string> = {
+    CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS: '1',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: git.config,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: String(EXECUTOR_GIT_CONFIG_OVERRIDES.length),
+  };
+  EXECUTOR_GIT_CONFIG_OVERRIDES.forEach(([key, value], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = key;
+    env[`GIT_CONFIG_VALUE_${i}`] = value === 'hooksPath' ? git.hooks : value;
+  });
+  return env;
+}
+
+function isRegularFile(p: string): boolean {
+  try {
+    return lstatSync(p).isFile();
+  } catch {
+    return false;
+  }
 }
 
 export type ClaudeExecutorEnv = Record<string, string> & { CLAUDE_CONFIG_DIR: string };
