@@ -1,10 +1,10 @@
 # M0 Baseline (T00: Baseline and CI)
 
-Recorded 2026-09-26 at the end of the M0 sprint on branch `m0/foundation`.
+Recorded 2026-09-26 after the M0 targeted fix round 3 on branch `m0/foundation`.
 
 ## Branch / commit
 
-- Measured on `m0/foundation` @ `f2f6ffa` ("fix(git-autocommit): close M0 red-team E5-1..E5-9 in both engines"). The commit that adds this file changes documentation only.
+- Measured on `m0/foundation` @ `1bcdc39` ("test(tool-authority): remove temp dirs reliably on Windows in the policy/rt4/rtf2 suites"). The commit that adds this file changes documentation only.
 - Code baseline before M0: `7b17b70` (`main`); integration base `239aea7` (docs-only delta over `7b17b70`).
 - All results below are from Windows 11 with `node_modules` installed via `pnpm install --frozen-lockfile`.
 
@@ -30,16 +30,16 @@ Every command was executed; none are assumed.
 | `pnpm install --frozen-lockfile` | Pass; lockfile unchanged | 0 |
 | `pnpm typecheck` | Pass. 6 packages have a `typecheck` script (otel, memory, shared, sprite-kit, ui, agent-runtime); pnpm reports "Scope: 7 of 8" because `apps/shell` is in scope but has no script | 0 |
 | `pnpm lint` | Pass. 0 errors, 10 warnings (see below) | 0 |
-| `pnpm -r test` | Pass. `packages/memory`: 146 tests, 144 pass, 2 skipped, 0 fail. `apps/agent-runtime`: 99 tests, 97 pass, 2 skipped, 0 fail | 0 |
-| `pnpm run test:scripts` | Pass. 35/35 (`scripts/git-autocommit.test.mjs`) | 0 |
+| `pnpm -r test` | Pass. `packages/memory`: 166 tests, 164 pass, 2 skipped, 0 fail. `apps/agent-runtime`: 141 tests, 131 pass, 10 skipped, 0 fail | 0 |
+| `pnpm run test:scripts` | Pass. 50/50 (`scripts/git-autocommit.test.mjs`) | 0 |
 | `pnpm build:runtime` | Pass (tsup ESM, `apps/agent-runtime/dist/index.js`) | 0 |
 | `pnpm --filter @skippy/ui build` | Pass (`tsc --noEmit && vite build`); existing >500 kB chunk-size warning, non-fatal | 0 |
 | `cargo check --manifest-path apps/shell/src-tauri/Cargo.toml` | Pass, no warnings. Requires `pnpm build:runtime` first (tauri.conf.json resources glob on `agent-runtime/dist`) | 0 |
-| `cargo test --manifest-path apps/shell/src-tauri/Cargo.toml` | Pass. 42 passed, 0 failed (git_autocommit, envelope, claude_spawn) | 0 |
+| `cargo test --manifest-path apps/shell/src-tauri/Cargo.toml` | Pass. 65 passed, 0 failed (git_autocommit, envelope, claude_spawn) | 0 |
 
 Skipped tests:
 - 2 in `packages/memory`: real file/dir symlink creation needs Developer Mode or SeCreateSymbolicLinkPrivilege. Junction tests cover the same reparse-point escape and pass.
-- 2 in `apps/agent-runtime` (`sdk-board.live-cli.test.ts`): opt-in with `SKIPPY_LIVE_CLI_MOCK=1`. They run the real bundled Claude CLI against a local mock Anthropic API. They passed 2/2 when enabled by the implementing agent; they were not enabled for this measurement.
+- 10 in `apps/agent-runtime` (`sdk-board.live-cli.test.ts`, `tool-authority-rtf2.live-cli.test.ts`): opt-in with `SKIPPY_LIVE_CLI_MOCK=1`. They run the real bundled Claude CLI against a local mock Anthropic API. The implementing agents ran them enabled, all passing; they were not enabled for this measurement.
 
 Test discovery: package `test` scripts glob `src/**/*.test.ts`, so new tests are picked up automatically. `scripts/*.test.mjs` run via `test:scripts`.
 
