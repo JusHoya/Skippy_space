@@ -48,7 +48,7 @@ async function tmpDir(prefix: string): Promise<string> {
 after(async () => {
   for (const dir of createdTmpDirs) {
     try {
-      await fs.rm(dir, { recursive: true, force: true });
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       /* best effort */
     }

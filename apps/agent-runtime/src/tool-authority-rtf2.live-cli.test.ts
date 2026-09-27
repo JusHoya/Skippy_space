@@ -183,17 +183,23 @@ before(async () => {
   });
 });
 
-after(() => {
+after(async () => {
   if (!LIVE) return;
   server?.close();
   for (const k of ENV_OVERRIDES) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
   }
-  try {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  } catch {
-    /* best effort */
+  // The spawned CLI's cwd is `work`; Windows refuses to remove a process's
+  // working directory until it has fully exited, so poll for a while.
+  const deadline = Date.now() + 15_000;
+  while (fs.existsSync(tmp) && Date.now() < deadline) {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+    } catch {
+      /* retry below */
+    }
+    if (fs.existsSync(tmp)) await new Promise((r) => setTimeout(r, 500));
   }
 });
 
