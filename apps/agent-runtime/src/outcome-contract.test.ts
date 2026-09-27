@@ -18,7 +18,7 @@ import {
 } from '@skippy/shared';
 
 import { resolveExecutionGate } from './execution-gate.js';
-import { executeBoardMissionViaSdk, type ClaudeAgentSdkModule } from './sdk-board.js';
+import { executeBoardMissionViaSdk, NO_SUMMARY, type ClaudeAgentSdkModule } from './sdk-board.js';
 
 // ── shared contract ─────────────────────────────────────────────────────────
 
@@ -603,5 +603,19 @@ test('N6c: success with a missing/non-string result → succeeded with a string 
     });
     assert.equal(r.status, 'succeeded', JSON.stringify(extra));
     assert.equal(typeof (r.status === 'succeeded' ? r.summary : null), 'string', JSON.stringify(extra));
+  }
+});
+
+// OQ-20 D3 (live-mock t_noBlockStopEnd): the CLI drops a text block that never
+// got content_block_stop and reports `result: ""`. A succeeded result's summary
+// is never the empty string.
+test('OQ-20 D3: success with an empty/blank result → succeeded with NO_SUMMARY, never ""', async () => {
+  for (const result of ['', ' ', '\n\t']) {
+    const r = await executeBoardMissionViaSdk(params, {
+      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, stop_reason: 'end_turn', result }]),
+    });
+    assert.equal(r.status, 'succeeded', JSON.stringify(result));
+    assert.equal(r.status === 'succeeded' && r.summary, NO_SUMMARY, JSON.stringify(result));
+    assert.equal(deriveTaskOutcome(r, 'not_defined').summary, NO_SUMMARY);
   }
 });

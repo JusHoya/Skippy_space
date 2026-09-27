@@ -175,13 +175,17 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  * truncated final turn after a `tool_use` turn reports a stale `"tool_use"`;
  * `stream` (the {@link RunStreamObserver}'s view of the final main-thread
  * turn, from `includePartialMessages` stream events) catches that case and
- * any stale normal value. Forwarded `assistant` messages always carry
- * `stop_reason: null` (emitted at `content_block_stop`), so they are not a
- * signal on their own.
+ * any stale normal value, and a final turn whose stop reason arrived with a
+ * content block never closed (D3). Forwarded streamed `assistant` messages
+ * (emitted at `content_block_stop`) carry `message_start`'s `stop_reason`
+ * (null from the real API), so they are not a signal on their own. Earlier
+ * main-thread turns judged truncated when a later turn superseded them (a
+ * background wake-up segment needs no `result` in between) are applied on top
+ * — see {@link TruncatedTurnLedger}.
  *
- * A succeeded result's `summary` is always a string (`result` when it is a
- * string, otherwise {@link NO_SUMMARY}) so the emitted `delegation_complete`
- * envelope satisfies the shared wire schema (N6c).
+ * A succeeded result's `summary` is always a non-blank string (`result` when
+ * it is one, otherwise {@link NO_SUMMARY}) so the emitted `delegation_complete`
+ * envelope satisfies the shared wire schema (N6c) and never carries "".
  *
  * Run-level tool denials that never reach `permission_denials` (task-agent /
  * subagent hook and canUseTool denials, N1) are applied on top of this per-
@@ -327,7 +331,10 @@ function mapSdkResultMessage(
 
   const normalStop = isNormalStopReason(stopReason);
   if (cleanSuccess && normalStop) {
-    return withCost({ status: 'succeeded', summary: resultText ?? NO_SUMMARY });
+    // A blank `result` (e.g. the CLI dropped a never-closed text block, D3) is
+    // no summary at all; the envelope never carries "".
+    const summary = resultText !== undefined && resultText.trim().length > 0 ? resultText : NO_SUMMARY;
+    return withCost({ status: 'succeeded', summary });
   }
 
   // Fail closed: an error subtype, a "success" subtype flagged is_error, any
@@ -720,6 +727,97 @@ interface MainTurn {
   /** `message_delta` stop reason (or a non-streamed message's); null = none yet. */
   stopReason: string | null;
   source: 'stream' | 'non-streamed';
+  /** Content evidence seen (block start/stop events, streamed assistant messages). */
+  content: number;
+  /** Indexes of streamed content blocks started but never stopped. */
+  openBlocks: Set<number>;
+  /** tool_use ids of this turn's closed (forwarded) tool_use blocks. */
+  toolUseIds: Set<string>;
+  /** The CLI returned a main-thread tool_result for one of `toolUseIds`. */
+  executed: boolean;
+  /** A new main-thread API request began (`system/status: requesting`) after
+   * this turn's `message_start` — the turn can no longer be completed by the
+   * non-streaming fallback of its own request. */
+  requestAfter: boolean;
+  /** `message_start`'s own stop_reason (null from the real API). The CLI copies
+   * it into the turn's streamed assistant messages (verified live,
+   * `t_startStopEndTrunc`), so it is never a completion signal. */
+  startStop: string | null;
+}
+
+function newMainTurn(
+  id: string | undefined,
+  source: MainTurn['source'],
+  stopReason: string | null = null,
+  startStop: string | null = null,
+): MainTurn {
+  return {
+    id,
+    stopReason,
+    source,
+    content: 0,
+    openBlocks: new Set(),
+    toolUseIds: new Set(),
+    executed: false,
+    requestAfter: false,
+    startStop,
+  };
+}
+
+const stopReasonOf = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
+
+/**
+ * Why a main-thread turn is truncated (OQ-20), or undefined when complete.
+ * A turn is complete when it got a stop reason with every streamed content
+ * block closed, or — lacking a stop reason — when every block it opened was
+ * closed and the CLI executed one of its tool_use blocks (the CLI accepted
+ * the turn and continued; verified live, `t_toolBlockCut`). A block left open
+ * means content was lost even if an earlier tool ran (`t_twoToolsCutMid1`: the
+ * CLI ran tool #0 and silently dropped the half-streamed tool #1).
+ */
+function truncationOf(t: MainTurn): string | undefined {
+  const open = t.openBlocks.size;
+  const openNote = open > 0 ? `${open} content block(s) never closed` : '';
+  if (t.stopReason === null) {
+    if (t.executed && open === 0) return undefined;
+    const how =
+      t.source === 'stream'
+        ? 'message_start without a message_delta stop reason'
+        : 'non-streamed message with stop_reason null';
+    return `got no stop reason (${[how, openNote].filter(Boolean).join('; ')})`;
+  }
+  if (t.source === 'stream' && open > 0) {
+    return `ended (stop_reason ${JSON.stringify(t.stopReason)}) with ${openNote}`;
+  }
+  return undefined;
+}
+
+const MAX_TRUNCATIONS_IN_DETAIL = 10;
+
+/**
+ * Every main-thread turn judged truncated before the `result` it belongs to
+ * was mapped (OQ-20, FR-RUN-01, G0): a turn superseded by a later turn without
+ * a stop reason. The CLI 2.1.162 emits no `result` between the segments of a
+ * run whose background task is still running (verified: `t_bgTwoWakes`, four
+ * main requests and one result), so a truncated non-final turn is only
+ * visible here. Any entry fails the run, whatever the later results say.
+ */
+export class TruncatedTurnLedger {
+  private readonly turns: string[] = [];
+
+  record(detail: string): void {
+    this.turns.push(detail);
+  }
+
+  get size(): number {
+    return this.turns.length;
+  }
+
+  detail(): string {
+    const shown = this.turns.slice(0, MAX_TRUNCATIONS_IN_DETAIL);
+    if (this.turns.length > shown.length) shown.push(`…and ${this.turns.length - shown.length} more`);
+    return shown.join(' | ');
+  }
 }
 
 /**
@@ -734,7 +832,8 @@ export class RunStreamObserver {
   private readonly toolNames = new Map<string, string>();
   /** Tools the CLI offered (system/init `tools`), canonicalized. */
   private offered: Set<string> | null = null;
-  /** Final main-thread turn of the current result segment (OQ-20). */
+  /** The main-thread turn currently tracked (OQ-20); judged when it is
+   * superseded by another turn or when its segment's `result` is mapped. */
   private mainTurn: MainTurn | null = null;
   /** Main-thread `stream_event`s seen, i.e. partial messages are flowing. */
   private streamEvents = false;
@@ -743,6 +842,7 @@ export class RunStreamObserver {
     private readonly policy: Pick<ExecutionPolicy, 'allowedTools' | 'mcpServers'>,
     private readonly failures: RunFailureLedger,
     private readonly denials: DenialLedger,
+    private readonly truncations: TruncatedTurnLedger = new TruncatedTurnLedger(),
   ) {}
 
   /** Key + label for a task agent referenced by id (hook `agent_id`, `task_id`). */
@@ -790,18 +890,28 @@ export class RunStreamObserver {
    * Evidence about the final main-thread turn for the `result` being mapped
    * now; resets for the next result segment (a background task can wake the
    * board and produce another result). With `includePartialMessages` the CLI
-   * forwards the main thread's raw SSE events (verified, CLI 2.1.162); a
-   * turn whose `message_start` was never followed by a `message_delta` stop
-   * reason is truncated. Without stream events nothing is claimed and the
-   * result's own `stop_reason` decides.
+   * forwards the main thread's raw SSE events (verified, CLI 2.1.162); see
+   * {@link truncationOf} for when a turn is truncated. Without stream events
+   * nothing is claimed and the result's own `stop_reason` decides.
    */
   takeFinalTurnEvidence(): FinalTurnEvidence {
     const turn = this.mainTurn;
     this.mainTurn = null;
-    if (!turn || turn.stopReason !== null) return {};
-    const how =
-      turn.source === 'stream' ? 'message_start without a message_delta stop reason' : 'non-streamed message with stop_reason null';
-    return { truncated: `final main-thread turn ${turn.id ?? '(no id)'} got no stop reason (${how})` };
+    const why = turn ? truncationOf(turn) : undefined;
+    return turn && why ? { truncated: `final main-thread turn ${turn.id ?? '(no id)'} ${why}` } : {};
+  }
+
+  /**
+   * Judge the tracked main-thread turn now that it is superseded by `next`
+   * (OQ-20). Only a turn's own non-streaming fallback may replace it without
+   * a stop reason; that case never reaches here (see observeMainAssistant).
+   */
+  private supersede(next: string): void {
+    const turn = this.mainTurn;
+    const why = turn ? truncationOf(turn) : undefined;
+    if (turn && why) {
+      this.truncations.record(`main-thread turn ${turn.id ?? '(no id)'} ${why}, superseded by ${next}`);
+    }
   }
 
   /**
@@ -815,34 +925,81 @@ export class RunStreamObserver {
     const ev = asRecord(msg.event);
     if (!ev) return;
     this.streamEvents = true;
+    const turn = this.mainTurn;
     if (ev.type === 'message_start') {
-      const id = asRecord(ev.message)?.id;
-      this.mainTurn = { id: typeof id === 'string' ? id : undefined, stopReason: null, source: 'stream' };
-    } else if (ev.type === 'message_delta' && this.mainTurn) {
-      const stop = asRecord(ev.delta)?.stop_reason;
-      if (typeof stop === 'string' && stop.length > 0) this.mainTurn.stopReason = stop;
+      const started = asRecord(ev.message);
+      const id = typeof started?.id === 'string' ? started.id : undefined;
+      // A second message_start with no content and no new API request in
+      // between belongs to the same response (a stray/duplicate start), not a
+      // new turn. Anything else supersedes the tracked turn: the CLI begins a
+      // new streamed turn only after the previous one completed, was retried
+      // through a non-streamed fallback (which completes it first), or was
+      // abandoned — e.g. a segment cut short while a background task still
+      // runs, where CLI 2.1.162 emits no `result` before the next segment.
+      const sameResponse =
+        turn?.source === 'stream' && turn.stopReason === null && turn.content === 0 && !turn.requestAfter;
+      if (!sameResponse) this.supersede(`main-thread turn ${id ?? '(no id)'} (message_start)`);
+      this.mainTurn = newMainTurn(id, 'stream', null, stopReasonOf(started?.stop_reason));
+      return;
+    }
+    if (!turn || turn.source !== 'stream') return;
+    const index = typeof ev.index === 'number' ? ev.index : undefined;
+    if (ev.type === 'content_block_start') {
+      turn.content++;
+      if (index !== undefined) turn.openBlocks.add(index);
+    } else if (ev.type === 'content_block_stop') {
+      turn.content++;
+      if (index !== undefined) turn.openBlocks.delete(index);
+    } else if (ev.type === 'message_delta') {
+      const stop = stopReasonOf(asRecord(ev.delta)?.stop_reason);
+      if (stop !== null) turn.stopReason = stop;
     }
   }
 
   /**
-   * A main-thread assistant message that no `message_start` announced is a
-   * non-streamed turn (the CLI's non-streaming fallback after a dropped
-   * stream, verified): its own `stop_reason` is final. Streamed messages are
-   * emitted at `content_block_stop` with `stop_reason: null`, so they never
-   * update the turn. The CLI's `<synthetic>` error messages are left to the
-   * result mapping (they come with an `is_error` result).
+   * Main-thread assistant messages. A streamed turn's messages (emitted at
+   * `content_block_stop`, carrying `message_start`'s stop_reason — null from
+   * the real API) carry the tracked turn's id and only add content. A message
+   * with its own stop reason for the same id, or any message no
+   * `message_start` announced, is the CLI's
+   * non-streaming fallback for the tracked turn's request (verified: sent
+   * right after the dropped stream, with no `system/status: requesting` in
+   * between, under a new id or the same one): it completes that turn with its
+   * own `stop_reason` (D2). If a new API request began since the tracked
+   * turn's `message_start`, that turn was abandoned and is judged first. The
+   * CLI's `<synthetic>` error messages are left to the result mapping (they
+   * come with an `is_error` result).
    */
   private observeMainAssistant(message: Record<string, unknown> | undefined): void {
     if (!this.streamEvents || !message || message.model === '<synthetic>') return;
     const id = typeof message.id === 'string' ? message.id : undefined;
-    if (id !== undefined && id === this.mainTurn?.id) return;
-    const stop = message.stop_reason;
-    this.mainTurn = { id, stopReason: typeof stop === 'string' && stop.length > 0 ? stop : null, source: 'non-streamed' };
+    const stop = stopReasonOf(message.stop_reason);
+    const turn = this.mainTurn;
+    if (turn?.source === 'stream' && id === turn.id && (stop === null || stop === turn.startStop)) {
+      turn.content++;
+      const content = Array.isArray(message.content) ? (message.content as unknown[]) : [];
+      for (const b of content) {
+        const block = asRecord(b);
+        if (block?.type === 'tool_use' && typeof block.id === 'string') turn.toolUseIds.add(block.id);
+      }
+      return;
+    }
+    if (turn?.requestAfter) {
+      this.supersede(`non-streamed main-thread message ${id ?? '(no id)'} of a later request`);
+    }
+    this.mainTurn = newMainTurn(id, 'non-streamed', stop);
   }
 
   private observeSystem(msg: Record<string, unknown>): void {
     const str = (k: string): string | undefined => (typeof msg[k] === 'string' ? (msg[k] as string) : undefined);
     switch (msg.subtype) {
+      case 'status': {
+        // CLI 2.1.162 emits `status: requesting` before every main-thread
+        // streamed API request (never for task agents or for the non-
+        // streaming fallback — verified live), i.e. a request boundary.
+        if (msg.status === 'requesting' && this.mainTurn) this.mainTurn.requestAfter = true;
+        return;
+      }
       case 'init': {
         if (Array.isArray(msg.tools)) {
           this.offered = new Set(msg.tools.filter((t): t is string => typeof t === 'string').map(canonicalToolName));
@@ -945,9 +1102,16 @@ export class RunStreamObserver {
     const message = asRecord(msg.message);
     const content = Array.isArray(message?.content) ? (message.content as unknown[]) : [];
     const mainThread = msg.parent_tool_use_id === null || msg.parent_tool_use_id === undefined;
+    const turn = this.mainTurn;
     for (const b of content) {
       const block = asRecord(b);
-      if (block?.type !== 'tool_result' || block.is_error !== true) continue;
+      if (block?.type !== 'tool_result') continue;
+      // OQ-20: the CLI executed a tool_use of the tracked main-thread turn.
+      const toolUseId = block.tool_use_id;
+      if (mainThread && turn && typeof toolUseId === 'string' && turn.toolUseIds.has(toolUseId)) {
+        turn.executed = true;
+      }
+      if (block.is_error !== true) continue;
       const id = typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined;
       const name = id ? this.toolNames.get(id) : undefined;
       if (name === undefined) continue;
@@ -1041,14 +1205,48 @@ function applyRunFailures(base: SdkBoardResult, failures: RunFailureLedger, boar
   return out;
 }
 
-/** Final run status: task-agent failures, then denials (denial wins). */
+/**
+ * Apply main-thread turns judged truncated mid-run (OQ-20, FR-RUN-01, G0): a
+ * run with one is never `succeeded`, however its later segments ended.
+ * `succeeded`, `interrupted` and `cancelled` become `failed(provider_error)`;
+ * an already `failed` or `blocked` run keeps its code and gains the detail.
+ */
+function applyRunTruncations(
+  base: SdkBoardResult,
+  truncations: TruncatedTurnLedger,
+  boardId: string,
+): SdkBoardResult {
+  if (truncations.size === 0) return base;
+  const turns = `${TRUNCATED_STREAM_DETAIL}: ${truncations.detail()}`;
+  if (base.status === 'failed' || base.status === 'blocked') {
+    return { ...base, reason: { ...base.reason, detail: `${base.reason.detail ?? base.reason.message} | ${turns}` } };
+  }
+  const also =
+    base.status === 'succeeded'
+      ? ''
+      : ` | run also ended ${base.status}(${base.reason.code}): ${base.reason.detail ?? base.reason.message}`;
+  const out: SdkBoardResult = {
+    status: 'failed',
+    reason: {
+      code: 'provider_error',
+      message: `Board ${boardId} executor's ${TRUNCATED_STREAM_DETAIL} in ${truncations.size} main-thread turn(s).`,
+      detail: `${turns}${also}`,
+    },
+  };
+  if (base.costUsd !== undefined) out.costUsd = base.costUsd;
+  return out;
+}
+
+/** Final run status: truncated turns, task-agent failures, then denials (denial wins). */
 function applyRunLedgers(
   base: SdkBoardResult,
   failures: RunFailureLedger,
   denials: DenialLedger,
   boardId: string,
+  truncations: TruncatedTurnLedger,
 ): SdkBoardResult {
-  return applyRunDenials(applyRunFailures(base, failures, boardId), denials, boardId);
+  const truncated = applyRunTruncations(base, truncations, boardId);
+  return applyRunDenials(applyRunFailures(truncated, failures, boardId), denials, boardId);
 }
 
 /**
@@ -1094,6 +1292,9 @@ export async function executeBoardMissionViaSdk(
   // Every task-agent failure observed in the stream (EC1 D1); any entry makes
   // the run `failed`, never `succeeded` (a denial still wins as `blocked`).
   const failures = new RunFailureLedger();
+  // Main-thread turns judged truncated before their result (OQ-20); any entry
+  // makes the run `failed(provider_error)`, never `succeeded`.
+  const truncations = new TruncatedTurnLedger();
   // Hoisted so a stream that throws AFTER yielding a non-success result (the
   // SDK throws "returned an error result" after an is_error result) keeps
   // that result's specific reason instead of a generic provider_error.
@@ -1116,7 +1317,7 @@ export async function executeBoardMissionViaSdk(
         params.enforcement?.onDecision?.(e);
       },
     });
-    const observer = new RunStreamObserver(policy, failures, denials);
+    const observer = new RunStreamObserver(policy, failures, denials, truncations);
     const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
     const q = sdk.query({
       prompt: params.missionBrief,
@@ -1172,9 +1373,10 @@ export async function executeBoardMissionViaSdk(
         failures,
         denials,
         params.boardId,
+        truncations,
       );
     }
-    return applyRunLedgers(terminal, failures, denials, params.boardId);
+    return applyRunLedgers(terminal, failures, denials, params.boardId, truncations);
   } catch (err) {
     logger.warn({
       msg: 'SDK board execution failed',
@@ -1184,7 +1386,7 @@ export async function executeBoardMissionViaSdk(
     // A non-success result already observed is the more specific truth.
     const observed: SdkBoardResult | null = terminal;
     if (observed && observed.status !== 'succeeded') {
-      return applyRunLedgers(observed, failures, denials, params.boardId);
+      return applyRunLedgers(observed, failures, denials, params.boardId, truncations);
     }
     return applyRunLedgers(
       {
@@ -1198,6 +1400,7 @@ export async function executeBoardMissionViaSdk(
       failures,
       denials,
       params.boardId,
+      truncations,
     );
   }
 }

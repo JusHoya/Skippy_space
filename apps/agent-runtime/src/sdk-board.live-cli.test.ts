@@ -44,9 +44,37 @@ interface Scenario {
   /** OQ-20: the main thread's final (text) turn stream ends after its text
    * block, without `message_delta`/`message_stop`. */
   mainTruncEnd?: boolean;
+  /** OQ-20 round 5: per-turn scripted responses; overrides everything above. */
+  script?: { main: ScriptStep[]; sub?: ScriptStep[] };
+}
+
+/**
+ * One scripted model turn, selected by the request's assistant-turn count (the
+ * CLI's retry / non-streaming fallback of the same turn counts as the next
+ * `attempts` entry). Mirrors the r4v1/r5 investigation mock.
+ */
+interface ScriptStep {
+  text?: string;
+  tools?: ToolUse[];
+  stop?: string;
+  /** End the stream after the last block: no message_delta / message_stop. */
+  truncEnd?: boolean;
+  /** End the stream right after this block's content_block_stop. */
+  cutAfterBlock?: number;
+  /** Never send content_block_stop (message_delta + message_stop still sent). */
+  noBlockStop?: boolean;
+  /** Destroy the socket after the first block's delta. */
+  dropMid?: boolean;
+  msgId?: string;
+  delayMs?: number;
+  attempts?: ScriptStep[];
 }
 
 let scenario: Scenario = { mainTools: [], subTools: [] };
+/** Per-scenario attempt counters of scripted turns (reset by scriptedRun). */
+const scriptAttempts = new Map<string, number>();
+/** Non-streaming (fallback) requests served to scripted scenarios. */
+let nonStreamedRequests = 0;
 let server: http.Server | undefined;
 let tmp = '';
 const savedEnv: Record<string, string | undefined> = {};
@@ -105,13 +133,93 @@ function sse(
   res.end();
 }
 
+function scripted(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  j: { model?: unknown; stream?: unknown; messages?: Array<{ role?: string; content?: unknown }> },
+  steps: ScriptStep[],
+  key: string,
+  next: () => number,
+  attempts: Map<string, number>,
+  dflt: ScriptStep,
+): void {
+  const msgs = j.messages ?? [];
+  const turn = msgs.filter((m) => m.role === 'assistant').length;
+  const akey = `${key}#${turn}`;
+  const attempt = attempts.get(akey) ?? 0;
+  attempts.set(akey, attempt + 1);
+  let step = steps[turn] ?? dflt;
+  if (step.attempts) step = step.attempts[attempt] ?? step.attempts[step.attempts.length - 1]!;
+  const s = step;
+  if (j.stream !== true) nonStreamedRequests++;
+  const blocks: Array<Record<string, unknown>> = (s.tools ?? []).map((t, i) => ({
+    type: 'tool_use',
+    id: `toolu_${key.replace(/\W/g, '')}_${turn}_${i}_${next()}`,
+    name: t.name,
+    input: t.input,
+  }));
+  if (s.text !== undefined) blocks.unshift({ type: 'text', text: s.text });
+  const stop = s.tools ? 'tool_use' : (s.stop ?? 'end_turn');
+  const id = s.msgId ?? `msg_${next()}`;
+  const usage = { input_tokens: 10, output_tokens: 5 };
+  const go = (): void => {
+    if (j.stream !== true) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: j.model, content: blocks, stop_reason: stop, stop_sequence: null, usage }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    const ev = (e: string, d: unknown): void => {
+      res.write(`event: ${e}\ndata: ${JSON.stringify(d)}\n\n`);
+    };
+    ev('message_start', {
+      type: 'message_start',
+      message: { id, type: 'message', role: 'assistant', model: j.model, content: [], stop_reason: null, stop_sequence: null, usage },
+    });
+    for (let index = 0; index < blocks.length; index++) {
+      const b = blocks[index]!;
+      if (b.type === 'text') {
+        ev('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
+        ev('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: b.text } });
+      } else {
+        ev('content_block_start', { type: 'content_block_start', index, content_block: { type: 'tool_use', id: b.id, name: b.name, input: {} } });
+        ev('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(b.input) } });
+      }
+      if (s.dropMid) {
+        setTimeout(() => req.socket.destroy(), 20);
+        return;
+      }
+      if (!s.noBlockStop) ev('content_block_stop', { type: 'content_block_stop', index });
+      if (s.cutAfterBlock === index) {
+        res.end();
+        return;
+      }
+    }
+    if (s.truncEnd) {
+      res.end();
+      return;
+    }
+    ev('message_delta', { type: 'message_delta', delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 5 } });
+    ev('message_stop', { type: 'message_stop' });
+    res.end();
+  };
+  if (s.delayMs) setTimeout(go, s.delayMs);
+  else go();
+}
+
 function startMock(): Promise<http.Server> {
   let n = 0;
   const srv = http.createServer((req, res) => {
     let body = '';
     req.on('data', (c: Buffer) => (body += c.toString()));
     req.on('end', () => {
-      let j: { model?: unknown; system?: unknown; tools?: unknown[]; messages?: Array<{ content?: unknown }> } = {};
+      let j: {
+        model?: unknown;
+        stream?: unknown;
+        system?: unknown;
+        tools?: unknown[];
+        messages?: Array<{ role?: string; content?: unknown }>;
+      } = {};
       try {
         j = JSON.parse(body || '{}') as typeof j;
       } catch {
@@ -136,6 +244,12 @@ function startMock(): Promise<http.Server> {
       const hasTools = (j.tools ?? []).length > 0;
       const isMain = hasTools && JSON.stringify(j.system ?? '').includes(MAIN_MARK);
       const isSub = !isMain && hasTools && JSON.stringify(msgs[0] ?? '').includes(SUB_MARK);
+      if (scenario.script && (isMain || isSub)) {
+        const steps = isMain ? scenario.script.main : (scenario.script.sub ?? []);
+        const dflt: ScriptStep = isMain ? { text: 'All done, monkeys! Magnificent.' } : { text: 'sub done' };
+        scripted(req, res, j, steps, isMain ? 'main' : 'sub', () => ++n, scriptAttempts, dflt);
+        return;
+      }
       const toolBlocks = (tools: ToolUse[]): Array<Record<string, unknown>> =>
         tools.map((t, i) => ({ type: 'tool_use', id: `toolu_${i}_${++n}`, name: t.name, input: t.input }));
       const id = `msg_${++n}`;
@@ -307,4 +421,71 @@ test('live CLI (OQ-20 maintooltrunc): truncated final turn after a tool turn (st
   const r = await executeBoardMissionViaSdk(mission());
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+});
+
+// ── OQ-20 round 5: non-final segment turns, same-id fallback, unclosed block ──
+//
+// While a background task agent runs, the CLI emits no `result` between the
+// board's segments; a truncated turn there must still fail the run.
+
+const bgAgent: ToolUse = {
+  name: 'Agent',
+  input: { description: 'sub', prompt: `${SUB_MARK} bg`, subagent_type: 'general-purpose', run_in_background: true },
+};
+const slowSub: ScriptStep[] = [{ text: 'bg sub done', stop: 'end_turn', delayMs: 2500 }];
+
+async function scriptedRun(script: NonNullable<Scenario['script']>): Promise<Awaited<ReturnType<typeof executeBoardMissionViaSdk>>> {
+  scenario = { mainTools: [], subTools: [], script };
+  scriptAttempts.clear();
+  nonStreamedRequests = 0;
+  return executeBoardMissionViaSdk(mission());
+}
+
+test('live CLI (OQ-20 t_pairSlowSub): turn truncated while a background task runs (no result before the wake-up) → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({
+    main: [{ tools: [bgAgent] }, { text: 'I will now write the report file and then', truncEnd: true, delayMs: 600 }, { text: 'Report complete, monkeys.' }],
+    sub: slowSub,
+  });
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+  assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /main-thread turn msg_\d+ got no stop reason/);
+});
+
+test('live CLI (OQ-20 t_bgTruncLostTool): stream cut before a Write tool_use (never ran), then a wake-up success → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({
+    main: [
+      { tools: [bgAgent] },
+      { text: 'Now writing the file', tools: [{ name: 'Write', input: { file_path: path.join(tmp, 'work', 'lost.txt'), content: 'z' } }], cutAfterBlock: 0 },
+      { text: 'All done, monkeys.' },
+    ],
+    sub: slowSub,
+  });
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+  assert.equal(fs.existsSync(path.join(tmp, 'work', 'lost.txt')), false);
+});
+
+test('live CLI (OQ-20 control t_pairSlowSubOk): complete turns around a background wake-up → succeeded', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({
+    main: [{ tools: [bgAgent] }, { text: 'waiting on bg', stop: 'end_turn', delayMs: 600 }, { text: 'Report complete, monkeys.' }],
+    sub: slowSub,
+  });
+  assert.equal(r.status, 'succeeded', JSON.stringify(r));
+  assert.equal(r.status === 'succeeded' && r.summary, 'Report complete, monkeys.');
+});
+
+test('live CLI (OQ-20 D2 t_fallbackNsSameId): non-streamed fallback reusing the dropped turn\'s id completes it → succeeded', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({
+    main: [{ attempts: [{ text: 'x', dropMid: true, msgId: 'msg_same' }, { text: 'fallback ok', msgId: 'msg_same' }] }],
+  });
+  assert.equal(nonStreamedRequests, 1, 'the CLI must have used the non-streaming fallback');
+  assert.equal(r.status, 'succeeded', JSON.stringify(r));
+  assert.equal(r.status === 'succeeded' && r.summary, 'fallback ok');
+});
+
+test('live CLI (OQ-20 D3 t_noBlockStopEnd): end_turn with a text block never closed (CLI reports result "") → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
+  const r = await scriptedRun({ main: [{ text: 'partial', noBlockStop: true }] });
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
+  assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /never closed/);
 });

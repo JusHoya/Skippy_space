@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 
 import { deriveTaskOutcome } from '@skippy/shared';
 
-import { executeBoardMissionViaSdk, type ClaudeAgentSdkModule, type SdkBoardResult } from './sdk-board.js';
+import { executeBoardMissionViaSdk, NO_SUMMARY, type ClaudeAgentSdkModule, type SdkBoardResult } from './sdk-board.js';
 
 const params = {
   boardId: 'coding',
@@ -698,4 +698,321 @@ test('D2: the CLI "Task" alias of the granted Agent tool is never treated as wit
   // The Agent call failed (executor_error), but it was offered: no D2 denial.
   assert.equal(r.status, 'failed');
   assert.equal(reasonOf(r).code, 'executor_error');
+});
+
+// ── OQ-20 (EC1 round 5): every main-thread turn is judged, not only the last ──
+//
+// Captured from the bundled CLI 2.1.162 against the r4v1/r5 mock. While a
+// background task agent still runs, the CLI emits NO `result` between the
+// board's segments (t_bgTwoWakes: four main requests, one result), so a turn
+// truncated in a non-final segment was overwritten by the next
+// `message_start` and the run reported success (t_pairSlowSub,
+// t_bgTruncLostTool). `system/status: requesting` precedes every main-thread
+// streamed request and never the non-streaming fallback or a task agent's
+// request; the fallback message arrives right after the dropped stream and
+// carries its own stop reason (under a new id or the same one).
+
+const statusRequesting = { type: 'system', subtype: 'status', status: 'requesting' };
+const textStart = (index: number): Record<string, unknown> =>
+  se({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } });
+const toolStart = (index: number, id: string, name = 'Read'): Record<string, unknown> =>
+  se({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name, input: {} } });
+const blockStop = (index: number): Record<string, unknown> => se({ type: 'content_block_stop', index });
+/** A complete streamed text turn, as the CLI forwards it (status first). */
+const fullTextTurn = (id: string, text: string, stop = 'end_turn'): Step[] => [
+  statusRequesting,
+  msgStart(id),
+  textStart(0),
+  mainText(id, text),
+  blockStop(0),
+  msgDelta(stop),
+  msgStop,
+];
+/** A streamed text turn whose SSE stream ended after its (closed) text block. */
+const cutTextTurn = (id: string, text: string): Step[] => [statusRequesting, msgStart(id), textStart(0), mainText(id, text), blockStop(0)];
+/** The board's first turn: a background Agent call, then its async launch. */
+const bgLaunch: Step[] = [
+  init,
+  statusRequesting,
+  msgStart('msg_2'),
+  toolStart(0, AGENT_TU, 'Agent'),
+  agentCall({ run_in_background: true }),
+  blockStop(0),
+  msgDelta('tool_use'),
+  msgStop,
+  { ...taskStarted, prompt: 'SUBMARK s bg' },
+  agentToolResult('Async agent launched successfully.'),
+];
+/** The background task agent finishing while the board waits (no result). */
+const bgFinish: Step[] = [
+  {
+    type: 'assistant',
+    message: { id: 'msg_3', model: 'claude-sonnet-4-6', role: 'assistant', content: [{ type: 'text', text: 'bg sub done' }], stop_reason: null },
+    parent_tool_use_id: AGENT_TU,
+  },
+  { type: 'system', subtype: 'task_updated', task_id: TASK, patch: { status: 'completed' } },
+  { ...taskNotification('completed'), summary: 'Agent "sub" completed' },
+  init,
+];
+const segmentResult = (text: string): Record<string, unknown> => ({ ...successResult, result: text, num_turns: 1 });
+
+test('OQ-20 t_pairSlowSub: a turn truncated in a non-final segment (no result before the next segment) → failed(provider_error)', async () => {
+  const r = await run([
+    ...bgLaunch,
+    ...cutTextTurn('msg_4', 'I will now write the report file and then'),
+    ...bgFinish,
+    ...fullTextTurn('msg_5', 'Report complete, monkeys.'),
+    segmentResult('Report complete, monkeys.'),
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  const { code, message, detail } = reasonOf(r);
+  assert.equal(code, 'provider_error');
+  assert.match(message, /provider stream ended without a stop reason \(truncated\) in 1 main-thread turn/);
+  assert.match(detail, /main-thread turn msg_4 got no stop reason/);
+  assert.match(detail, /superseded by main-thread turn msg_5/);
+  assert.equal(deriveTaskOutcome(r, 'not_defined').outcome, 'failed');
+});
+
+test('OQ-20 t_bgTruncLostTool: stream cut after the text block, before a Write tool_use (never ran) → failed(provider_error)', async () => {
+  const r = await run([
+    ...bgLaunch,
+    ...cutTextTurn('msg_5', 'Now writing the file'),
+    ...bgFinish,
+    ...fullTextTurn('msg_6', 'All done, monkeys.'),
+    segmentResult('All done, monkeys.'),
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(reasonOf(r).code, 'provider_error');
+  assert.match(reasonOf(r).detail, /main-thread turn msg_5 got no stop reason/);
+});
+
+test('OQ-20: the same truncated turn fails whether or not the CLI put a result between the segments (t_pairFastSub ≡ t_pairSlowSub)', async () => {
+  const fast = await run([
+    ...bgLaunch,
+    ...cutTextTurn('msg_4', 'I will now write the report file and then'),
+    { ...successResult, result: 'I will now write the report file and then', stop_reason: 'tool_use', num_turns: 2 },
+    ...bgFinish,
+    ...fullTextTurn('msg_5', 'Report complete, monkeys.'),
+    segmentResult('Report complete, monkeys.'),
+  ]);
+  assert.equal(fast.status, 'failed', JSON.stringify(fast));
+  assert.equal(reasonOf(fast).code, 'provider_error');
+  assert.match(reasonOf(fast).detail, /final main-thread turn msg_4/);
+});
+
+test('OQ-20 t_bgTwoWakesMidTrunc: a truncated middle wake-up turn fails the run although first and last turns completed', async () => {
+  const r = await run([
+    ...bgLaunch,
+    ...fullTextTurn('msg_6', 'waiting'),
+    ...bgFinish,
+    ...cutTextTurn('msg_7', 'partial'),
+    ...bgFinish,
+    ...fullTextTurn('msg_8', 'both done'),
+    segmentResult('both done'),
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.match(reasonOf(r).detail, /main-thread turn msg_7 got no stop reason/);
+  assert.doesNotMatch(reasonOf(r).detail, /msg_6/);
+  assert.doesNotMatch(reasonOf(r).detail, /turn msg_8 got/);
+});
+
+test('OQ-20 t_twoToolsCutMid1: the CLI ran tool #0 but dropped the half-streamed tool #1 (block never closed) → failed(provider_error)', async () => {
+  const read = (id: string): Record<string, unknown> => ({
+    type: 'assistant',
+    message: { id: 'msg_3', model: 'claude-sonnet-4-6', role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: 'inside.txt' } }], stop_reason: null },
+    parent_tool_use_id: null,
+  });
+  const readResult = (id: string): Record<string, unknown> => ({
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: '1\tinside' }] },
+    parent_tool_use_id: null,
+  });
+  const cutMid = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_3'),
+    toolStart(0, 'toolu_main_0_0_1'),
+    read('toolu_main_0_0_1'),
+    blockStop(0),
+    toolStart(1, 'toolu_main_0_1_2'),
+    readResult('toolu_main_0_0_1'),
+    ...fullTextTurn('msg_4', 'All done, monkeys! Magnificent.'),
+    { ...successResult, num_turns: 2 },
+  ]);
+  assert.equal(cutMid.status, 'failed', JSON.stringify(cutMid));
+  assert.match(reasonOf(cutMid).detail, /msg_3 got no stop reason .*1 content block\(s\) never closed/);
+
+  // Control t_toolBlockCut: every opened block closed and the CLI executed the
+  // tool — the CLI accepted the turn; the next turn completes the run.
+  const blockCut = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_3'),
+    toolStart(0, 'toolu_main_0_0_1'),
+    read('toolu_main_0_0_1'),
+    blockStop(0),
+    readResult('toolu_main_0_0_1'),
+    ...fullTextTurn('msg_4', 'All done, monkeys! Magnificent.'),
+    { ...successResult, num_turns: 2 },
+  ]);
+  assert.equal(blockCut.status, 'succeeded', JSON.stringify(blockCut));
+
+  // A closed tool_use the CLI never executed is still a truncated turn.
+  const notRun = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_3'),
+    toolStart(0, 'toolu_main_0_0_1'),
+    read('toolu_main_0_0_1'),
+    blockStop(0),
+    ...fullTextTurn('msg_4', 'All done'),
+    successResult,
+  ]);
+  assert.equal(notRun.status, 'failed', JSON.stringify(notRun));
+});
+
+test('OQ-20 D2 t_fallbackNsSameId: the non-streamed fallback under the dropped turn\'s own id completes that turn', async () => {
+  const dropped: Step[] = [init, statusRequesting, msgStart('msg_same'), textStart(0)];
+  const ok = await run([...dropped, mainText('msg_same', 'fallback ok', 'end_turn'), { ...successResult, result: 'fallback ok', num_turns: 1 }]);
+  assert.equal(ok.status, 'succeeded', JSON.stringify(ok));
+  assert.equal(ok.status === 'succeeded' && ok.summary, 'fallback ok');
+  // t_fallbackNsSameIdNull: the same-id fallback without a stop reason is not a completion.
+  const nul = await run([...dropped, mainText('msg_same', 'x'), { ...successResult, result: 'x', stop_reason: null, num_turns: 1 }]);
+  assert.equal(reasonOf(nul).code, 'provider_error');
+  // t_startStopEndTrunc: the CLI copies message_start's stop_reason into the
+  // turn's STREAMED messages; that copy is not a fallback completion.
+  const startStop = await run([
+    init,
+    statusRequesting,
+    se({ type: 'message_start', message: { id: 'msg_1', type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', content: [], stop_reason: 'end_turn' } }),
+    textStart(0),
+    mainText('msg_1', 'partial', 'end_turn'),
+    blockStop(0),
+    { ...successResult, result: 'partial', num_turns: 1 },
+  ]);
+  assert.equal(startStop.status, 'failed', JSON.stringify(startStop));
+  assert.match(reasonOf(startStop).detail, /final main-thread turn msg_1 got no stop reason/);
+});
+
+test('OQ-20 D3 t_noBlockStopEnd: end_turn arrives with a content block never closed (CLI dropped the text) → failed(provider_error)', async () => {
+  const r = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_1'),
+    textStart(0),
+    msgDelta('end_turn'),
+    msgStop,
+    { ...successResult, result: '', num_turns: 1 },
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.equal(reasonOf(r).code, 'provider_error');
+  assert.match(reasonOf(r).detail, /final main-thread turn msg_1 ended \(stop_reason "end_turn"\) with 1 content block\(s\) never closed/);
+});
+
+test('OQ-20 D3: a succeeded result never carries an empty summary', async () => {
+  for (const blank of ['', '   ']) {
+    const r = await run([init, ...fullTextTurn('msg_1', 'x'), { ...successResult, result: blank }]);
+    assert.equal(r.status, 'succeeded', JSON.stringify(r));
+    assert.equal(r.status === 'succeeded' && r.summary, NO_SUMMARY);
+  }
+});
+
+test('OQ-20: an empty turn abandoned for a NEW request (status requesting in between) is truncated; a stray duplicate message_start is not', async () => {
+  const abandoned = await run([init, statusRequesting, msgStart('msg_1'), ...fullTextTurn('msg_2', 'ok'), { ...successResult, result: 'ok' }]);
+  assert.equal(abandoned.status, 'failed', JSON.stringify(abandoned));
+  assert.match(reasonOf(abandoned).detail, /main-thread turn msg_1 got no stop reason/);
+  // t_dupStartOtherOk / t_preStartOk: two message_starts in one response.
+  const dup = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_1'),
+    msgStart('msg_other'),
+    textStart(0),
+    mainText('msg_other', 'ok'),
+    blockStop(0),
+    msgDelta('end_turn'),
+    msgStop,
+    { ...successResult, result: 'ok', num_turns: 1 },
+  ]);
+  assert.equal(dup.status, 'succeeded', JSON.stringify(dup));
+});
+
+test('OQ-20: a non-streamed message after a NEW request does not complete an earlier abandoned turn', async () => {
+  const r = await run([
+    init,
+    ...cutTextTurn('msg_1', 'partial'),
+    statusRequesting,
+    mainText('msg_9', 'done', 'end_turn'),
+    { ...successResult, result: 'done' },
+  ]);
+  assert.equal(r.status, 'failed', JSON.stringify(r));
+  assert.match(reasonOf(r).detail, /main-thread turn msg_1 got no stop reason.*superseded by non-streamed main-thread message msg_9/);
+});
+
+test('OQ-20: a mid-run truncation keeps a later, more specific failure code and adds its detail', async () => {
+  // A later segment that hits an is_error result keeps executor_error and
+  // gains the truncated-turn detail.
+  const failedLater = await run([
+    ...bgLaunch,
+    ...cutTextTurn('msg_4', 'partial'),
+    ...bgFinish,
+    statusRequesting,
+    msgStart('msg_5'),
+    {
+      type: 'assistant',
+      message: { id: 'syn', model: '<synthetic>', role: 'assistant', content: [{ type: 'text', text: 'API Error: Overloaded' }], stop_reason: 'stop_sequence' },
+      parent_tool_use_id: null,
+    },
+    { type: 'result', subtype: 'success', is_error: true, result: 'API Error: Overloaded', stop_reason: 'stop_sequence', permission_denials: [] },
+  ]);
+  assert.equal(failedLater.status, 'failed');
+  assert.equal(reasonOf(failedLater).code, 'executor_error');
+  assert.match(reasonOf(failedLater).detail, /truncated\): main-thread turn msg_4/);
+});
+
+test('OQ-20 controls: background wake-ups, fallbacks and executed tool turns still succeed', async () => {
+  // t_bgTwoWakes / t_pairSlowSubOk: complete turns in every segment.
+  const wakes = await run([
+    ...bgLaunch,
+    ...fullTextTurn('msg_6', 'waiting'),
+    ...bgFinish,
+    ...fullTextTurn('msg_7', 'one done'),
+    ...bgFinish,
+    ...fullTextTurn('msg_8', 'both done'),
+    segmentResult('both done'),
+  ]);
+  assert.equal(wakes.status, 'succeeded', JSON.stringify(wakes));
+  // maindropmidrecover / t_midText: dropped stream, non-streamed fallback (new id).
+  const fb = await run([init, statusRequesting, msgStart('msg_1'), textStart(0), mainText('msg_2', 'recovered', 'end_turn'), { ...successResult, result: 'recovered', num_turns: 1 }]);
+  assert.equal(fb.status, 'succeeded', JSON.stringify(fb));
+  // t_turn2Fallback: tool turn, then a dropped turn recovered by the fallback.
+  const turn2 = await run([
+    init,
+    ...streamedAgentCall,
+    taskStarted,
+    taskNotification('completed'),
+    agentToolResult('sub done'),
+    statusRequesting,
+    msgStart('msg_4'),
+    textStart(0),
+    mainText('msg_5', 'fallback ok', 'end_turn'),
+    { ...successResult, result: 'fallback ok' },
+  ]);
+  assert.equal(turn2.status, 'succeeded', JSON.stringify(turn2));
+  // A fallback that itself returns a tool_use turn, executed, then a complete turn.
+  const toolFb = await run([
+    init,
+    statusRequesting,
+    msgStart('msg_2'),
+    toolStart(0, 'toolu_main_0_0_1'),
+    {
+      type: 'assistant',
+      message: { id: 'msg_4', model: 'claude-sonnet-4-6', role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_main_0_0_3', name: 'Read', input: {} }], stop_reason: 'tool_use' },
+      parent_tool_use_id: null,
+    },
+    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_main_0_0_3', content: 'x' }] }, parent_tool_use_id: null },
+    ...fullTextTurn('msg_5', 'All done, monkeys! Magnificent.'),
+    successResult,
+  ]);
+  assert.equal(toolFb.status, 'succeeded', JSON.stringify(toolFb));
 });
