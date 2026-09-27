@@ -16,7 +16,10 @@
 // policy broker (`authorizeMcpDispatch`) BEFORE the handler runs, and only the
 // servers on the charter-derived policy allowlist are built. A denied dispatch
 // returns isError text and the handler is never invoked. The broker is
-// mandatory — there is no unbrokered constructor.
+// mandatory — there is no unbrokered constructor. Its `policy` and `hooks`
+// are read as OWN properties once, when a tool is built (M1 pre-flight D-B3):
+// the production broker `{ policy }` has no own `hooks`, and an inherited one
+// must never approve a dispatch.
 
 import { z } from 'zod';
 import { createSdkMcpServer, tool, type McpServerConfig } from '@anthropic-ai/claude-agent-sdk';
@@ -28,7 +31,11 @@ import { logger } from './logger.js';
 import {
   ToolPolicyError,
   authorizeMcpDispatch,
+  captureOwnData,
   derivePolicy,
+  ownString,
+  ownValue,
+  resolveEnforcementHooks,
   type ExecutionPolicy,
   type SdkEnforcementHooks,
 } from './tool-policy.js';
@@ -60,12 +67,25 @@ export function brokered<A extends Record<string, unknown>>(
   tool: string,
   run: (args: A) => Promise<McpToolResult>,
 ): (args: A) => Promise<McpToolResult> {
+  // Captured ONCE, as OWN properties, when the tool is built (M1 pre-flight
+  // D-B3): the production broker is `{ policy }` with no own `hooks`, and
+  // `broker.hooks ?? {}` used to read a polluted `Object.prototype.hooks`
+  // (`{ approver }`) at every dispatch. A broker without an own policy
+  // denies every dispatch.
+  const policy = ownValue(broker, 'policy') as ExecutionPolicy | undefined;
+  const hooks = resolveEnforcementHooks(ownValue(broker, 'hooks') as SdkEnforcementHooks | undefined);
   return async (args: A) => {
-    const decision = await authorizeMcpDispatch(broker.policy, server, tool, args, broker.hooks ?? {});
+    if (!policy || typeof policy !== 'object') {
+      return {
+        content: [{ type: 'text', text: 'Denied by Skippy tool policy (invalid_context): the MCP broker has no policy' }],
+        isError: true,
+      };
+    }
+    const decision = await authorizeMcpDispatch(policy, server, tool, args, hooks);
     if (!decision.allow) {
       logger.warn({
         msg: 'MCP dispatch denied by tool policy',
-        agent: broker.policy.agentId,
+        agent: policy.agentId,
         tool: `${server}.${tool}`,
         code: decision.code,
       });
@@ -80,8 +100,15 @@ export function brokered<A extends Record<string, unknown>>(
 
 /** Read the charter's `mcp_servers:` array (kept as raw strings by charter.ts). */
 export function requestedMcpServers(charter: Charter): string[] {
-  const raw = charter.frontmatter['mcp_servers'];
-  return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : [];
+  const raw = ownValue(ownValue(charter, 'frontmatter'), 'mcp_servers');
+  if (!Array.isArray(raw)) return [];
+  let items: unknown[];
+  try {
+    items = captureOwnData<unknown[]>(raw);
+  } catch {
+    return [];
+  }
+  return items.filter((x): x is string => typeof x === 'string');
 }
 
 /**
@@ -143,15 +170,15 @@ export function buildObsidianServer(vaultRoot: string, broker: McpBroker): McpSe
 /** Pull the board's Letta binding (letta_agent_id) + short board id from the
  * charter's nested `memory:` stanza. Returns null when no agent id is declared. */
 function lettaBindings(charter: Charter): { agentId: string; board: string } | null {
-  const mem = charter.frontmatter['memory'];
-  const agentId =
-    mem && typeof mem === 'object' && 'letta_agent_id' in mem
-      ? String((mem as Record<string, unknown>).letta_agent_id)
-      : '';
+  // Own-property reads (D-B3): `'letta_agent_id' in mem` also matched an
+  // inherited (polluted) binding.
+  const mem = ownValue(ownValue(charter, 'frontmatter'), 'memory');
+  const raw = mem && typeof mem === 'object' ? ownValue(mem, 'letta_agent_id') : undefined;
+  const agentId = typeof raw === 'string' || typeof raw === 'number' ? String(raw) : '';
   if (!agentId) return null;
-  const board = charter.agentId.startsWith('board.')
-    ? charter.agentId.slice('board.'.length)
-    : charter.agentId;
+  const who = ownString(charter, 'agentId');
+  if (who === undefined) return null;
+  const board = who.startsWith('board.') ? who.slice('board.'.length) : who;
   return { agentId, board };
 }
 
@@ -234,7 +261,10 @@ export async function buildMcpServers(
       return {};
     }
   }
-  const requested = requestedMcpServers(charter).filter((name) => effective.policy.mcpServers.includes(name));
+  const effectivePolicy = ownValue(effective, 'policy') as ExecutionPolicy | undefined;
+  if (!effectivePolicy || typeof effectivePolicy !== 'object') return {};
+  const allowed = effectivePolicy.mcpServers;
+  const requested = requestedMcpServers(charter).filter((name) => allowed.includes(name));
   const servers: Record<string, McpServerConfig> = {};
 
   for (const name of requested) {

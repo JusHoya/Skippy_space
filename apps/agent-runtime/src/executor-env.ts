@@ -122,7 +122,14 @@
 //      which git applies with command-line precedence over every file and
 //      include (`EXECUTOR_GIT_CONFIG_OVERRIDES`): `core.fsmonitor=false`,
 //      `core.hooksPath=<support>/git/hooks` (empty), `core.untrackedCache=false`,
-//      `core.pager=cat`. Filter drivers cannot be pinned generically (their
+//      `core.pager=cat`, `safe.bareRepository=explicit` (D-A1: an implicit
+//      bare layout — HEAD + objects/ + refs/ in an ordinary directory — is
+//      never discovered, so its `config` is never loaded; the command scope
+//      is protected configuration, so git honours it from the env; verified
+//      on git 2.45, normal repos / linked worktrees unaffected). With git
+//      instructions disabled the only git the CLI 2.1.162 still spawns is
+//      `git config --get remote.origin.url` (M1 pre-flight trace), which
+//      reads config and runs nothing. Filter drivers cannot be pinned generically (their
 //      names are arbitrary); a driver a USER configured in their own repo is
 //      that user's own command (looked up on the sidecar's PATH, never a
 //      board-writable file) and the startup status that would trigger it is
@@ -253,6 +260,13 @@ export const EXECUTOR_GIT_CONFIG_OVERRIDES: ReadonlyArray<readonly [key: string,
     ['core.hooksPath', 'hooksPath'],
     ['core.untrackedCache', 'false'],
     ['core.pager', 'cat'],
+    // D-A1: an implicit bare repository (a directory holding HEAD + objects/
+    // + refs/, e.g. one a board assembled from ordinary files) is never
+    // discovered; only `--git-dir`/`GIT_DIR` could select one. Honoured from
+    // the command scope (GIT_CONFIG_COUNT is command scope, which git treats
+    // as protected configuration). Normal repos, linked worktrees and
+    // submodule gitdirs are unaffected (verified, git 2.45).
+    ['safe.bareRepository', 'explicit'],
   ] as const);
 
 /**
@@ -273,6 +287,14 @@ export function executorConfigBase(tmp: string = os.tmpdir()): string {
 export function legacyExecutorDirs(tmp: string = os.tmpdir()): string[] {
   const base = path.join(path.resolve(tmp), 'skippy-agent-runtime');
   return [path.join(base, 'claude-config'), path.join(base, 'no-root')];
+}
+
+/** fs options as a null-prototype record (M1 pre-flight D-B2): Node reads
+ * option fields (`recursive`, `mode`, `flag`, `signal`, …) through the
+ * prototype chain, so a polluted `Object.prototype` must not reach the
+ * per-run directory's creation, permissions or removal. */
+function fsOptions<T extends object>(o: T): T {
+  return Object.assign(Object.create(null) as T, o);
 }
 
 function realpathOrSelf(p: string): string {
@@ -364,13 +386,13 @@ function runOwnerAlive(configDir: string): boolean {
  * Returns the real long path of the config directory.
  */
 export function createExecutorConfigDir(base: string = executorConfigBase()): string {
-  mkdirSync(base, { recursive: true, mode: 0o700 });
+  mkdirSync(base, fsOptions({ recursive: true, mode: 0o700 }));
   const dir = realpathOrSelf(mkdtempSync(path.join(base, EXECUTOR_CONFIG_DIR_PREFIX)));
   const git = executorGitPaths(dir);
-  mkdirSync(noRootWorkingDirectory(dir), { recursive: true, mode: 0o700 });
-  mkdirSync(git.hooks, { recursive: true, mode: 0o700 });
-  writeFileSync(git.config, '', { mode: 0o600 });
-  writeFileSync(runPidFile(dir), `${process.pid}\n`, { mode: 0o600 });
+  mkdirSync(noRootWorkingDirectory(dir), fsOptions({ recursive: true, mode: 0o700 }));
+  mkdirSync(git.hooks, fsOptions({ recursive: true, mode: 0o700 }));
+  writeFileSync(git.config, '', fsOptions({ mode: 0o600 }));
+  writeFileSync(runPidFile(dir), `${process.pid}\n`, fsOptions({ mode: 0o600 }));
   activeRuns.add(runKey(dir));
   return dir;
 }
@@ -395,7 +417,7 @@ export async function removeExecutorConfigDir(
   for (;;) {
     for (const t of targets) {
       try {
-        rmSync(t, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        rmSync(t, fsOptions({ recursive: true, force: true, maxRetries: 3, retryDelay: 100 }));
       } catch {
         /* retried below */
       }
@@ -437,9 +459,16 @@ export function sweepExecutorState(opts: {
   now?: number;
   maxAgeMs?: number;
 } = {}): ExecutorSweepResult {
-  const base = opts.base ?? executorConfigBase();
-  const now = opts.now ?? Date.now();
-  const maxAgeMs = opts.maxAgeMs ?? EXECUTOR_STALE_RUN_MS;
+  // Own-property option reads (D-B2): an inherited `base` must never point
+  // the sweep at another directory.
+  const ownOpt = (k: 'base' | 'tmp' | 'now' | 'maxAgeMs'): unknown => (Object.hasOwn(opts, k) ? opts[k] : undefined);
+  const baseOpt = ownOpt('base');
+  const nowOpt = ownOpt('now');
+  const ageOpt = ownOpt('maxAgeMs');
+  const tmpOpt = ownOpt('tmp');
+  const base = typeof baseOpt === 'string' ? baseOpt : executorConfigBase();
+  const now = typeof nowOpt === 'number' ? nowOpt : Date.now();
+  const maxAgeMs = typeof ageOpt === 'number' ? ageOpt : EXECUTOR_STALE_RUN_MS;
   const result: ExecutorSweepResult = { removed: [], skipped: [] };
   const removeRealDir = (p: string, minAge: number): void => {
     let st: ReturnType<typeof lstatSync>;
@@ -457,7 +486,7 @@ export function sweepExecutorState(opts: {
       return;
     }
     try {
-      rmSync(p, { recursive: true, force: true, maxRetries: 2, retryDelay: 50 });
+      rmSync(p, fsOptions({ recursive: true, force: true, maxRetries: 2, retryDelay: 50 }));
       result.removed.push(p);
     } catch {
       result.skipped.push(p);
@@ -481,7 +510,7 @@ export function sweepExecutorState(opts: {
     }
     removeRealDir(full, maxAgeMs);
   }
-  for (const legacy of legacyExecutorDirs(opts.tmp)) removeRealDir(legacy, 0);
+  for (const legacy of legacyExecutorDirs(typeof tmpOpt === 'string' ? tmpOpt : undefined)) removeRealDir(legacy, 0);
   return result;
 }
 

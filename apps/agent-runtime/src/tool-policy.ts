@@ -90,6 +90,13 @@
 //      or anywhere else in the process) cannot substitute a guard or an
 //      approver (M1 pre-flight D-B); observer snapshots are deep copies into
 //      null-prototype objects (no `constructor` route back to a prototype).
+//      More generally (M1 pre-flight final, D-B1..D-B3; see "Own-property
+//      access" below for the threat model): EVERY decision input is read as
+//      an own property or captured once into frozen null-prototype records
+//      — the charter and the context (`derivePolicy`), tool calls, SDK hook
+//      inputs and permission options, and every internal result whose
+//      fields are tested (decisions, `pathField`, guard verdicts) — so
+//      `Object.prototype` pollution cannot supply a missing field.
 //      Git metadata is NEVER board-writable (`gitMetadataRejection`, D-A):
 //      the CLI runs `git status` in the worktree at startup and the repo
 //      configuration decides what that executes (executor-env.ts), so a
@@ -97,7 +104,12 @@
 //      inside a `.git` segment at any depth (directory or file), the gitdir a
 //      write root's `.git` file/link points to (and its `commondir`), or is
 //      named `.gitattributes`, `.gitmodules` or `.gitconfig`, is denied
-//      (`git_metadata`) before any guard runs. `.gitignore` stays writable
+//      (`git_metadata`) before any guard runs. So is a file named `HEAD`
+//      (any case) and anything inside a directory, up to and including the
+//      write root, that holds a `HEAD` entry (D-A1/D-A2): that is how a
+//      bare-repo layout (HEAD + objects/ + refs/) is assembled, and how a
+//      nested repo's gitdir that a `.git` FILE elsewhere points to is
+//      recognised whatever it is named. `.gitignore` stays writable
 //      (it selects files, it cannot run code), and reads of git metadata
 //      stay allowed (the repo is in the board's read scope; embedded tokens
 //      in remote URLs are OQ-17 content-level exposure). Bash is approval-
@@ -398,16 +410,140 @@ export function unassignedNoRootCwd(): string {
   return path.join(executorConfigBase(), 'no-root-unassigned');
 }
 
-function fail(code: ToolPolicyErrorCode, charter: Charter, msg: string): never {
+// ──────────────────────────────────────────────────────────────────────────────
+// Own-property access (M1 pre-flight D-B2/D-B3: no decision input is ever read
+// through the prototype chain)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Threat model (OQ-22): code running inside the sidecar process (observers,
+// libraries) is trusted — replacing a built-in METHOD (`Object.hasOwn`,
+// `Array.prototype.includes`, `String.prototype.toLowerCase`, a function-
+// valued `Object.prototype.then` that hijacks every promise resolution) is
+// out of scope without process isolation. What IS guaranteed: no agent-
+// supplied data and no prototype POLLUTION (a new property on
+// `Object.prototype` / `Array.prototype` / `Function.prototype` / …, data or
+// function valued, e.g. from a naive deep merge somewhere in the process) can
+// change a decision. By construction: every decision input — charter
+// frontmatter, execution context, run parameters, enforcement hooks, tool
+// inputs, hook inputs, SDK messages — is read with `ownValue` (or captured
+// once with `captureOwnData` into null-prototype records), and every internal
+// result whose fields are tested is a null-prototype record (`nullRecord`)
+// so an absent field is `undefined`, never inherited.
+
+/** Own-property read that never consults the prototype chain and never
+ * throws (a non-object, a hostile getter or proxy trap yields `undefined`).
+ * Decision code treats `undefined` as "absent", which always fails closed. */
+export function ownValue(o: unknown, k: string): unknown {
+  try {
+    if (o === null || (typeof o !== 'object' && typeof o !== 'function')) return undefined;
+    return Object.hasOwn(o, k) ? (o as Record<string, unknown>)[k] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `ownValue` narrowed to a string. */
+export function ownString(o: unknown, k: string): string | undefined {
+  const v = ownValue(o, k);
+  return typeof v === 'string' ? v : undefined;
+}
+
+/** A frozen NULL-PROTOTYPE copy of `fields`' own enumerable properties: an
+ * absent field reads as `undefined`, never as an inherited value. */
+export function nullRecord<T extends object>(fields: T): T {
+  return Object.freeze(Object.assign(Object.create(null) as T, fields));
+}
+
+/** Nesting beyond this is refused, not truncated (`captureOwnData`). */
+const MAX_CAPTURE_DEPTH = 256;
+
+/**
+ * Deep copy of a plain data value that reads ONLY own enumerable string-keyed
+ * properties (`Object.keys`): objects become null-prototype records, arrays
+ * become dense arrays (ordinary `Array.prototype`, so iteration still works;
+ * indexes are all own), functions and symbols are dropped. With `freeze` the
+ * copy is deeply frozen. THROWS on nesting deeper than MAX_CAPTURE_DEPTH and
+ * propagates a hostile getter's exception: a caller that decides must treat
+ * a throw as a refusal.
+ */
+export function captureOwnData<T = unknown>(v: unknown, freeze = true, depth = 0): T {
+  if (typeof v === 'function' || typeof v === 'symbol') return undefined as T;
+  if (v === null || typeof v !== 'object') return v as T;
+  if (depth > MAX_CAPTURE_DEPTH) throw new Error(`data nested deeper than ${MAX_CAPTURE_DEPTH} levels`);
+  if (Array.isArray(v)) {
+    const arr: unknown[] = [];
+    const n = v.length;
+    for (let i = 0; i < n; i++) arr.push(captureOwnData(Object.hasOwn(v, i) ? (v as unknown[])[i] : undefined, freeze, depth + 1));
+    return (freeze ? Object.freeze(arr) : arr) as T;
+  }
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const k of Object.keys(v)) {
+    const val = (v as Record<string, unknown>)[k];
+    if (typeof val === 'function' || typeof val === 'symbol') continue;
+    out[k] = captureOwnData(val, freeze, depth + 1);
+  }
+  return (freeze ? Object.freeze(out) : out) as T;
+}
+
+/** The charter as `derivePolicy` sees it: captured ONCE, own properties
+ * only, into a frozen null-prototype record (frontmatter deep-captured). */
+interface CapturedCharter {
+  readonly agentId: string;
+  readonly path: string;
+  readonly loaded: boolean;
+  readonly frontmatter: Readonly<Record<string, unknown>>;
+}
+
+function captureCharter(charter: unknown): CapturedCharter {
+  const agentId = ownString(charter, 'agentId');
+  const where = ownString(charter, 'path') ?? '(unknown path)';
+  const id = agentId ?? '(unknown agent)';
+  // `loaded` must be an OWN `true`: an inherited or absent flag is "not loaded".
+  const loaded = agentId !== undefined && ownValue(charter, 'loaded') === true;
+  let frontmatter: Readonly<Record<string, unknown>> = nullRecord({});
+  if (loaded) {
+    const raw = ownValue(charter, 'frontmatter');
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new ToolPolicyError('invalid_charter_key', id, `charter frontmatter must be a mapping (charter: ${where})`);
+    }
+    try {
+      frontmatter = captureOwnData<Record<string, unknown>>(raw);
+    } catch (err) {
+      throw new ToolPolicyError('invalid_charter_key', id, `charter frontmatter cannot be captured: ${String(err)} (charter: ${where})`);
+    }
+  }
+  return nullRecord({ agentId: id, path: where, loaded, frontmatter });
+}
+
+/** The execution context, captured once (own properties only). */
+interface CapturedContext {
+  readonly worktreePath: unknown;
+  readonly projectRoot: unknown;
+  readonly cwd: unknown;
+  readonly noRootCwd: unknown;
+  readonly networkAllowedHosts: unknown;
+}
+
+function captureContext(ctx: unknown): CapturedContext {
+  return nullRecord({
+    worktreePath: ownValue(ctx, 'worktreePath'),
+    projectRoot: ownValue(ctx, 'projectRoot'),
+    cwd: ownValue(ctx, 'cwd'),
+    noRootCwd: ownValue(ctx, 'noRootCwd'),
+    networkAllowedHosts: ownValue(ctx, 'networkAllowedHosts'),
+  });
+}
+
+function fail(code: ToolPolicyErrorCode, charter: Pick<CapturedCharter, 'agentId' | 'path'>, msg: string): never {
   throw new ToolPolicyError(code, charter.agentId, `${msg} (charter: ${charter.path})`);
 }
 
 function stringList(
-  charter: Charter,
+  charter: CapturedCharter,
   key: string,
   code: ToolPolicyErrorCode,
 ): string[] {
-  const raw = charter.frontmatter[key];
+  const raw = ownValue(charter.frontmatter, key);
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) fail(code, charter, `\`${key}\` must be a list, got ${JSON.stringify(raw)}`);
   const out: string[] = [];
@@ -446,8 +582,8 @@ function isCataloguedDisallowEntry(d: string): boolean {
   return tool === '*' || Object.hasOwn(tools, tool);
 }
 
-function parsePermissionMode(charter: Charter): Exclude<CharterPermissionMode, 'default'> {
-  const raw = charter.frontmatter['permission_mode'];
+function parsePermissionMode(charter: CapturedCharter): Exclude<CharterPermissionMode, 'default'> {
+  const raw = ownValue(charter.frontmatter, 'permission_mode');
   // Missing => the restrictive interactive mode ('ask'): approval-required
   // classes are denied until an approver grants them.
   if (raw === undefined || raw === null) return 'ask';
@@ -471,16 +607,16 @@ function parsePermissionMode(charter: Charter): Exclude<CharterPermissionMode, '
   return raw === 'default' ? 'ask' : (raw as Exclude<CharterPermissionMode, 'default'>);
 }
 
-function vaultScopes(charter: Charter): string[] {
-  const mem = charter.frontmatter['memory'];
+function vaultScopes(charter: CapturedCharter): string[] {
+  const mem = ownValue(charter.frontmatter, 'memory');
   if (!mem || typeof mem !== 'object' || Array.isArray(mem)) return [];
-  const sub = (mem as Record<string, unknown>)['vault_subdir'];
+  const sub = ownValue(mem, 'vault_subdir');
   if (typeof sub !== 'string' || sub.trim() === '') return [];
   const norm = normalizeVaultRelative(sub);
   return norm === null || norm === '' ? [] : [norm.endsWith('/') ? norm : `${norm}/`];
 }
 
-function requireAbsolute(charter: Charter, label: string, p: string | undefined): string | undefined {
+function requireAbsolute(charter: CapturedCharter, label: string, p: unknown): string | undefined {
   if (p === undefined) return undefined;
   if (typeof p !== 'string' || p === '' || !path.isAbsolute(p)) {
     fail('invalid_context', charter, `${label} must be an absolute path, got ${JSON.stringify(p)}`);
@@ -543,7 +679,7 @@ export function rootRejection(
   return null;
 }
 
-function requireRoot(charter: Charter, label: string, p: string | undefined): string | undefined {
+function requireRoot(charter: CapturedCharter, label: string, p: unknown): string | undefined {
   const abs = requireAbsolute(charter, label, p);
   if (abs === undefined) return undefined;
   const why = rootRejection(abs);
@@ -567,7 +703,7 @@ function requireRoot(charter: Charter, label: string, p: string | undefined): st
  *     like, or is within edit distance 2 of an authority key is refused —
  *     authority is top-level only.
  */
-function checkCharterKeys(charter: Charter): void {
+function checkCharterKeys(charter: CapturedCharter): void {
   const visit = (value: unknown, depth: number, trail: string): void => {
     if (Array.isArray(value)) {
       value.forEach((v, i) => visit(v, depth + 1, `${trail}[${i}]`));
@@ -618,7 +754,12 @@ function checkCharterKeys(charter: Charter): void {
  * on any unknown/invalid authority field — callers must treat that as
  * "ineligible to run", never as "run unrestricted".
  */
-export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): ExecutionPolicy {
+export function derivePolicy(charterIn: Charter, ctxIn: PolicyContext = {}): ExecutionPolicy {
+  // Freeze-by-construction (D-B2): the charter and the context are read ONCE,
+  // as own properties, into frozen null-prototype records; nothing below
+  // reads the caller's objects (or any prototype) again.
+  const charter = captureCharter(charterIn);
+  const ctx = captureContext(ctxIn);
   if (!charter.loaded) {
     fail('charter_not_loaded', charter, 'charter file was not loaded; a placeholder charter grants no authority');
   }
@@ -689,7 +830,17 @@ export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): Executi
     cwd = noRoot ?? unassignedNoRootCwd();
   }
 
-  const hosts = (ctx.networkAllowedHosts ?? []).map((h) => h.trim().toLowerCase());
+  // Captured (own indexes only: a hole never reads an inherited element).
+  let rawHosts: unknown;
+  try {
+    rawHosts = captureOwnData(ctx.networkAllowedHosts);
+  } catch {
+    rawHosts = null;
+  }
+  if (rawHosts !== undefined && (!Array.isArray(rawHosts) || rawHosts.some((h) => typeof h !== 'string'))) {
+    fail('invalid_context', charter, 'networkAllowedHosts must be a list of hostnames');
+  }
+  const hosts = ((rawHosts ?? []) as readonly string[]).map((h) => h.trim().toLowerCase());
   for (const h of hosts) {
     if (h === '' || h === '*' || h.includes('/') || h.includes('*')) {
       fail('invalid_context', charter, `network host "${h}" must be an explicit hostname (no wildcards)`);
@@ -819,17 +970,20 @@ export function resolveEnforcementHooks(hooks: SdkEnforcementHooks | undefined):
   return Object.freeze(resolved);
 }
 
+/** Decisions are frozen null-prototype records: a field a branch does not set
+ * (`actionClass` on some denials, `approved`/`code` across the union) reads
+ * as `undefined`, never as a polluted inherited value. */
 function deny(code: DenyCode, reason: string, actionClass?: ActionClass): PolicyDecision {
-  return actionClass ? { allow: false, code, reason, actionClass } : { allow: false, code, reason };
+  return nullRecord(actionClass ? { allow: false as const, code, reason, actionClass } : { allow: false as const, code, reason });
 }
 
 /** Split `mcp__server__tool` into its parts; null when not an MCP tool name. */
 export function parseMcpToolName(name: string): { server: string; tool: string } | null {
-  if (!name.startsWith('mcp__')) return null;
+  if (typeof name !== 'string' || !name.startsWith('mcp__')) return null;
   const rest = name.slice('mcp__'.length);
   const sep = rest.indexOf('__');
   if (sep <= 0 || sep + 2 >= rest.length) return null;
-  return { server: rest.slice(0, sep), tool: rest.slice(sep + 2) };
+  return nullRecord({ server: rest.slice(0, sep), tool: rest.slice(sep + 2) });
 }
 
 export function mcpToolName(server: string, tool: string): string {
@@ -847,9 +1001,24 @@ function isDisallowed(policy: ExecutionPolicy, name: string, canonical: string):
 }
 
 /** Own-property read of a tool input field: never the prototype chain, so a
- * polluted `Object.prototype` cannot supply (or hide) an argument. */
+ * polluted `Object.prototype` cannot supply (or hide) an argument. Unlike
+ * `ownValue` it lets a hostile getter's exception propagate: the gates turn
+ * that into an explicit deny (M0-G07), never into "field absent". */
 function own(input: Record<string, unknown>, key: string): unknown {
   return Object.hasOwn(input, key) ? input[key] : undefined;
+}
+
+/** `own` for an SDK hook input / permission-options object (throws on a
+ * hostile getter; the gate's catch turns that into a fail-closed output). */
+function hookField(o: object, key: string): unknown {
+  return Object.hasOwn(o, key) ? (o as Record<string, unknown>)[key] : undefined;
+}
+
+/** Enumerate `o`'s own keys, so an object that cannot be inspected (a proxy
+ * whose traps throw) throws HERE and the gate fails closed, instead of
+ * reading as an object with no own properties. Non-objects pass. */
+function assertInspectable(o: unknown): void {
+  if (o !== null && typeof o === 'object') Object.keys(o);
 }
 
 function str(input: Record<string, unknown>, key: string): string | undefined {
@@ -1299,6 +1468,8 @@ function globRootFor(alt: string, searchBase: string): string {
 // MAX_SCAN_ENTRIES entries (a pnpm `node_modules`) — is denied and the model
 // is told to narrow `path` to a subtree without credential files (OQ-18).
 
+const READDIR_OPTIONS = nullRecord({ withFileTypes: true as const, recursive: false, encoding: 'utf8' as const });
+
 export const MAX_SCAN_ENTRIES = 25_000;
 export const MAX_SCAN_DEPTH = 40;
 
@@ -1338,7 +1509,10 @@ export function scanForCredentials(root: string): CredentialScanResult {
     }
     let entries: import('node:fs').Dirent[];
     try {
-      entries = readdirSync(cur.abs, { withFileTypes: true });
+      // Null-prototype options (D-B2): Node reads `options.signal` /
+      // `encoding` / `recursive` through the chain, so a polluted
+      // `Object.prototype.recursive` would change what is enumerated.
+      entries = readdirSync(cur.abs, READDIR_OPTIONS);
     } catch (err) {
       return { ok: false, reason: `cannot enumerate ${cur.abs}: ${String(err)}` };
     }
@@ -1387,7 +1561,7 @@ function searchTreeRejection(label: string, abs: string): string | null {
 
 type ArgCheck = { ok: true } | { ok: false; code: DenyCode; reason: string };
 
-const argOk: ArgCheck = { ok: true };
+const argOk: ArgCheck = nullRecord({ ok: true as const });
 
 /** Exact-field allowlist for a catalogued built-in. */
 function checkInputFields(canonical: string, input: Record<string, unknown>): ArgCheck {
@@ -1512,6 +1686,12 @@ export function gitMetadataRejection(p: string, writeRoots: readonly string[]): 
     if (last !== undefined && GIT_METADATA_BASENAMES.has(last.toLowerCase())) {
       return `${form}: "${last}" is git metadata (attributes, submodules or config); never board-writable`;
     }
+    // D-A1: `HEAD` is the one file every git directory needs (with `objects/`
+    // and `refs/`); a board that could write it could assemble a bare-repo
+    // layout that ambient git discovers and whose `config` it then loads.
+    if (last !== undefined && last.toLowerCase() === 'head') {
+      return `${form}: "${last}" can make its directory a git repository (HEAD + objects/ + refs/); never board-writable`;
+    }
   }
   for (const root of writeRoots) {
     for (const target of gitDirTargets(path.resolve(root))) {
@@ -1520,7 +1700,45 @@ export function gitMetadataRejection(p: string, writeRoots: readonly string[]): 
       }
     }
   }
+  // D-A1/D-A2: a directory inside a write root that holds a `HEAD` entry is
+  // (or can become, by adding `objects/` + `refs/`) a git directory — a
+  // nested repo's gitdir that a `.git` FILE elsewhere points to, a gitdir not
+  // named `.git`, or a bare layout under construction. Nothing inside it (its
+  // `config`, `info/attributes`, `hooks/`, `objects/`, `refs/`) is
+  // board-writable. Fail closed: the HEAD entry alone decides (any type), on
+  // every ancestor of the target up to and including the root, literal and
+  // real forms.
+  for (const root of writeRoots) {
+    const r = path.resolve(root);
+    for (const rf of new Set([r, realish(r)])) {
+      for (const form of forms) {
+        if (!contains(rf, form) || key(rf) === key(form)) continue;
+        let dir = path.dirname(form);
+        for (let i = 0; i < 4096; i++) {
+          if (hasHeadEntry(dir)) {
+            return `${form} is inside ${dir}, which holds a HEAD entry (a git directory or a bare-repo layout); never board-writable`;
+          }
+          if (key(dir) === key(rf)) break;
+          const parent = path.dirname(dir);
+          if (parent === dir || !contains(rf, parent)) break;
+          dir = parent;
+        }
+      }
+    }
+  }
   return null;
+}
+
+/** True when `dir` holds an entry named `HEAD` (any type; `lstat`, never
+ * followed). On a case-insensitive file system any casing matches, as it
+ * does for git. */
+function hasHeadEntry(dir: string): boolean {
+  try {
+    lstatSync(path.join(dir, 'HEAD'));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Interpret one path argument and run it through the PathGuard. */
@@ -1537,9 +1755,16 @@ async function checkPathArg(
   if (cred) return { ok: false, code: 'credential_path', reason: `${label} "${raw}" (${r.path}) denied: ${cred}` };
   const state = executorStateRejection(r.path);
   if (state) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${state}` };
-  const g = await guard(r.path, roots, base);
+  const g = guardVerdict(await guard(r.path, roots, base));
   if (!g.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${g.reason}` };
   return argOk;
+}
+
+/** A PathGuard's result, read as OWN properties: only an own `ok === true`
+ * admits the path (an absent or inherited `ok` is a refusal). */
+function guardVerdict(g: unknown): { ok: boolean; reason: string } {
+  if (ownValue(g, 'ok') === true) return nullRecord({ ok: true, reason: '' });
+  return nullRecord({ ok: false, reason: ownString(g, 'reason') ?? 'path guard refused (no own ok: true)' });
 }
 
 /** Glob `pattern` (+ optional `path`) must stay inside the read roots.
@@ -1567,7 +1792,7 @@ async function checkGlobPattern(
     if (rootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${root}: ${rootCred}` };
     const rootState = executorStateRejection(root);
     if (rootState) return bad(`alternative "${alt}" searches ${root}: ${rootState}`);
-    const g = await guard(root, roots, searchBase);
+    const g = guardVerdict(await guard(root, roots, searchBase));
     if (!g.ok) return bad(`alternative "${alt}" searches ${root}: ${g.reason}`);
   }
   // F2 D2 / F3 / EC2: the tree rg walks is exactly the CLI's split of the RAW
@@ -1583,7 +1808,7 @@ async function checkGlobPattern(
   if (rgRootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${rgRoot}: ${rgRootCred}` };
   const rgRootState = executorStateRejection(rgRoot);
   if (rgRootState) return bad(`rg would search ${rgRoot}: ${rgRootState}`);
-  const g = await guard(rgRoot, roots, cwd);
+  const g = guardVerdict(await guard(rgRoot, roots, cwd));
   if (!g.ok) return bad(`rg would search ${rgRoot}: ${g.reason}`);
   const why = searchTreeRejection(`glob pattern "${pattern}"`, rgRoot);
   if (why) return { ok: false, code: 'credential_path', reason: why };
@@ -1625,30 +1850,38 @@ async function checkReadArgs(
 ): Promise<ArgCheck> {
   const roots = policy.readRoots;
   const base = policy.cwd;
-  const pathField = (k: string): { present: boolean; value?: string; bad?: ArgCheck } => {
-    if (!Object.hasOwn(input, k) || input[k] === undefined) return { present: false };
-    const v = input[k];
+  // D-B1: every field of the result is explicitly defined on a frozen
+  // null-prototype record, so `bad`/`value` can never be inherited from a
+  // polluted `Object.prototype` (an inherited `bad = {ok: true}` used to
+  // turn a Read outside the roots into an allow).
+  const pathField = (k: string): { present: boolean; value: string | undefined; bad: ArgCheck | undefined } => {
+    const v = own(input, k);
+    if (v === undefined) return nullRecord({ present: false, value: undefined, bad: undefined });
     if (typeof v !== 'string') {
-      return { present: true, bad: { ok: false, code: 'invalid_arguments', reason: `${canonical} \`${k}\` must be a string` } };
+      return nullRecord({
+        present: true,
+        value: undefined,
+        bad: nullRecord({ ok: false as const, code: 'invalid_arguments' as const, reason: `${canonical} \`${k}\` must be a string` }),
+      });
     }
-    return { present: true, value: v };
+    return nullRecord({ present: true, value: v, bad: undefined });
   };
   switch (canonical) {
     case 'Read': {
       const f = pathField('file_path');
-      if (f.bad) return f.bad;
+      if (f.bad !== undefined) return f.bad;
       if (!f.present || f.value === undefined || f.value.trim() === '') {
         return { ok: false, code: 'invalid_arguments', reason: 'Read requires a non-empty file_path' };
       }
       return checkPathArg('file_path', f.value, roots, base, guard);
     }
     case 'Glob': {
-      const pattern = input['pattern'];
+      const pattern = own(input, 'pattern');
       if (typeof pattern !== 'string' || pattern === '') {
         return { ok: false, code: 'invalid_arguments', reason: 'Glob requires a string pattern' };
       }
       const p = pathField('path');
-      if (p.bad) return p.bad;
+      if (p.bad !== undefined) return p.bad;
       let searchBase = base;
       if (p.value !== undefined) {
         const c = await checkPathArg('path', p.value, roots, base, guard);
@@ -1659,17 +1892,17 @@ async function checkReadArgs(
       return checkGlobPattern(pattern, p.value, base, searchBase, roots, guard);
     }
     case 'Grep': {
-      if (typeof input['pattern'] !== 'string') {
+      if (typeof own(input, 'pattern') !== 'string') {
         return { ok: false, code: 'invalid_arguments', reason: 'Grep requires a string pattern' };
       }
       const p = pathField('path');
-      if (p.bad) return p.bad;
+      if (p.bad !== undefined) return p.bad;
       // No `path` => rg searches the executor cwd; that implicit base must
       // pass the same root check (with no roots assigned it is denied).
       const c = await checkPathArg('path', p.value ?? '', roots, base, guard);
       if (!c.ok) return c;
       const g = pathField('glob');
-      if (g.bad) return g.bad;
+      if (g.bad !== undefined) return g.bad;
       if (g.value !== undefined) {
         const gc = checkGrepGlob(g.value);
         if (!gc.ok) return gc;
@@ -1722,9 +1955,15 @@ export async function evaluateToolCall(
   call: ToolCall,
   hooks: EnforcementHooks | ResolvedEnforcementHooks = {},
 ): Promise<PolicyDecision> {
-  const name = call.toolName;
+  // The call is read as OWN properties, once (D-B2): an absent `subagentId`
+  // or `input` is never inherited from a polluted prototype.
+  const name = ownValue(call, 'toolName');
+  if (typeof name !== 'string') return deny('invalid_arguments', 'tool name must be a string');
   const canonical = canonicalTool(name);
-  const input = call.input && typeof call.input === 'object' ? call.input : {};
+  const rawInput = ownValue(call, 'input');
+  const input: Record<string, unknown> =
+    rawInput && typeof rawInput === 'object' ? (rawInput as Record<string, unknown>) : nullRecord({});
+  const subagentId = ownValue(call, 'subagentId');
   // Own-property reads only, once (D-B): a resolved record is used as is.
   const resolved = resolveEnforcementHooks(hooks as SdkEnforcementHooks);
   const guard = resolved.pathGuard;
@@ -1816,7 +2055,7 @@ export async function evaluateToolCall(
       break;
     }
     case 'spawn': {
-      if (call.subagentId) {
+      if (subagentId) {
         return deny('no_grandchildren', 'task agents may not spawn agents (Skippy -> Board -> Task limit)', actionClass);
       }
       const mode = own(input, 'mode');
@@ -1847,7 +2086,7 @@ export async function evaluateToolCall(
   }
 
   // ── Approval ───────────────────────────────────────────────────────────────
-  const allow = (approved: boolean): PolicyDecision => ({ allow: true, actionClass, approved });
+  const allow = (approved: boolean): PolicyDecision => nullRecord({ allow: true as const, actionClass, approved });
   const need = networkPreapproved ? { needed: false, why: '' } : approvalNeeded(policy, actionClass);
   if (!need.needed) return allow(false);
   if (policy.permissionMode === 'dontAsk') {
@@ -1966,7 +2205,7 @@ export function requiredCapabilities(policy: ExecutionPolicy): (keyof Omit<Execu
   if (policy.mcpServers.length > 0) req.push('mcpAllowlist');
   // Exec is always approval-gated by this policy. If a future mode ever
   // auto-allows it, the executor must confine it natively.
-  if (policy.allowedTools.some((t) => BUILTIN_TOOL_CLASSES[t] === 'exec') && approvalNeeded(policy, 'exec').needed === false) {
+  if (policy.allowedTools.some((t) => builtinClass(t) === 'exec') && approvalNeeded(policy, 'exec').needed === false) {
     req.push('shellSandbox', 'networkEgressControl');
   }
   return req;
@@ -1974,7 +2213,8 @@ export function requiredCapabilities(policy: ExecutionPolicy): (keyof Omit<Execu
 
 /** Throw `adapter_ineligible` unless `caps` can enforce `policy`. */
 export function assertExecutorEligible(policy: ExecutionPolicy, caps: ExecutorCapabilities): void {
-  const missing = requiredCapabilities(policy).filter((c) => caps[c] !== true);
+  // Own-property capability reads (D-B2): an inherited `true` claims nothing.
+  const missing = requiredCapabilities(policy).filter((c) => ownValue(caps, c) !== true);
   if (missing.length > 0) {
     throw new ToolPolicyError(
       'adapter_ineligible',
@@ -2125,13 +2365,19 @@ export function redactSearchOutput(
 ): { replacement: Record<string, unknown>; reason: string } | null {
   const canonical = canonicalTool(toolName);
   if (canonical !== 'Grep' && canonical !== 'Glob') return null;
-  const input = toolInput && typeof toolInput === 'object' ? (toolInput as Record<string, unknown>) : {};
-  const pathArg = typeof input['path'] === 'string' ? input['path'] : undefined;
+  const input = toolInput && typeof toolInput === 'object' ? (toolInput as Record<string, unknown>) : nullRecord({});
+  // An uninspectable input or response throws here: the PostToolUse gate
+  // withholds (fail closed), never "no own fields".
+  assertInspectable(input);
+  assertInspectable(toolResponse);
+  const rawPath = own(input, 'path');
+  const pathArg = typeof rawPath === 'string' ? rawPath : undefined;
   const root = interpretToolPath(pathArg ?? '', policy.cwd);
   let searchRoot = root.ok ? root.path : policy.cwd;
-  if (canonical === 'Glob' && typeof input['pattern'] === 'string' && root.ok) {
+  const pattern = own(input, 'pattern');
+  if (canonical === 'Glob' && typeof pattern === 'string' && root.ok) {
     // The tree the CLI actually handed rg (see `cliGlobSplit`).
-    searchRoot = path.resolve(policy.cwd, cliGlobSplit(input['pattern'], pathArg, policy.cwd).baseDir);
+    searchRoot = path.resolve(policy.cwd, cliGlobSplit(pattern, pathArg, policy.cwd).baseDir);
   }
   const withhold = (reason: string, mode?: unknown): { replacement: Record<string, unknown>; reason: string } => ({
     replacement: withheldSearchReplacement(canonical, mode),
@@ -2143,7 +2389,7 @@ export function redactSearchOutput(
   if (typeof toolResponse === 'string') res = { content: toolResponse };
   else if (toolResponse && typeof toolResponse === 'object' && !Array.isArray(toolResponse)) res = toolResponse as Record<string, unknown>;
   else return withhold(`unrecognised tool_response shape (${Array.isArray(toolResponse) ? 'array' : typeof toolResponse})`);
-  const mode = res['mode'];
+  const mode = own(res, 'mode');
   // D2 TOCTOU: the search root is re-resolved NOW. A Grep over a single file
   // prints content lines without a filename, so a `path` swapped (junction /
   // symlink) to a credential location after the gate ran is only visible
@@ -2246,25 +2492,15 @@ function describeError(err: unknown): string {
   }
 }
 
-/** Own-property string read that cannot throw (hostile getters, non-objects). */
+/** Own-property string read that cannot throw (hostile getters, non-objects,
+ * inherited values). */
 function safeString(o: unknown, k: string): string | undefined {
-  try {
-    if (!o || typeof o !== 'object') return undefined;
-    const v = (o as Record<string, unknown>)[k];
-    return typeof v === 'string' ? v : undefined;
-  } catch {
-    return undefined;
-  }
+  return ownString(o, k);
 }
 
 /** Own-property read that cannot throw. */
 function safeGet(o: unknown, k: string): unknown {
-  try {
-    if (!o || typeof o !== 'object') return undefined;
-    return (o as Record<string, unknown>)[k];
-  } catch {
-    return undefined;
-  }
+  return ownValue(o, k);
 }
 
 /** Reason text carried by every fail-closed output. */
@@ -2342,6 +2578,24 @@ function callFingerprint(toolName: string, input: unknown, subagentId: string | 
 }
 
 /**
+ * A hook matcher whose `matcher` and `timeout` are OWN properties (undefined
+ * unless given) on a null-prototype record. The SDK serialises each matcher
+ * as `{matcher: m.matcher, hookCallbackIds, timeout: m.timeout}` (sdk.mjs
+ * 0.3.162 `initialize`), so an ABSENT `matcher` was read from
+ * `Object.prototype`: a polluted `matcher = 'x'` made the PreToolUse gate —
+ * the only pre-execution gate of the auto-approved Read/Grep/Glob — match no
+ * tool, and a polluted `timeout` shortened it (D-B2). Undefined values are
+ * dropped by the JSON the CLI receives, so the wire format is unchanged.
+ */
+export function hookMatcher(hooks: HookCallback[], matcher?: string): HookCallbackMatcher {
+  const m = Object.create(null) as Record<string, unknown>;
+  m['matcher'] = matcher;
+  m['timeout'] = undefined;
+  m['hooks'] = hooks;
+  return m as unknown as HookCallbackMatcher;
+}
+
+/**
  * Build the SDK permission options for `policy`. Every tool call is decided by
  * `evaluateToolCall`: the PreToolUse hook decides (and denies natively);
  * `canUseTool` reuses that decision only when the tool-use id AND the
@@ -2393,16 +2647,20 @@ export function buildClaudeSdkPermissionOptions(
   const preToolUse: HookCallback = async (hookInput, toolUseID) => {
     try {
       if (!hookInput || typeof hookInput !== 'object') throw new Error('hook input is not an object');
-      if (hookInput.hook_event_name !== 'PreToolUse') throw new Error(`unexpected hook event ${describeError(hookInput.hook_event_name)}`);
-      const toolName = hookInput.tool_name;
+      // Own-property reads (D-B2): an absent `agent_id` is the main thread,
+      // never an inherited value.
+      assertInspectable(hookInput);
+      const event = hookField(hookInput, 'hook_event_name');
+      if (event !== 'PreToolUse') throw new Error(`unexpected hook event ${describeError(event)}`);
+      const toolName = hookField(hookInput, 'tool_name');
       if (typeof toolName !== 'string') throw new Error('tool_name is not a string');
-      const input =
-        hookInput.tool_input && typeof hookInput.tool_input === 'object'
-          ? (hookInput.tool_input as Record<string, unknown>)
-          : {};
-      const agentId = typeof hookInput.agent_id === 'string' ? hookInput.agent_id : undefined;
+      const rawInput = hookField(hookInput, 'tool_input');
+      const input = rawInput && typeof rawInput === 'object' ? (rawInput as Record<string, unknown>) : nullRecord({});
+      const rawAgent = hookField(hookInput, 'agent_id');
+      const agentId = typeof rawAgent === 'string' ? rawAgent : undefined;
       const decision = await safeEvaluate({ toolName, input, subagentId: agentId });
-      const id = typeof hookInput.tool_use_id === 'string' ? hookInput.tool_use_id : toolUseID;
+      const rawId = hookField(hookInput, 'tool_use_id');
+      const id = typeof rawId === 'string' ? rawId : toolUseID;
       remember(id, callFingerprint(toolName, input, agentId), decision);
       // Computed from the live decision BEFORE the observer runs (D2).
       const out = decision.allow ? {} : preToolUseDeny(decision); // allow: defer to canUseTool
@@ -2416,10 +2674,17 @@ export function buildClaudeSdkPermissionOptions(
   const postToolUse: HookCallback = async (hookInput) => {
     try {
       if (!hookInput || typeof hookInput !== 'object') throw new Error('hook input is not an object');
-      if (hookInput.hook_event_name !== 'PostToolUse') throw new Error(`unexpected hook event ${describeError(hookInput.hook_event_name)}`);
-      const toolName = hookInput.tool_name;
+      assertInspectable(hookInput);
+      const event = hookField(hookInput, 'hook_event_name');
+      if (event !== 'PostToolUse') throw new Error(`unexpected hook event ${describeError(event)}`);
+      const toolName = hookField(hookInput, 'tool_name');
       if (typeof toolName !== 'string') throw new Error('tool_name is not a string');
-      const verdict = redactSearchOutput(policy, toolName, hookInput.tool_input, hookInput.tool_response);
+      const verdict = redactSearchOutput(
+        policy,
+        toolName,
+        hookField(hookInput, 'tool_input'),
+        hookField(hookInput, 'tool_response'),
+      );
       if (!verdict) return {};
       const out = {
         hookSpecificOutput: {
@@ -2445,8 +2710,12 @@ export function buildClaudeSdkPermissionOptions(
     try {
       if (typeof toolName !== 'string') throw new Error('tool name is not a string');
       if (!options || typeof options !== 'object') throw new Error('permission options are not an object');
-      const toolUseID = typeof options.toolUseID === 'string' ? options.toolUseID : undefined;
-      const agentID = typeof options.agentID === 'string' ? options.agentID : undefined;
+      assertInspectable(options);
+      assertInspectable(input);
+      const rawToolUseID = hookField(options, 'toolUseID');
+      const rawAgentID = hookField(options, 'agentID');
+      const toolUseID = typeof rawToolUseID === 'string' ? rawToolUseID : undefined;
+      const agentID = typeof rawAgentID === 'string' ? rawAgentID : undefined;
       const callInput = input && typeof input === 'object' ? input : {};
       const cached = toolUseID !== undefined ? decided.get(toolUseID) : undefined;
       if (toolUseID !== undefined) decided.delete(toolUseID);
@@ -2490,8 +2759,8 @@ export function buildClaudeSdkPermissionOptions(
     ],
     canUseTool,
     hooks: {
-      PreToolUse: [{ hooks: [preToolUse] }],
-      PostToolUse: [{ matcher: 'Grep|Glob', hooks: [postToolUse] }],
+      PreToolUse: [hookMatcher([preToolUse])],
+      PostToolUse: [hookMatcher([postToolUse], 'Grep|Glob')],
     },
     cwd: policy.cwd,
     additionalDirectories: policy.readRoots.filter((r) => r !== policy.cwd),
@@ -2522,11 +2791,12 @@ export async function authorizeMcpDispatch(
   server: string,
   tool: string,
   args: Record<string, unknown>,
-  hooks: SdkEnforcementHooks = {},
+  hooks: SdkEnforcementHooks | ResolvedEnforcementHooks = {},
 ): Promise<PolicyDecision> {
   const toolName = mcpToolName(server, tool);
-  // Own-property reads, once per dispatch (D-B).
-  const resolved = resolveEnforcementHooks(hooks);
+  // Own-property reads, once per dispatch (D-B); a resolved record (the
+  // broker captures one when the tool is built) is used as is.
+  const resolved = resolveEnforcementHooks(hooks as SdkEnforcementHooks);
   let decision: PolicyDecision;
   try {
     decision = await evaluateToolCall(policy, { toolName, input: args }, resolved);

@@ -32,6 +32,15 @@
 // has NO read roots: every built-in filesystem read is denied and the CLI runs
 // in a fresh, empty, per-execution directory inside the executor state base
 // (`noRootWorkingDirectory`, executor-env.ts), gone after the run.
+//
+// PROTOTYPE POLLUTION (M1 pre-flight D-B2, OQ-22): the run parameters, deps
+// and enforcement hooks are captured once, as own properties, into frozen
+// null-prototype records (`captureMissionParams`); every `query()` option the
+// SDK reads is an own property (`hardenedQueryOptions`); hook matchers carry
+// own `matcher`/`timeout` (`hookMatcher`); the CLI is spawned with a
+// null-prototype env (`spawnExecutorProcess`: Node's spawn enumerates `env`
+// with for…in); and every stream message is captured as own data before it
+// is mapped. An absent field is absent — never an inherited value.
 
 import type { ExecutorTerminal, ModelId } from '@skippy/shared';
 import { isNormalStopReason, TRUNCATED_STREAM_DETAIL } from '@skippy/shared';
@@ -42,7 +51,10 @@ import type {
   HookEvent,
   McpServerConfig,
   SDKResultMessage,
+  SpawnedProcess,
+  SpawnOptions,
 } from '@anthropic-ai/claude-agent-sdk';
+import { spawn, type SpawnOptions as NodeSpawnOptions } from 'node:child_process';
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { resolveExecutionGate } from './execution-gate.js';
@@ -59,13 +71,20 @@ import {
   ToolPolicyError,
   assertExecutorEligible,
   buildClaudeSdkPermissionOptions,
+  captureOwnData,
   derivePolicy,
   failClosedHookOutput,
   failClosedPermissionResult,
   filterMcpServers,
+  hookMatcher,
+  nullRecord,
+  ownString,
+  ownValue,
   parseMcpToolName,
+  resolveEnforcementHooks,
   type ClaudeSdkPermissionOptions,
   type ExecutionPolicy,
+  type ResolvedEnforcementHooks,
   type SdkEnforcementHooks,
 } from './tool-policy.js';
 
@@ -126,15 +145,73 @@ export interface ExecuteBoardMissionParams {
  * placeholder inside the executor state base that is never created.
  */
 export async function resolveBoardPolicy(params: ExecuteBoardMissionParams, noRootCwd?: string): Promise<ExecutionPolicy> {
-  const charter =
-    params.charter ?? (await loadCharter(`board.${params.boardId}` as CharterAgentId));
+  return resolveCapturedPolicy(captureMissionParams(params), noRootCwd);
+}
+
+async function resolveCapturedPolicy(p: CapturedMission, noRootCwd?: string): Promise<ExecutionPolicy> {
+  const charter = p.charter ?? (await loadCharter(`board.${p.boardId}` as CharterAgentId));
   const policy = derivePolicy(charter, {
-    ...(params.worktreePath ? { worktreePath: params.worktreePath } : {}),
-    ...(params.projectRoot ? { projectRoot: params.projectRoot } : {}),
+    // Validated by derivePolicy (a non-string / relative root is refused).
+    ...(p.worktreePath !== undefined ? { worktreePath: p.worktreePath as string } : {}),
+    ...(p.projectRoot !== undefined ? { projectRoot: p.projectRoot as string } : {}),
     ...(noRootCwd !== undefined ? { noRootCwd } : {}),
   });
   assertExecutorEligible(policy, CLAUDE_AGENT_SDK_CAPABILITIES);
   return policy;
+}
+
+/**
+ * The mission parameters, captured ONCE at run start as OWN properties into
+ * a frozen null-prototype record (M1 pre-flight D-B2). Production callers
+ * (board.ts) omit `enforcement` and, without an assignment, `worktreePath` /
+ * `projectRoot`; those absences must stay absences — before this, each was
+ * read through the prototype chain, so a polluted `Object.prototype
+ * .enforcement = { approver }` approved a later run's Bash and a polluted
+ * `projectRoot` / `worktreePath` / `charter` broadened its roots and grants.
+ * The enforcement hooks are resolved here too (`resolveEnforcementHooks`:
+ * own properties, once), so nothing read later can substitute them.
+ */
+interface CapturedMission {
+  readonly boardId: string;
+  readonly systemPrompt: string;
+  readonly model: ModelId;
+  readonly missionBrief: string;
+  readonly mcpServers: Record<string, McpServerConfig> | undefined;
+  readonly maxTurns: number;
+  readonly charter: Charter | undefined;
+  readonly worktreePath: unknown;
+  readonly projectRoot: unknown;
+  readonly enforcement: ResolvedEnforcementHooks;
+}
+
+function captureMissionParams(params: unknown): CapturedMission {
+  const text = (k: string): string => {
+    const v = ownValue(params, k);
+    return typeof v === 'string' ? v : '';
+  };
+  const servers = ownValue(params, 'mcpServers');
+  const maxTurns = ownValue(params, 'maxTurns');
+  const charter = ownValue(params, 'charter');
+  // An empty / absent root is "not assigned" (as before); anything else is
+  // handed to `derivePolicy`, which validates it (non-string => refused).
+  const root = (k: 'worktreePath' | 'projectRoot'): unknown => {
+    const v = ownValue(params, k);
+    return v === undefined || v === null || v === '' ? undefined : v;
+  };
+  return nullRecord({
+    boardId: text('boardId'),
+    systemPrompt: text('systemPrompt'),
+    model: text('model') as ModelId,
+    missionBrief: text('missionBrief'),
+    mcpServers: servers && typeof servers === 'object' ? (servers as Record<string, McpServerConfig>) : undefined,
+    maxTurns: typeof maxTurns === 'number' ? maxTurns : 8,
+    // A present-but-malformed charter is handed on as is: `derivePolicy`
+    // refuses it (charter_not_loaded); only an ABSENT one is loaded from disk.
+    charter: charter === undefined ? undefined : (charter as Charter),
+    worktreePath: root('worktreePath'),
+    projectRoot: root('projectRoot'),
+    enforcement: resolveEnforcementHooks(ownValue(params, 'enforcement') as SdkEnforcementHooks | undefined),
+  });
 }
 
 /**
@@ -262,7 +339,7 @@ function mapSdkResultMessage(
       reason: {
         code: 'provider_error',
         message: `Board ${boardId} executor hit a provider API error (status ${msg.api_error_status}).`,
-        detail: String(msg.api_error_status),
+        detail: plainText(msg.api_error_status),
       },
     });
   }
@@ -367,7 +444,7 @@ function mapSdkResultMessage(
   const detail =
     msg.subtype === 'success'
       ? `success result ${msg.is_error === false ? 'ended abnormally' : 'flagged is_error'}: ${resultText ?? NO_SUMMARY}${suffix ? ` (${suffix})` : ''}`
-      : [msg.subtype, terminalReason, abnormalStop ? `stop_reason: ${describeValue(stopReason)}` : '', ...errors.map(String)]
+      : [msg.subtype, terminalReason, abnormalStop ? `stop_reason: ${describeValue(stopReason)}` : '', ...errors.map(plainText)]
           .filter(Boolean)
           .join(': ');
   return withCost({
@@ -392,6 +469,12 @@ function describeValue(v: unknown): string {
   if (Array.isArray(v)) return 'array';
   if (typeof v === 'string') return JSON.stringify(v.length > 80 ? `${v.slice(0, 80)}…` : v);
   return typeof v;
+}
+
+/** `String(v)` for primitives; a short description for objects (a captured
+ * message's objects have no prototype, so `String()` would throw). */
+function plainText(v: unknown): string {
+  return v !== null && (typeof v === 'object' || typeof v === 'function') ? describeValue(v) : String(v);
 }
 
 function denialToolName(d: unknown): string {
@@ -490,20 +573,26 @@ export class DenialLedger {
 /** Deny reason carried by a permission-hook output, or null when it allows. */
 function hookOutputDenial(event: string, out: unknown): { reason?: string } | null {
   if (!out || typeof out !== 'object') return null;
-  const o = out as Record<string, unknown>;
-  const hso = o.hookSpecificOutput && typeof o.hookSpecificOutput === 'object'
-    ? (o.hookSpecificOutput as Record<string, unknown>)
-    : undefined;
+  // Own-property reads only (D-B2): what the CLI acts on is the JSON of the
+  // output's OWN properties, so that is all the accounting may look at.
+  const hsoRaw = ownValue(out, 'hookSpecificOutput');
+  const hso = hsoRaw && typeof hsoRaw === 'object' ? hsoRaw : undefined;
   if (event === 'PreToolUse') {
-    if (hso?.permissionDecision === 'deny') {
-      const r = hso.permissionDecisionReason;
-      return typeof r === 'string' ? { reason: r } : {};
+    if (ownValue(hso, 'permissionDecision') === 'deny') {
+      const r = ownString(hso, 'permissionDecisionReason');
+      return r !== undefined ? { reason: r } : {};
     }
-    if (o.decision === 'block') return typeof o.reason === 'string' ? { reason: o.reason } : {};
+    if (ownValue(out, 'decision') === 'block') {
+      const r = ownString(out, 'reason');
+      return r !== undefined ? { reason: r } : {};
+    }
   }
-  if (event === 'PermissionRequest' && hso?.decision && typeof hso.decision === 'object') {
-    const dec = hso.decision as { behavior?: unknown; message?: unknown };
-    if (dec.behavior === 'deny') return typeof dec.message === 'string' ? { reason: dec.message } : {};
+  const dec = ownValue(hso, 'decision');
+  if (event === 'PermissionRequest' && dec && typeof dec === 'object') {
+    if (ownValue(dec, 'behavior') === 'deny') {
+      const m = ownString(dec, 'message');
+      return m !== undefined ? { reason: m } : {};
+    }
   }
   return null;
 }
@@ -517,15 +606,10 @@ function describeError(err: unknown): string {
   }
 }
 
-/** Own-property string read that cannot throw (hostile getters, non-objects). */
+/** Own-property string read that cannot throw (hostile getters, non-objects,
+ * inherited values). */
 function safeString(o: unknown, k: string): string | undefined {
-  try {
-    if (!o || typeof o !== 'object') return undefined;
-    const v = (o as Record<string, unknown>)[k];
-    return typeof v === 'string' ? v : undefined;
-  } catch {
-    return undefined;
-  }
+  return ownString(o, k);
 }
 
 /**
@@ -588,9 +672,9 @@ export function instrumentPermissionOptions(
       toolUseID = safeString(options, 'toolUseID');
       const result = await inner(toolName, input, options);
       if (!result || typeof result !== 'object') throw new Error('permission callback returned a non-object');
-      if (result.behavior !== 'allow') {
-        const message = (result as { message?: unknown }).message;
-        ledger.record(toolUseID, typeof message === 'string' ? { ...base, reason: message } : base);
+      if (ownValue(result, 'behavior') !== 'allow') {
+        const message = ownString(result, 'message');
+        ledger.record(toolUseID, message !== undefined ? { ...base, reason: message } : base);
       }
       return result;
     } catch (err) {
@@ -607,7 +691,13 @@ export function instrumentPermissionOptions(
     [HookEvent, HookCallbackMatcher[] | undefined]
   >) {
     if (!matchers) continue;
-    hooks[event] = matchers.map((m) => ({ ...m, hooks: m.hooks.map((cb) => instrumentHook(event, cb, ledger)) }));
+    // Rebuilt with `hookMatcher`: `matcher`/`timeout` stay OWN properties (D-B2).
+    hooks[event] = matchers.map((m) =>
+      hookMatcher(
+        m.hooks.map((cb) => instrumentHook(event, cb, ledger)),
+        ownString(m, 'matcher'),
+      ),
+    );
   }
   return { ...permission, canUseTool, hooks };
 }
@@ -1402,19 +1492,21 @@ export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
 ): T & { forwardSubagentText: true; includePartialMessages: true } {
   const stopFailure: HookCallback = (input) => {
     try {
-      const rec = input as unknown as Record<string, unknown>;
-      const agentId = rec.agent_id;
+      // Own-property reads (D-B2): an absent `agent_id` is the main thread.
+      const agentId = ownValue(input, 'agent_id');
+      const error = ownValue(input, 'error');
+      const lastMessage = ownValue(input, 'last_assistant_message');
       if (typeof agentId !== 'string' || agentId.length === 0) {
         // Main thread (M0-G01): no error `result` follows inside a segment a
         // background task keeps open; deduped against one that does.
-        observer.recordMainStopFailure(rec.error, rec.last_assistant_message);
+        observer.recordMainStopFailure(error, lastMessage);
       } else {
         const { key, label } = observer.agentKey(agentId);
-        const code = classifyTaskAgentError(rec.error);
-        const signals = [`StopFailure error=${describeValue(rec.error)}`];
+        const code = classifyTaskAgentError(error);
+        const signals = [`StopFailure error=${describeValue(error)}`];
         // For API errors the last message is the CLI's synthetic error text;
         // otherwise it may be model prose, which is not copied into the detail.
-        const ex = code === 'provider_error' ? excerpt(rec.last_assistant_message) : undefined;
+        const ex = code === 'provider_error' ? excerpt(lastMessage) : undefined;
         if (ex) signals.push(`cli: ${ex}`);
         failures.record(key, { code, agent: label, signals });
       }
@@ -1424,7 +1516,8 @@ export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
     return Promise.resolve({});
   };
   const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = { ...permission.hooks };
-  hooks.StopFailure = [...(hooks.StopFailure ?? []), { hooks: [stopFailure] }];
+  const existing = ownValue(hooks, 'StopFailure');
+  hooks.StopFailure = [...(Array.isArray(existing) ? (existing as HookCallbackMatcher[]) : []), hookMatcher([stopFailure])];
   return { ...permission, hooks, forwardSubagentText: true, includePartialMessages: true };
 }
 
@@ -1508,9 +1601,13 @@ function applyRunLedgers(
  * refusal is returned as `blocked`, every other failure as `failed`.
  */
 export async function executeBoardMissionViaSdk(
-  params: ExecuteBoardMissionParams,
-  deps: ExecuteBoardMissionDeps = {},
+  paramsIn: ExecuteBoardMissionParams,
+  depsIn: ExecuteBoardMissionDeps = {},
 ): Promise<SdkBoardResult> {
+  // Freeze-by-construction (D-B2): parameters, hooks and deps are read ONCE,
+  // as own properties, before anything else runs.
+  const params = captureMissionParams(paramsIn);
+  const deps = captureDeps(depsIn);
   // Stale leftovers of crashed runs and the legacy persistent directories go
   // first (best effort; executor-env.ts). Then THIS run's private state —
   // the CLI's config directory and its support directory (the no-root cwd,
@@ -1529,14 +1626,184 @@ export async function executeBoardMissionViaSdk(
   }
 }
 
+interface CapturedDeps {
+  readonly loadSdk: () => Promise<ClaudeAgentSdkModule>;
+  readonly executorEnvOverrides: Readonly<Record<string, string>> | undefined;
+}
+
+function captureDeps(deps: unknown): CapturedDeps {
+  const load = ownValue(deps, 'loadSdk');
+  const overrides = ownValue(deps, 'executorEnvOverrides');
+  return nullRecord({
+    loadSdk: typeof load === 'function' ? (load as () => Promise<ClaudeAgentSdkModule>) : loadClaudeAgentSdk,
+    executorEnvOverrides:
+      overrides && typeof overrides === 'object' ? (overrides as Readonly<Record<string, string>>) : undefined,
+  });
+}
+
+/**
+ * Every option key the installed SDK (0.3.162) reads from `query()` options:
+ * the `Options` type in sdk.d.ts plus the undocumented keys its query
+ * builder destructures or reads (`getOAuthToken`, `getHostAuthToken`,
+ * `workload`, `appendSubagentSystemPrompt`,
+ * `webSearchIsolationExemptMcpServers`). The builder copies the options with
+ * an object rest (`{systemPrompt, …, ...q} = options`) into an ORDINARY
+ * object and destructures that, so an option we did not set was read from
+ * `Object.prototype` — `extraArgs` (arbitrary CLI flags),
+ * `pathToClaudeCodeExecutable`, `executable`, `settings`, `plugins`,
+ * `agents`, `resume`, … (M1 pre-flight D-B2). `hardenedQueryOptions` makes
+ * every one of them an OWN property. A test re-derives the list from the
+ * installed sdk.d.ts / sdk.mjs, so an SDK bump that adds a key fails.
+ */
+export const SDK_QUERY_OPTION_KEYS: readonly string[] = Object.freeze([
+  'abortController',
+  'additionalDirectories',
+  'agent',
+  'agentProgressSummaries',
+  'agents',
+  'allowDangerouslySkipPermissions',
+  'allowedTools',
+  'appendSubagentSystemPrompt',
+  'betas',
+  'canUseTool',
+  'continue',
+  'cwd',
+  'debug',
+  'debugFile',
+  'disallowedTools',
+  'effort',
+  'enableFileCheckpointing',
+  'env',
+  'executable',
+  'executableArgs',
+  'extraArgs',
+  'fallbackModel',
+  'forkSession',
+  'forwardSubagentText',
+  'getHostAuthToken',
+  'getOAuthToken',
+  'hooks',
+  'includeHookEvents',
+  'includePartialMessages',
+  'loadTimeoutMs',
+  'managedSettings',
+  'maxBudgetUsd',
+  'maxThinkingTokens',
+  'maxTurns',
+  'mcpServers',
+  'model',
+  'onElicitation',
+  'onUserDialog',
+  'outputFormat',
+  'pathToClaudeCodeExecutable',
+  'permissionMode',
+  'permissionPromptToolName',
+  'persistSession',
+  'planModeInstructions',
+  'plugins',
+  'promptSuggestions',
+  'resume',
+  'resumeSessionAt',
+  'sandbox',
+  'sessionId',
+  'sessionStore',
+  'sessionStoreFlush',
+  'settingSources',
+  'settings',
+  'skills',
+  'spawnClaudeCodeProcess',
+  'stderr',
+  'strictMcpConfig',
+  'systemPrompt',
+  'taskBudget',
+  'thinking',
+  'title',
+  'toolAliases',
+  'toolConfig',
+  'tools',
+  'webSearchIsolationExemptMcpServers',
+  'workload',
+]);
+
+/** `query()` options as a null-prototype record in which EVERY key in
+ * SDK_QUERY_OPTION_KEYS is an own property (`undefined` unless set), so the
+ * SDK's defaults — never an inherited value — apply to what we leave out. */
+export function hardenedQueryOptions<T extends object>(fields: T): T {
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const k of SDK_QUERY_OPTION_KEYS) out[k] = undefined;
+  for (const k of Object.keys(fields)) out[k] = (fields as Record<string, unknown>)[k];
+  return out as T;
+}
+
+/**
+ * The executor's process spawn (`spawnClaudeCodeProcess`), equivalent to the
+ * SDK's default `spawnLocalProcess` (same command, args, cwd, abort signal,
+ * `windowsHide`, stdin/stdout piped; stderr ignored — the SDK pipes it only
+ * for `DEBUG_CLAUDE_AGENT_SDK` / an `stderr` callback, neither of which this
+ * runtime sets) with ONE difference: the environment and the spawn options
+ * are NULL-PROTOTYPE records holding only the own string entries the SDK
+ * built. Node's `spawn` enumerates `env` with `for…in`, so with the default
+ * spawner an enumerable property polluted onto `Object.prototype`
+ * (`RIPGREP_CONFIG_PATH`, `CLAUDE_CODE_*`, `GIT_*`, …) became a variable of
+ * the executor's process, bypassing the allowlist (executor-env.ts, OQ-22).
+ */
+export function spawnExecutorProcess(o: SpawnOptions): SpawnedProcess {
+  const command = ownValue(o, 'command');
+  const rawArgs = ownValue(o, 'args');
+  const args = Array.isArray(rawArgs) ? captureOwnData<unknown[]>(rawArgs) : undefined;
+  if (typeof command !== 'string' || !args || args.some((a) => typeof a !== 'string')) {
+    throw new Error('executor spawn refused: malformed command or arguments');
+  }
+  const envIn = ownValue(o, 'env');
+  const env = Object.create(null) as Record<string, string>;
+  if (envIn && typeof envIn === 'object') {
+    for (const k of Object.keys(envIn)) {
+      const v = (envIn as Record<string, unknown>)[k];
+      if (typeof v === 'string') env[k] = v;
+    }
+  }
+  const cwd = ownValue(o, 'cwd');
+  const signal = ownValue(o, 'signal');
+  const options = Object.create(null) as NodeSpawnOptions;
+  options.stdio = ['pipe', 'pipe', 'ignore'];
+  options.env = env;
+  options.windowsHide = true;
+  if (typeof cwd === 'string') options.cwd = cwd;
+  if (signal instanceof AbortSignal) options.signal = signal;
+  const child = spawn(command, args as string[], options);
+  if (!child.stdin || !child.stdout) throw new Error('executor spawn refused: stdio pipes missing');
+  const stdin = child.stdin;
+  const stdout = child.stdout;
+  return {
+    stdin,
+    stdout,
+    get killed() {
+      return child.killed;
+    },
+    get exitCode() {
+      return child.exitCode;
+    },
+    kill: (sig: NodeJS.Signals) => child.kill(sig),
+    on: ((event: string, listener: (...a: unknown[]) => void) => {
+      child.on(event, listener);
+    }) as SpawnedProcess['on'],
+    once: ((event: string, listener: (...a: unknown[]) => void) => {
+      child.once(event, listener);
+    }) as SpawnedProcess['once'],
+    off: ((event: string, listener: (...a: unknown[]) => void) => {
+      child.off(event, listener);
+    }) as SpawnedProcess['off'],
+  };
+}
+
 async function executeBoardMissionInRun(
-  params: ExecuteBoardMissionParams,
-  deps: ExecuteBoardMissionDeps,
+  params: CapturedMission,
+  deps: CapturedDeps,
   configDir: string,
 ): Promise<SdkBoardResult> {
   let policy: ExecutionPolicy;
   try {
-    policy = await resolveBoardPolicy(params, noRootWorkingDirectory(configDir));
+    policy = await resolveCapturedPolicy(params, noRootWorkingDirectory(configDir));
   } catch (err) {
     const reason = err instanceof ToolPolicyError ? err.message : String(err);
     logger.warn({ msg: 'SDK board refused: tool policy', boardId: params.boardId, err: reason });
@@ -1578,9 +1845,13 @@ async function executeBoardMissionInRun(
 
   async function runMission(): Promise<SdkBoardResult> {
     try {
-      const sdk = await (deps.loadSdk ?? loadClaudeAgentSdk)();
+      const sdk = await deps.loadSdk();
+      // The hooks were resolved once at capture (own properties, frozen); the
+      // record literal below has every field as an OWN property.
+      const enforcement = params.enforcement;
       const gate = buildClaudeSdkPermissionOptions(policy, {
-        ...params.enforcement,
+        approver: enforcement.approver,
+        pathGuard: enforcement.pathGuard,
         onDecision: (e) => {
           if (!e.decision.allow) {
             logger.warn({
@@ -1592,7 +1863,7 @@ async function executeBoardMissionInRun(
             });
             denials.noteAudit({ toolName: e.toolName, source: 'policy-audit', reason: `${e.decision.code}: ${e.decision.reason}` });
           }
-          params.enforcement?.onDecision?.(e);
+          enforcement.onDecision?.(e);
         },
       });
       const observer = new RunStreamObserver(policy, failures, denials, truncations);
@@ -1606,14 +1877,17 @@ async function executeBoardMissionInRun(
       const env = buildClaudeExecutorEnv(process.env, configDir, deps.executorEnvOverrides);
       const q = sdk.query({
         prompt: params.missionBrief,
-        options: {
+        // Every option the SDK reads is an OWN property (D-B2), and the
+        // executor process gets a null-prototype environment.
+        options: hardenedQueryOptions({
           model: params.model,
           systemPrompt: params.systemPrompt,
-          maxTurns: params.maxTurns ?? 8,
+          maxTurns: params.maxTurns,
           ...permission,
           mcpServers: filterMcpServers(policy, params.mcpServers),
           env,
-        },
+          spawnClaudeCodeProcess: spawnExecutorProcess,
+        }),
       });
 
       // Await the terminal `result` message(s). Normally the last one observed
@@ -1622,7 +1896,11 @@ async function executeBoardMissionInRun(
       // stream has shown failure/blocked/interrupted, a subsequent success
       // message cannot un-fail the mission.
       let sawNonSuccessResult = false;
-      for await (const msg of q) {
+      for await (const raw of q) {
+        // Each message is captured as own data into null-prototype records
+        // (D-B2): a field the stream did not carry (`stop_reason`,
+        // `permission_denials`, `agent_id`, …) is absent, never inherited.
+        const msg = captureOwnData<typeof raw>(raw, false);
         observer.observe(msg);
         if (msg.type !== 'result') continue;
         const reported: unknown = (msg as { permission_denials?: unknown }).permission_denials;
