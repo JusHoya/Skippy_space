@@ -49,11 +49,20 @@
 // (`.tmp`, `.lock`, `.ingest-tmp`, `.ingest-error.json` suffixes),
 // `too-deep` (a directory beyond MAX_SCAN_DEPTH) and `internal-folder` (a user
 // file inside `_ingest-errors/`). The only silent skips are the pipeline's own,
-// provably-owned artifacts: ingest-error sidecars whose CONTENT proves they are
-// ours (`isOwnIngestErrorSidecar`, not the suffix), our `.<32 hex>.….ingest-tmp`
-// freeze files (handled by the startup recovery) and, for live events only, the
-// transient `.skippy-<32 hex>.tmp` atomic-write temp files. Only ENOENT (the
-// file really vanished) is otherwise silent.
+// provably-owned artifacts: ingest-error sidecars carrying a valid MAC under
+// the vault's key (`isOwnIngestErrorSidecar`, D3 -- not the suffix, not the
+// content shape), our `.<32 hex>.….ingest-tmp` freeze files OUTSIDE
+// `_ingest-errors/` (handled by the startup recovery; inside that folder such
+// a name proves nothing and is reported, D4) and, for live events only, the
+// transient `.skippy-<32 hex>.tmp` atomic-write temp files. Only ENOENT is
+// otherwise silent, and only when no same-name-after-normalization sibling
+// remains (`handleVanished`).
+//
+// Unicode names (M0 NFC/NFD round, D1): every path the watcher handles and
+// reports is the exact on-disk spelling (readdir / chokidar names are never
+// normalized); NFC `café.md` and NFD `café.md` are distinct files and
+// each is ingested or reported on its own. Rule comparisons (`_ingest-errors`,
+// reserved suffixes) use NFC forms (`ruleKey`).
 
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
@@ -71,7 +80,7 @@ import { INGEST_ERROR_SUFFIX, isOwnIngestErrorSidecar, readIngestError } from '.
 import { extensionOf, isSupportedExtension } from './ingest/extractors.js';
 import { sha256Hex } from './ingest/originals.js';
 import { parseIngestTmpName, recoverIngestTemps, type IngestTmpRecovery } from './ingest/recovery.js';
-import { canonicalVaultRoot, cmpKey, rebaseOntoRoot } from './vault-path.js';
+import { canonicalVaultRoot, cmpKey, normalizationSiblings, rebaseOntoRoot, ruleKey } from './vault-path.js';
 
 /** Maximum inbox nesting (directory levels) the startup scan and the live watch descend into. */
 export const MAX_SCAN_DEPTH = 8;
@@ -171,24 +180,49 @@ export function watchInbox(opts: WatchInboxOptions): InboxWatcher {
   }
 
   /**
+   * The exact name `abs` is gone. If its directory holds an entry that is the
+   * same name after NFC (and, on win32, case) folding but different bytes on
+   * disk -- e.g. a path whose Unicode form was changed somewhere upstream --
+   * that entry is handled under its ON-DISK name, so nothing is dropped just
+   * because two spellings disagree (M0 NFC/NFD round, D1). A name that truly
+   * vanished (no such sibling) has nothing left to ingest or report.
+   */
+  async function handleVanished(abs: string, origin: 'scan' | 'live', aliasHop: boolean): Promise<void> {
+    if (aliasHop) return;
+    const dir = path.dirname(abs);
+    let siblings: string[];
+    try {
+      siblings = await normalizationSiblings(dir, path.basename(abs));
+    } catch (err) {
+      reject(abs, 'read-error', `the entry vanished and its directory cannot be listed: ${String(err)}`, 'vanished');
+      return;
+    }
+    for (const s of siblings) await handleEntry(path.join(dir, s), origin, true);
+  }
+
+  /**
    * Classify one inbox entry and either report it, skip it (provably ours),
    * or dispatch it. Checks the entry with lstat (never following a link), the
    * strict inbox rules and the size cap before reading; a file that vanished
-   * mid-check is silently skipped. A file whose recorded `.ingest-error.json`
-   * sidecar already covers this EXACT content hash is skipped too (E4-2).
+   * mid-check is skipped unless an on-disk alias remains (`handleVanished`). A
+   * file whose MAC-authenticated `.ingest-error.json` sidecar already covers
+   * this EXACT content hash is skipped too (E4-2, D3).
    */
-  async function handleEntry(abs: string, origin: 'scan' | 'live'): Promise<void> {
+  async function handleEntry(abs: string, origin: 'scan' | 'live', aliasHop = false): Promise<void> {
     if (closed) return;
     const segs = relSegments(inboxDir, abs);
     if (segs === null || ignoredByWatch(abs)) return;
     const name = segs[segs.length - 1]!;
-    const inErrorsDir = segs.slice(0, -1).some((s) => s.toLowerCase() === INGEST_ERRORS_DIR);
+    const inErrorsDir = segs.slice(0, -1).some((s) => ruleKey(s) === INGEST_ERRORS_DIR);
 
     let lst;
     try {
       lst = await fs.lstat(abs);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // gone already
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        await handleVanished(abs, origin, aliasHop);
+        return;
+      }
       reject(abs, 'read-error', String(err), 'lstat');
       return;
     }
@@ -213,26 +247,30 @@ export function watchInbox(opts: WatchInboxOptions): InboxWatcher {
     }
 
     // The pipeline's own artifacts (provably ours) are the only silent skips.
-    if (parseIngestTmpName(name)) return; // freeze file: transient, or handled by the startup recovery
     if (SAFE_WRITE_TEMP_RE.test(name)) {
       if (origin === 'live') return; // an atomic write in flight (renamed within milliseconds)
       reject(abs, 'reserved-name', 'leftover atomic-write temp file from an interrupted write', fingerprint);
       return;
     }
-    if (name.toLowerCase().endsWith(INGEST_ERROR_SUFFIX)) {
-      if (await isOwnIngestErrorSidecar(vaultRoot, abs)) return;
+    if (ruleKey(name).endsWith(INGEST_ERROR_SUFFIX)) {
+      if (await isOwnIngestErrorSidecar(vaultRoot, abs)) return; // MAC-authenticated record (D3)
       reject(abs, 'reserved-name', `"${INGEST_ERROR_SUFFIX}" is reserved for ingest error records`, fingerprint);
       return;
     }
+    // D4: ingest never freezes anything inside `_ingest-errors/` (it refuses
+    // sources there) and the startup recovery does not walk it, so a
+    // freeze-file NAME there proves nothing: it is reported like any other
+    // user file in that folder.
     if (inErrorsDir) {
       reject(abs, 'internal-folder', `${INGEST_ERRORS_DIR}/ holds ingest error records, not drops`, fingerprint);
       return;
     }
+    if (parseIngestTmpName(name)) return; // freeze file: transient, or handled by the startup recovery
     if (name.startsWith('.')) {
       reject(abs, 'hidden', 'hidden files in the inbox are not ingested', fingerprint);
       return;
     }
-    if (RESERVED_SUFFIX_RE.test(name)) {
+    if (RESERVED_SUFFIX_RE.test(ruleKey(name))) {
       reject(abs, 'reserved-name', 'the .tmp/.lock/.ingest-tmp suffixes are reserved for temporary and lock files', fingerprint);
       return;
     }
@@ -245,7 +283,11 @@ export function watchInbox(opts: WatchInboxOptions): InboxWatcher {
     try {
       buf = (await readInboxFile(vaultRoot, abs)).bytes;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // removed by a concurrent ingest
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        // Removed by a concurrent ingest -- or spelled differently on disk.
+        await handleVanished(abs, origin, aliasHop);
+        return;
+      }
       if (err instanceof IngestSourceRejectedError) {
         reject(abs, err.reason, err.message, fingerprint);
       } else {
@@ -255,15 +297,14 @@ export function watchInbox(opts: WatchInboxOptions): InboxWatcher {
     }
     const hash = sha256Hex(buf);
     if (lastEnqueuedHash.get(abs) === hash) return; // already handled this exact content
-
-    const errRec = await readIngestError(vaultRoot, abs).catch(() => null);
-    if (errRec && errRec.contentSha256 === hash) {
-      // This exact content already failed and was recorded; don't loop.
-      lastEnqueuedHash.set(abs, hash);
-      return;
-    }
-
+    // Claimed before the next await, so a scan and a live event for the same
+    // content cannot both dispatch it.
     lastEnqueuedHash.set(abs, hash);
+
+    // This exact content already failed and was recorded by the pipeline (a
+    // MAC-authenticated record, D3; a hand-written one does not count): don't loop.
+    const errRec = await readIngestError(vaultRoot, abs).catch(() => null);
+    if (errRec && errRec.contentSha256 === hash) return;
 
     if (!isSupportedExtension(abs)) {
       const ext = extensionOf(abs);
@@ -294,12 +335,17 @@ export function watchInbox(opts: WatchInboxOptions): InboxWatcher {
       return;
     }
     for (const name of names) {
+      // `name` is the exact on-disk spelling (never Unicode-normalized).
       const abs = path.join(dirAbs, name);
       const lst = await fs.lstat(abs).catch(() => null);
-      if (!lst) continue;
+      if (!lst) {
+        // Vanished (silent unless an alias remains) or unreadable (reported).
+        await handleEntry(abs, 'scan');
+        continue;
+      }
       if (lst.isDirectory() && !lst.isSymbolicLink()) {
         const segs = relSegments(inboxDir, abs) ?? [];
-        const inErrorsDir = segs.slice(0, -1).some((s) => s.toLowerCase() === INGEST_ERRORS_DIR);
+        const inErrorsDir = segs.slice(0, -1).some((s) => ruleKey(s) === INGEST_ERRORS_DIR);
         if (name.startsWith('.') || inErrorsDir || depth + 1 > MAX_SCAN_DEPTH) {
           await handleEntry(abs, 'scan'); // reported, not descended into
           continue;

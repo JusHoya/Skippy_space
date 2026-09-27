@@ -116,21 +116,12 @@ test('E4-2: a file overwritten with different content after a failure is retried
   const target = path.join(inboxDir, 'retry.md');
   await fs.writeFile(target, '# First\n');
 
-  // Simulate a prior failed ingest of the FIRST content (mirrors what
-  // `ingest/errors.ts#writeIngestError` would have written for it).
+  // Simulate a prior failed ingest of the FIRST content through the real
+  // writer (a hand-written record is not trusted: it carries no valid MAC, D3).
   const { sha256Hex } = await import('./ingest/originals.js');
+  const { writeIngestError } = await import('./ingest/errors.js');
   const firstHash = sha256Hex(await fs.readFile(target));
-  await fs.writeFile(
-    `${target}.ingest-error.json`,
-    JSON.stringify({
-      sourcePath: target,
-      reason: 'invalid-encoding',
-      detail: 'simulated prior failure',
-      extension: '.md',
-      at: new Date().toISOString(),
-      contentSha256: firstHash,
-    }),
-  );
+  await writeIngestError(vaultRoot, target, 'invalid-encoding', 'simulated prior failure', '.md', firstHash);
 
   const supported: string[] = [];
   const watcher = watchInbox({ vaultRoot, onFile: (p) => supported.push(p) });

@@ -19,7 +19,11 @@
 //      path inside the REAL `00_Inbox/` with no junction/symlink in any segment,
 //      no hidden/8.3/reserved segment, a single-link regular file of at most
 //      MAX_INGEST_BYTES. Anything else is rejected with a sidecar (inside the
-//      inbox) and never read, modified or deleted.
+//      inbox) and never read, modified or deleted. The drop is addressed by its
+//      EXACT name (vault-path.ts "Unicode normalization policy"): NFC `café.md`
+//      and NFD `café.md` are different NTFS files, and ingest reads,
+//      freezes, deletes, restores and labels (`source: file://…`) only the one
+//      it was handed.
 //   1. Read the raw bytes of the drop and hash them (sha256). The hash is
 //      computed once, over the exact original bytes, and used for every
 //      sidecar/store/marker path below (E4-8: no more re-deriving a possibly
@@ -88,7 +92,7 @@ import { ulid } from 'ulid';
 import { makeFrontmatter, parseNote, serializeNote } from '../frontmatter.js';
 import { VaultBroker, type NoteSnapshot } from '../vault-broker.js';
 import { assertNoRelativeMdLinks } from '../atomic.js';
-import { cmpKey, realVaultRoot, rebaseOntoRoot } from '../vault-path.js';
+import { cmpKey, realVaultRoot, rebaseOntoRoot, ruleKey } from '../vault-path.js';
 import { acquireVaultLock } from '../vault-lock.js';
 import { EXTRACTORS, getExtractor, InvalidEncodingError } from '../ingest/extractors.js';
 import { INGEST_AUTHOR, INGEST_WRITER, SOURCES_DIR } from '../ingest/provenance.js';
@@ -509,8 +513,8 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
     const inboxRel = inboxRelPath(vaultRoot, sourcePath);
     if (
       inboxRel !== null &&
-      (inboxRel.toLowerCase().endsWith(INGEST_ERROR_SUFFIX) ||
-        inboxRel.split('/').some((s) => s.toLowerCase() === INGEST_ERRORS_DIR))
+      (ruleKey(inboxRel).endsWith(INGEST_ERROR_SUFFIX) ||
+        inboxRel.split('/').some((s) => ruleKey(s) === INGEST_ERRORS_DIR))
     ) {
       throw new IngestSourceRejectedError('path-rejected', sourcePath, 'ingest-error records are not ingest sources');
     }

@@ -16,14 +16,32 @@
 //      control directories, not notes; G0 denied paths); segments ending in
 //      `.lock` (the broker's proper-lockfile directories are `<note>.md.lock`,
 //      so a note created inside one would pin that lock forever; M0 final
-//      red-team #3); and Unicode look-alikes (#8): every segment is
-//      NFC-normalized, invisible characters (format/bidi controls `Cf` such as
-//      U+200B and U+202E, line/paragraph separators, non-ASCII spaces,
-//      variation selectors, Hangul fillers, private use) are rejected, and a
-//      segment whose NFKC form differs is re-checked in that form, so fullwidth
-//      `．obsidian`, `４０_Daily` or `ｘ.lock` cannot alias a hidden, reserved
-//      or control name. (A fullwidth `ｘ.md` that folds to an ordinary name is
-//      accepted: it is a distinct file on NTFS, not an alias.)
+//      red-team #3); and Unicode look-alikes (#8): invisible characters
+//      (format/bidi controls `Cf` such as U+200B and U+202E, line/paragraph
+//      separators, non-ASCII spaces, variation selectors, Hangul fillers,
+//      private use) are rejected, and a segment whose NFKC form differs is
+//      re-checked in that form, so fullwidth `．obsidian`, `４０_Daily` or
+//      `ｘ.lock` cannot alias a hidden, reserved or control name. (A fullwidth
+//      `ｘ.md` that folds to an ordinary name is accepted: it is a distinct file
+//      on NTFS, not an alias.)
+//
+//   Unicode normalization policy (FR-SEC-02 "case normalization", FR-WIKI-02
+//   identity; M0 NFC/NFD round): NTFS stores names as exact UTF-16 code units
+//   and never normalizes, so NFC `café.md` and NFD `café.md` are two
+//   DIFFERENT files. Normalization is therefore used ONLY to evaluate rules:
+//   every rule runs on the raw segment AND on its NFC form (and the NFKC
+//   look-alike rules on the NFKC form), and the reserved-path comparisons
+//   (`reservedAppendOnlyType`, `isSourcesPath`, `_ingest-errors`) compare
+//   `ruleKey()` forms. The path returned and every filesystem operation use the
+//   EXACT segment strings as given (and, for existing entries, as found on
+//   disk), so an operation always acts on the named file, never on a
+//   differently-encoded sibling. Lock keys are built from the real path of the
+//   actual file (vault-broker.ts), so two distinct NTFS names never share a
+//   lock. Creating a NEW entry whose `foldKey()` (NFC, case-folded on win32)
+//   equals that of an existing sibling with different bytes is refused with
+//   `normalization_collision` (`assertNoNormalizationSibling`), so a writer can
+//   never mint a visually identical duplicate; existing entries of either form
+//   are read and updated by their exact names.
 //
 //   2. REAL (`resolveContained`, async): resolve the vault root with native
 //      realpath, then find the nearest EXISTING ancestor of the target and
@@ -75,7 +93,8 @@ export type VaultPathViolation =
   | 'root_changed'
   | 'lock_segment'
   | 'invisible_char'
-  | 'lookalike';
+  | 'lookalike'
+  | 'normalization_collision';
 
 export class VaultPathError extends Error {
   readonly code = 'VAULT_PATH_REJECTED';
@@ -174,7 +193,9 @@ function hiddenAllowed(seg: string, opts: VaultPathOptions): boolean {
 /**
  * Lexically validate an untrusted vault-relative path and return its canonical
  * POSIX form (`10_Atomic/x.md`). Both `/` and `\` are accepted as separators;
- * empty and `.` segments are dropped. Throws `VaultPathError` on any violation.
+ * empty and `.` segments are dropped; segment code units are returned exactly
+ * as given (rules are evaluated on their NFC/NFKC forms, the returned path is
+ * never Unicode-normalized). Throws `VaultPathError` on any violation.
  * Pure and synchronous, so the REST client can use it before sending a request.
  */
 export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {}): string {
@@ -198,21 +219,24 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
     throw new VaultPathError('absolute', input);
   }
 
-  const segments = input
-    .split(/[\\/]+/)
-    .filter((s) => s !== '' && s !== '.')
-    .map((s) => s.normalize('NFC'));
+  // Segments keep their EXACT code units (see "Unicode normalization policy"
+  // in the header): NTFS does not normalize, so an NFC-rewritten segment would
+  // name a different file than the one the caller (or the disk) named.
+  const segments = input.split(/[\\/]+/).filter((s) => s !== '' && s !== '.');
   if (segments.length === 0) throw new VaultPathError('empty', input);
 
   for (const seg of segments) {
-    const violation = segmentViolation(seg, opts);
+    // Rules are evaluated on the raw segment and on its NFC form, so neither
+    // spelling can slip past a rule the other would trip.
+    const nfc = seg.normalize('NFC');
+    const violation = segmentViolation(seg, opts) ?? (nfc !== seg ? segmentViolation(nfc, opts) : null);
     if (violation) throw new VaultPathError(violation, input);
     // NFKC look-alikes (#8): a segment that folds to something else under
     // compatibility normalization (fullwidth `．obsidian`, `４０_Daily`) must
     // pass every rule in its folded form too, and may not fold onto a reserved
     // vault name it does not literally spell.
     const folded = seg.normalize('NFKC');
-    if (folded !== seg) {
+    if (folded !== nfc) {
       if (/[\\/:]/.test(folded) || segmentViolation(folded, opts) !== null) {
         throw new VaultPathError('lookalike', input, `"${seg}" folds to "${folded}"`);
       }
@@ -222,11 +246,69 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
     }
   }
 
-  const last = segments[segments.length - 1]!;
-  if (opts.requireMarkdown && !/\.md$/i.test(last)) {
+  const last = ruleKey(segments[segments.length - 1]!);
+  if (opts.requireMarkdown && !/\.md$/.test(last)) {
     throw new VaultPathError('not_markdown', input);
   }
   return segments.join('/');
+}
+
+/**
+ * The form a path segment (or `/`-joined path) is compared in when a RULE is
+ * evaluated: NFC, then lower-cased (NTFS is case-insensitive, and the rules'
+ * reserved names are case-insensitive on every host). Never used to build a
+ * filesystem path.
+ */
+export function ruleKey(s: string): string {
+  return s.normalize('NFC').toLowerCase();
+}
+
+/**
+ * The key under which two sibling names are "the same name" to a human: NFC,
+ * plus case folding on win32 (where case variants are one file anyway).
+ * `assertNoNormalizationSibling` refuses to create a name whose key equals an
+ * existing sibling's key when the bytes differ.
+ */
+export function foldKey(name: string): string {
+  const nfc = name.normalize('NFC');
+  return IS_WIN ? nfc.toLowerCase() : nfc;
+}
+
+/**
+ * The existing entries of `dir` whose `foldKey` equals `name`'s but which are
+ * a different name on disk (e.g. NFD `café.md` for NFC `café.md`). Case
+ * variants of `name` on win32 are the same NTFS entry, not siblings.
+ */
+export async function normalizationSiblings(dir: string, name: string): Promise<string[]> {
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (err) {
+    if (isMissing(err)) return [];
+    throw err;
+  }
+  const key = foldKey(name);
+  const same = (e: string) => (IS_WIN ? e.toLowerCase() === name.toLowerCase() : e === name);
+  return names.filter((e) => !same(e) && foldKey(e) === key);
+}
+
+/**
+ * Refuse to CREATE `name` in `dir` when a sibling with the same `foldKey` but
+ * different bytes exists (the create would mint a visually identical
+ * duplicate). Throws `VaultPathError('normalization_collision')`. Callers only
+ * invoke this when `name` itself does not exist.
+ */
+export async function assertNoNormalizationSibling(dir: string, name: string, input: string): Promise<void> {
+  const siblings = await normalizationSiblings(dir, name);
+  if (siblings.length > 0) {
+    throw new VaultPathError(
+      'normalization_collision',
+      input,
+      `${JSON.stringify(name)} would be a visually identical duplicate of the existing ` +
+        `${siblings.map((s) => JSON.stringify(s)).join(', ')} (same name after Unicode NFC` +
+        `${IS_WIN ? '/case' : ''} normalization, different bytes on disk); use the existing name`,
+    );
+  }
 }
 
 /** The first rule a single (NFC) path segment violates, or null. */
@@ -273,7 +355,11 @@ function isMissing(err: unknown): boolean {
 
 /** A target proven to lie inside the vault at resolution time. */
 export interface ContainedPath {
-  /** Canonical POSIX vault-relative path, e.g. `20_Topics/plasma.md`. */
+  /**
+   * POSIX vault-relative path, e.g. `20_Topics/plasma.md`: separators and `.`
+   * segments canonicalized, segment code units exactly as given (never
+   * Unicode-normalized; see the header).
+   */
   rel: string;
   /** The caller-supplied vault root (used for reporting; never for containment). */
   vaultRoot: string;
@@ -365,22 +451,25 @@ function assertRealSegments(
 ): void {
   const rel = path.relative(realRoot, real);
   if (rel === '') return;
-  for (const seg of rel.split(/[\\/]+/)) {
-    if (RESERVED_RE.test(seg)) {
-      throw new VaultPathError('reserved_name', input, `real path segment "${seg}"`);
+  for (const raw of rel.split(/[\\/]+/)) {
+    // Rules only: evaluated on the on-disk spelling and on its NFC form.
+    for (const seg of new Set([raw, raw.normalize('NFC')])) {
+      if (RESERVED_RE.test(seg)) {
+        throw new VaultPathError('reserved_name', input, `real path segment "${raw}"`);
+      }
+      if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) {
+        throw new VaultPathError('hidden_segment', input, `real path segment "${raw}"`);
+      }
+      if (!opts.allowLockSegments && LOCK_SEGMENT_RE.test(seg)) {
+        throw new VaultPathError('lock_segment', input, `real path segment "${raw}"`);
+      }
+      if (INVISIBLE_RE.test(seg)) {
+        throw new VaultPathError('invisible_char', input, `real path segment ${JSON.stringify(raw)}`);
+      }
     }
-    if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) {
-      throw new VaultPathError('hidden_segment', input, `real path segment "${seg}"`);
-    }
-    if (!opts.allowLockSegments && LOCK_SEGMENT_RE.test(seg)) {
-      throw new VaultPathError('lock_segment', input, `real path segment "${seg}"`);
-    }
-    if (INVISIBLE_RE.test(seg)) {
-      throw new VaultPathError('invisible_char', input, `real path segment ${JSON.stringify(seg)}`);
-    }
-    const folded = seg.normalize('NFKC');
-    if (folded !== seg && folded.startsWith('.') && !hiddenAllowed(folded, opts)) {
-      throw new VaultPathError('lookalike', input, `real path segment "${seg}" folds to "${folded}"`);
+    const folded = raw.normalize('NFKC');
+    if (folded !== raw && folded.startsWith('.') && !hiddenAllowed(folded, opts)) {
+      throw new VaultPathError('lookalike', input, `real path segment "${raw}" folds to "${folded}"`);
     }
   }
 }
@@ -483,6 +572,16 @@ export async function ensureContainedParentDir(cp: ContainedPath): Promise<strin
   let cur = cp.realRoot;
   for (const seg of cp.rel.split('/').slice(0, -1)) {
     const next = path.join(cur, seg);
+    const present = await fs.lstat(next).then(
+      () => true,
+      (err: unknown) => {
+        if (isMissing(err)) return false;
+        throw err;
+      },
+    );
+    // Never mint a directory that is a visually identical duplicate of an
+    // existing sibling with different bytes (NFC vs NFD; see the header).
+    if (!present) await assertNoNormalizationSibling(cur, seg, cp.rel);
     try {
       await fs.mkdir(next);
     } catch (err) {

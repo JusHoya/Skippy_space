@@ -85,6 +85,16 @@
 //   path rules reject `.lock` segments, and a squatted lock path (non-empty
 //   directory, file, link) is an explicit `VaultLockPathError` (vault-lock.ts).
 //
+//   Unicode names (vault-path.ts "Unicode normalization policy"): every
+//   operation acts on the note spelled EXACTLY as named (NFC `café.md` and NFD
+//   `café.md` are different NTFS files, and either can be read, updated
+//   or appended to by its own name); reserved-path rules compare NFC forms.
+//   createNote / appendNote-with-init refuse, with
+//   VaultPathError('normalization_collision'), to create a note (or directory)
+//   whose NFC (case-folded on win32) name equals an existing sibling's with
+//   different bytes; creates are additionally serialized in-process by that
+//   folded name so two differently-encoded concurrent creates cannot both pass.
+//
 //   patchFrontmatter(path, expectedHash, key, value)
 //     `updateNote` for one key. The key must be a plain lowercase snake_case
 //     name and never `id`/`created_at`/`updated_at`/`type` (so no encoded or
@@ -135,9 +145,13 @@ import {
 import { TargetExistsError, atomicWriteContained } from './safe-write.js';
 import {
   VaultPathError,
+  assertNoNormalizationSibling,
+  cmpKey,
   ensureContainedParentDir,
+  foldKey,
   recheckContained,
   resolveContained,
+  ruleKey,
   type ContainedPath,
   type VaultPathOptions,
 } from './vault-path.js';
@@ -159,8 +173,9 @@ export function isAppendOnlyType(type: unknown): boolean {
 export function reservedAppendOnlyType(relPath: string): 'daily' | 'agent_log' | null {
   const segs = relPath.split(/[\\/]+/).filter((x) => x !== '' && x !== '.');
   if (segs.length === 0) return null;
-  const first = segs[0]!.toLowerCase();
-  const last = segs[segs.length - 1]!.toLowerCase();
+  // Rule comparison only (NFC + case-insensitive); the path is never rewritten.
+  const first = ruleKey(segs[0]!);
+  const last = ruleKey(segs[segs.length - 1]!);
   if (first === '40_daily' && segs.length >= 2 && last.endsWith('.md')) return 'daily';
   if (first === '50_agents' && segs.length === 3 && last === 'agent_log.md') return 'agent_log';
   return null;
@@ -204,7 +219,7 @@ export const PROVENANCE_KEYS: readonly string[] = [
 /** True if a vault-relative path (lexical or real) lies under `60_Sources/`. */
 export function isSourcesPath(relPath: string): boolean {
   const first = relPath.split(/[\\/]+/).find((x) => x !== '' && x !== '.');
-  return first !== undefined && first.toLowerCase() === SOURCES_DIR.toLowerCase();
+  return first !== undefined && ruleKey(first) === ruleKey(SOURCES_DIR);
 }
 
 /** A non-ingest writer touched the reserved ingest subtree or a provenance key. */
@@ -398,6 +413,35 @@ export interface VaultBrokerOptions {
 
 const NOTE_PATH_OPTS: VaultPathOptions = { requireMarkdown: true };
 
+/**
+ * In-process serialization of note CREATES by `foldKey` (NFC, case-folded on
+ * win32), so two concurrent creates of differently-encoded spellings of one
+ * new name (NFC `café.md` and NFD `café.md`) cannot both pass the
+ * normalization-sibling check. This is NOT the note lock: the lock stays keyed
+ * on the real path of the actual file (distinct NTFS names never share one);
+ * this only orders creates. Acquired before the note lock, never inside it.
+ */
+const createGuards = new Map<string, Promise<unknown>>();
+
+async function withCreateGuard<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = createGuards.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  createGuards.set(key, tail);
+  try {
+    return await run;
+  } finally {
+    if (createGuards.get(key) === tail) createGuards.delete(key);
+  }
+}
+
+function createGuardKey(cp: ContainedPath): string {
+  return `${cmpKey(cp.realRoot)}\u0000${foldKey(cp.rel)}`;
+}
+
 /** Copy frontmatter and normalize YAML timestamps (parsed as Date) to ISO strings. */
 function normalizeFrontmatter(fm: Record<string, unknown>): Record<string, unknown> {
   const out = structuredClone(fm) as Record<string, unknown>;
@@ -560,7 +604,7 @@ export class VaultBroker {
     const contents = serializeNote(frontmatter, body); // throws on invalid §8.3
     const absPath = this.reportPath(cp);
 
-    const out = await this.withLock(cp, async (target, assertLockHeld, realRel) => {
+    const out = await withCreateGuard(createGuardKey(cp), () => this.withLock(cp, async (target, assertLockHeld, realRel) => {
       assertReservedCreate(cp.rel, realRel, frontmatter['type']);
       this.assertSourcesWritable(cp.rel, realRel);
       const existsResult = async () => {
@@ -574,6 +618,9 @@ export class VaultBroker {
         };
       };
       if (await recheckContained(cp, target)) return existsResult();
+      // Normalization policy (vault-path.ts header): never mint a visually
+      // identical duplicate of an existing note spelled with different bytes.
+      await assertNoNormalizationSibling(path.dirname(target), path.basename(target), cp.rel);
       try {
         await atomicWriteContained(cp, contents, {
           target,
@@ -593,7 +640,7 @@ export class VaultBroker {
         created: true,
         changed: true,
       };
-    });
+    }));
     return 'lockedOut' in out ? this.locked(cp) : out;
   }
 
@@ -750,13 +797,14 @@ export class VaultBroker {
       initContents = serializeNote(opts.init.frontmatter, opts.init.body);
     }
 
-    const out = await this.withLock(cp, async (target, assertLockHeld, realRel): Promise<BrokerResult> => {
+    const run = () => this.withLock(cp, async (target, assertLockHeld, realRel): Promise<BrokerResult> => {
       this.assertSourcesWritable(cp.rel, realRel);
       const reserved = reservedAppendOnlyType(realRel);
       const exists = await recheckContained(cp, target);
       if (!exists) {
         if (initContents === null) return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
         assertReservedCreate(cp.rel, realRel, opts.init?.frontmatter['type']);
+        await assertNoNormalizationSibling(path.dirname(target), path.basename(target), cp.rel);
         const contents = initContents + chunk;
         try {
           await atomicWriteContained(cp, contents, {
@@ -807,6 +855,8 @@ export class VaultBroker {
       const after = await readRegularFile(target, cp.rel);
       return { ok: true, path: cp.rel, absPath, hash: hashContent(after), created: false, changed: true };
     });
+    // Only an `init` append can create the note, so only it joins the create guard.
+    const out = initContents !== null ? await withCreateGuard(createGuardKey(cp), run) : await run();
     return 'lockedOut' in out ? this.locked(cp) : out;
   }
 }

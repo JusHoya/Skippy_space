@@ -6,10 +6,15 @@
 // visible on disk (the watcher/UI can surface it, a human browsing the inbox
 // sees it immediately) without touching the original bytes.
 // `vault-watcher.ts` never enqueues a `*.ingest-error.json`; it stays silent
-// only about records whose CONTENT proves they are ours (`kind` marker, known
-// reason, and a location that matches the drop the record names:
-// `isOwnIngestErrorSidecar`) and reports any other file with that suffix as
-// `reserved-name` (M0 final #6).
+// only about records that are PROVABLY ours (`isOwnIngestErrorSidecar`: `kind`
+// marker, known reason, a location that matches the drop the record names,
+// and a valid `mac`, an HMAC-SHA256 over the record's fields and its own
+// location under the per-vault secret in `.skippy/ingest-sidecar.key`,
+// ingest/sidecar-key.ts; M0 NFC/NFD round D3) and reports any other file with
+// that suffix as `reserved-name` (M0 final #6). Content alone is forgeable, so
+// a hand-written record neither counts as ours nor, through `readIngestError`,
+// suppresses the retry of a drop. Records without a valid MAC (including ones
+// written before this change) are reported once, never trusted.
 //
 // Containment (E3-2, round-2 N1): the sidecar's path is derived from the
 // untrusted `sourcePath`, so it must satisfy the same strict inbox rules as an
@@ -42,6 +47,7 @@ import {
   type IngestRejectReason,
 } from './containment.js';
 import { sha256Hex } from './originals.js';
+import { macEqual, macHex, sidecarKey } from './sidecar-key.js';
 
 export const INGEST_ERROR_SUFFIX = '.ingest-error.json';
 
@@ -70,6 +76,46 @@ export interface IngestErrorRecord {
   at: string; // ISO timestamp
   /** sha256 (hex) of the dropped content this failure applies to (E4-2/E4-7). */
   contentSha256?: string;
+  /** HMAC-SHA256 (hex) proving the pipeline wrote this record at this location (D3). */
+  mac?: string;
+}
+
+/** Location key of a sidecar inside the inbox: POSIX, case-folded on NTFS, exact code units. */
+function locationKey(inboxRel: string): string {
+  const p = inboxRel.replace(/\\/g, '/');
+  return process.platform === 'win32' ? p.toLowerCase() : p;
+}
+
+/** The canonical MAC input: every field but `mac`, plus the sidecar's own location. */
+function macInput(rec: IngestErrorRecord, sidecarInboxRel: string): string {
+  return JSON.stringify([
+    'skippy.ingest-error/v1',
+    locationKey(sidecarInboxRel),
+    rec.kind ?? null,
+    rec.inboxRel ?? null,
+    rec.sourcePath,
+    rec.reason,
+    rec.detail,
+    rec.extension,
+    rec.at,
+    rec.contentSha256 ?? null,
+  ]);
+}
+
+/** True iff `rec`, read from `sidecarAbs`, carries a valid MAC under this vault's key. */
+async function hasValidMac(vaultRoot: string, sidecarAbs: string, rec: IngestErrorRecord): Promise<boolean> {
+  if (typeof rec.mac !== 'string') return false;
+  const sidecarRel = inboxRelPath(vaultRoot, sidecarAbs);
+  if (sidecarRel === null) return false;
+  if (typeof rec.detail !== 'string' || typeof rec.extension !== 'string' || typeof rec.at !== 'string') return false;
+  let key: Buffer | null;
+  try {
+    key = await sidecarKey(vaultRoot, false);
+  } catch {
+    return false;
+  }
+  if (key === null) return false;
+  return macEqual(rec.mac, macHex(key, macInput(rec, sidecarRel)));
 }
 
 /** Natural sidecar path for a given inbox drop. */
@@ -92,8 +138,18 @@ export function fallbackIngestErrorPath(vaultRoot: string, sourcePath: string): 
   return path.join(vaultRoot, INBOX_DIR, INGEST_ERRORS_DIR, `${key}${INGEST_ERROR_SUFFIX}`);
 }
 
-async function writeSidecarAt(vaultRoot: string, sidecarAbs: string, json: string): Promise<string> {
+async function writeSidecarAt(
+  vaultRoot: string,
+  sidecarAbs: string,
+  record: IngestErrorRecord,
+  key: Buffer,
+): Promise<string> {
   const t = await resolveInboxPath(vaultRoot, sidecarAbs);
+  const sidecarRel = inboxRelPath(vaultRoot, sidecarAbs);
+  if (sidecarRel === null) {
+    throw new IngestSourceRejectedError('outside-inbox', sidecarAbs, 'no sidecar is written outside the inbox');
+  }
+  const json = JSON.stringify({ ...record, mac: macHex(key, macInput(record, sidecarRel)) }, null, 2);
   const realParent = await ensureContainedParentDir(t.cp);
   // The (possibly just created) parent chain must still be reparse-free.
   const expectedParent = path.dirname(t.cp.abs);
@@ -130,16 +186,19 @@ export async function writeIngestError(
     at: new Date().toISOString(),
     ...(contentSha256 ? { contentSha256 } : {}),
   };
-  const json = JSON.stringify(record, null, 2);
   const fallback = fallbackIngestErrorPath(vaultRoot, sourcePath);
   if (fallback === null) {
     throw new IngestSourceRejectedError('outside-inbox', sourcePath, 'no sidecar is written outside the inbox');
   }
+  // Fail closed (D3): without the vault's MAC key no record is written, since
+  // an unauthenticated record would itself be reported as a foreign file.
+  const key = await sidecarKey(vaultRoot, true);
+  if (key === null) throw new Error('ingest sidecar key unavailable');
   try {
-    return await writeSidecarAt(vaultRoot, ingestErrorPath(sourcePath), json);
+    return await writeSidecarAt(vaultRoot, ingestErrorPath(sourcePath), record, key);
   } catch (err) {
     try {
-      return await writeSidecarAt(vaultRoot, fallback, json);
+      return await writeSidecarAt(vaultRoot, fallback, record, key);
     } catch (err2) {
       throw new AggregateError([err, err2], `could not write an ingest-error sidecar for ${sourcePath}`);
     }
@@ -236,10 +295,11 @@ function sameRel(a: string, b: string): boolean {
 /**
  * True iff `sidecarAbs` is provably a record this pipeline wrote (M0 final #6):
  * it lies inside the real inbox, parses as an ingest-error record with a known
- * reason, carries the ownership marker (or the full pre-marker record shape),
- * and sits exactly where `writeIngestError` puts the record for the drop it
- * names (the natural `<drop>.ingest-error.json`, or the `_ingest-errors/`
- * fallback keyed on that drop). A user file that merely has the suffix is not.
+ * reason, carries the ownership marker, sits exactly where `writeIngestError`
+ * puts the record for the drop it names (the natural `<drop>.ingest-error.json`,
+ * or the `_ingest-errors/` fallback keyed on that drop), and carries a valid
+ * `mac` for that location under this vault's key (D3). A user file that merely
+ * has the suffix, or copies a record's shape, is not.
  */
 export async function isOwnIngestErrorSidecar(vaultRoot: string, sidecarAbs: string): Promise<boolean> {
   let rec: IngestErrorRecord | null;
@@ -251,21 +311,28 @@ export async function isOwnIngestErrorSidecar(vaultRoot: string, sidecarAbs: str
   if (!rec || typeof rec.reason !== 'string' || !RECORD_REASONS.has(rec.reason) || typeof rec.at !== 'string') {
     return false;
   }
-  if (rec.kind !== undefined && rec.kind !== INGEST_ERROR_KIND) return false;
+  if (rec.kind !== INGEST_ERROR_KIND) return false;
   const sidecarRel = inboxRelPath(vaultRoot, sidecarAbs);
   if (sidecarRel === null) return false;
   const dropRel = typeof rec.inboxRel === 'string' ? rec.inboxRel : inboxRelPath(vaultRoot, rec.sourcePath);
   if (dropRel === null) return false;
-  if (sameRel(sidecarRel, `${dropRel}${INGEST_ERROR_SUFFIX}`)) return true;
-  const fallback = fallbackIngestErrorPath(vaultRoot, path.join(vaultRoot, INBOX_DIR, ...dropRel.split('/')));
-  const fallbackRel = fallback === null ? null : inboxRelPath(vaultRoot, fallback);
-  return fallbackRel !== null && sameRel(sidecarRel, fallbackRel);
+  let located = sameRel(sidecarRel, `${dropRel}${INGEST_ERROR_SUFFIX}`);
+  if (!located) {
+    const fallback = fallbackIngestErrorPath(vaultRoot, path.join(vaultRoot, INBOX_DIR, ...dropRel.split('/')));
+    const fallbackRel = fallback === null ? null : inboxRelPath(vaultRoot, fallback);
+    located = fallbackRel !== null && sameRel(sidecarRel, fallbackRel);
+  }
+  // D3: the shape and location are forgeable; the MAC is not.
+  return located && (await hasValidMac(vaultRoot, sidecarAbs, rec));
 }
 
 /**
  * Read back the sidecar error record for `sourcePath` (natural path first,
  * then the `_ingest-errors/` fallback), or `null` if none exists, it is
- * unparseable, or its path is not safely inside the inbox.
+ * unparseable, its path is not safely inside the inbox, or it is not provably
+ * the pipeline's own record (valid `mac`, D3): a hand-written record never
+ * stands in for a real failure (the watcher uses its `contentSha256` to skip
+ * retries).
  */
 export async function readIngestError(
   vaultRoot: string,
@@ -276,7 +343,7 @@ export async function readIngestError(
     if (c === null) continue;
     try {
       const rec = await readSidecarAt(vaultRoot, c);
-      if (rec) return rec;
+      if (rec && (await isOwnIngestErrorSidecar(vaultRoot, c))) return rec;
     } catch {
       // unsafe or unreadable candidate: try the next one
     }

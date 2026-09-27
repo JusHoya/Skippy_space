@@ -598,8 +598,10 @@ test('M0F-8: invisible, bidi and NFKC look-alike segments are rejected; ordinary
   for (const [p, v] of cases) {
     assert.throws(() => normalizeVaultRelPath(p, { requireMarkdown: true }), rejectsViolation(v), JSON.stringify(p));
   }
-  assert.equal(normalizeVaultRelPath('10_Atomic/café.md'), '10_Atomic/café.md', 'NFC-normalized');
-  for (const ok of ['10_Atomic/café.md', '10_Atomic/日本語.md', '10_Atomic/über note.md']) {
-    assert.equal(normalizeVaultRelPath(ok), ok.normalize('NFC'));
+  // NFC/NFD round: NTFS does not normalize names, so the path keeps its exact
+  // code units (NFD stays NFD); only the rules see normalized forms.
+  assert.equal(normalizeVaultRelPath('10_Atomic/cafe\u0301.md'), '10_Atomic/cafe\u0301.md', 'exact bytes kept');
+  for (const ok of ['10_Atomic/caf\u00e9.md', '10_Atomic/日本語.md', '10_Atomic/über note.md']) {
+    assert.equal(normalizeVaultRelPath(ok), ok);
   }
 });

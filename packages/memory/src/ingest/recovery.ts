@@ -36,7 +36,7 @@ import { randomBytes } from 'node:crypto';
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import { cmpKey } from '../vault-path.js';
+import { cmpKey, ruleKey } from '../vault-path.js';
 import { INBOX_DIR, INGEST_ERRORS_DIR, MAX_INGEST_BYTES, resolveInboxPath } from './containment.js';
 import { extensionOf } from './extractors.js';
 import { readMarker, sha256Hex, storedOriginalIsIntact } from './originals.js';
@@ -166,7 +166,9 @@ export async function recoverIngestTemps(vaultRoot: string, maxDepth: number): P
       const lst = await fs.lstat(abs).catch(() => null);
       if (!lst || lst.isSymbolicLink()) continue;
       if (lst.isDirectory()) {
-        if (name.startsWith('.') || name.toLowerCase() === INGEST_ERRORS_DIR || depth + 1 > maxDepth) continue;
+        // Never walks `_ingest-errors/`: ingest never freezes a file there, so
+        // the watcher reports any freeze-named file in it (D4).
+        if (name.startsWith('.') || ruleKey(name) === INGEST_ERRORS_DIR || depth + 1 > maxDepth) continue;
         await walk(abs, depth + 1);
         continue;
       }
