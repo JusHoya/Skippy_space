@@ -5,6 +5,8 @@
 //       credential deny list: the rule saw only the literal argument
 //   D2  Grep/Glob results were never checked: `Grep SECRET` (no glob),
 //       `glob: ".en?"`, `glob: "*.pe?"` and `Glob "**/*"` returned credentials
+//       (F3 redesign: the tree rg walks is enumerated and any credential
+//       entry in it denies the call; see tool-authority-rtf3.test.ts)
 //   D3  a junction inside the root pointing at an in-root credential directory
 //       (`lnk -> .aws`) bypassed the name check
 //   D5  misspelled / lookalike authority keys (`permision_mode`, Cyrillic
@@ -47,8 +49,6 @@ const isWin = process.platform === 'win32';
 type PolicyExtras = {
   credentialTargetRejection?: (p: string) => string | null;
   scanForCredentials?: (root: string) => { ok: true; scan: { dirs: string[]; files: string[]; entries: number } } | { ok: false; reason: string };
-  credentialNegatives?: (scan: { dirs: string[]; files: string[]; entries: number }) => string[] | null;
-  globCouldMatch?: (glob: string, rel: string) => boolean;
   redactSearchOutput?: (
     policy: ExecutionPolicy,
     toolName: string,
@@ -198,36 +198,37 @@ test('D3: a junction inside the root that points at an in-root credential direct
 });
 
 // ── D2: search results ───────────────────────────────────────────────────────
+//
+// F3 redesign: Grep/Glob are gated on the TREE rg walks, not on modelled
+// filtering. A credential entry anywhere under the search root denies the
+// call; the model is told to narrow `path`. Nothing is rewritten.
 
-test('D2: Grep never searches credential entries — the call is rewritten with anchored negative globs', async () => {
+test('D2/F3: Grep is denied whenever the tree under its search root holds a credential entry — no rewrite', async () => {
   const { wt } = await credentialWorktree();
   const policy = readPolicy(wt);
-  const expectNeg = ['!/.env', '!/.env.production', '!/.aws', '!/.ssh', '!/server.pem'];
   for (const input of [
     { pattern: 'SECRET', output_mode: 'content' },
     { pattern: 'SECRET', path: wt, output_mode: 'content' },
     { pattern: 'SECRET', glob: '.en?', output_mode: 'content' },
     { pattern: 'SECRET', glob: '[.]env', output_mode: 'content' },
     { pattern: 'SECRET', glob: '*.pe?', output_mode: 'content' },
+    { pattern: 'SECRET', glob: '*.txt', output_mode: 'content' }, // a narrowing glob is not modelled: still denied
     { pattern: 'SECRET', type: 'txt' },
+    { pattern: 'plain', path: path.join(wt, 'lnk') },
   ]) {
-    const d = allowed(await evaluateToolCall(policy, { toolName: 'Grep', input }), JSON.stringify(input));
-    const glob = d.updatedInput?.['glob'];
-    assert.equal(typeof glob, 'string', `Grep ${JSON.stringify(input)} carries a rewritten glob`);
-    const tokens = (glob as string).split(/\s+/);
-    for (const n of expectNeg) assert.ok(tokens.includes(n), `${glob} excludes ${n}`);
-    if (typeof input.glob === 'string') assert.equal(tokens[0], input.glob, 'the original glob is kept first');
-    // Negatives are appended last: rg gives the later glob precedence.
-    assert.ok(tokens.indexOf(expectNeg[0] as string) > (typeof input.glob === 'string' ? 0 : -1));
-    // Nothing else about the call changes.
-    for (const [k, v] of Object.entries(input)) if (k !== 'glob') assert.deepEqual(d.updatedInput?.[k], v);
+    const d = denied(await evaluateToolCall(policy, { toolName: 'Grep', input }), JSON.stringify(input));
+    assert.equal(d.code, 'credential_path');
+    assert.match(d.reason, /narrow `path`|credential/i);
+    assert.ok(!('updatedInput' in d), 'no input rewrite exists any more');
   }
-  // A subtree without credentials needs no rewrite.
+  // A subtree without credentials runs unchanged.
   const clean = allowed(await evaluateToolCall(policy, { toolName: 'Grep', input: { pattern: 'plain', path: path.join(wt, 'sub') } }));
-  assert.equal(clean.updatedInput, undefined);
+  assert.ok(!('updatedInput' in clean));
+  allowed(await evaluateToolCall(policy, { toolName: 'Grep', input: { pattern: 'plain', path: path.join(wt, 'sub'), glob: '**/*' } }));
+  allowed(await evaluateToolCall(policy, { toolName: 'Grep', input: { pattern: 'plain', path: path.join(wt, 'inside.txt') } }), 'a file root');
 });
 
-test('D2: Glob is denied whenever its pattern could list a credential file under the search root', async () => {
+test('D2/F3: Glob is denied whenever the tree rg walks holds a credential entry, whatever the pattern', async () => {
   const { wt } = await credentialWorktree();
   const policy = readPolicy(wt);
   for (const input of [
@@ -239,25 +240,33 @@ test('D2: Glob is denied whenever its pattern could list a credential file under
     { pattern: '*.pe?' },
     { pattern: '**/{config,id_*}' },
     { pattern: '.*' },
+    { pattern: '*.txt' }, // narrowing patterns are not modelled: the tree decides
+    { pattern: 'sub/**/*.txt' },
+    { pattern: '**/*.md' },
     { pattern: `${wt.replace(/\\/g, '/')}/**/*` },
+    { pattern: `${wt.replace(/\\/g, '/')}/./*.txt` },
     { pattern: '*', path: wt },
   ]) {
-    assert.equal(denied(await evaluateToolCall(policy, { toolName: 'Glob', input }), JSON.stringify(input)).code, 'credential_path');
+    const d = denied(await evaluateToolCall(policy, { toolName: 'Glob', input }), JSON.stringify(input));
+    assert.equal(d.code, 'credential_path');
   }
-  for (const input of [{ pattern: '*.txt' }, { pattern: 'sub/**/*.txt' }, { pattern: '**/*.md' }, { pattern: '*', path: path.join(wt, 'sub') }]) {
+  for (const input of [
+    { pattern: '*', path: path.join(wt, 'sub') },
+    { pattern: '**/*.txt', path: path.join(wt, 'sub') },
+    { pattern: `${wt.replace(/\\/g, '/')}/sub/**/*` }, // absolute: rg runs in the static prefix
+    { pattern: `${wt.replace(/\\/g, '/')}/./sub//deep/*` }, // non-normalised absolute prefix
+  ]) {
     allowed(await evaluateToolCall(policy, { toolName: 'Glob', input }), JSON.stringify(input));
   }
 });
 
-test('D2: the search-tree scan is bounded and fails closed; unexpressible credential names deny Grep', async () => {
+test('D2/F3: the search-tree scan has no carve-outs and is bounded (a bound is a denial)', async () => {
   const scan = extra('scanForCredentials');
-  const negatives = extra('credentialNegatives');
   const { wt } = await credentialWorktree();
   const r = scan(wt);
   assert.ok(r.ok, JSON.stringify(r));
   assert.deepEqual([...r.scan.dirs].sort(), ['.aws', '.ssh']);
   assert.deepEqual([...r.scan.files].sort(), ['.aws/credentials', '.env', '.env.production', '.ssh/config', '.ssh/id_ed25519', 'server.pem']);
-  assert.deepEqual([...(negatives(r.scan) ?? [])].sort(), ['!/.aws', '!/.env', '!/.env.production', '!/.ssh', '!/server.pem']);
   // Depth cap => denial, not a guess.
   const deep = await tmpDir('skippy-rtf2-deep-');
   let cur = deep;
@@ -270,88 +279,65 @@ test('D2: the search-tree scan is bounded and fails closed; unexpressible creden
   assert.match(dr.ok ? '' : dr.reason, /deeper than|narrow/);
   assert.equal(denied(await evaluateToolCall(readPolicy(deep), { toolName: 'Grep', input: { pattern: 'x' } })).code, 'credential_path');
   assert.equal(denied(await evaluateToolCall(readPolicy(deep), { toolName: 'Glob', input: { pattern: '*.txt' } })).code, 'credential_path');
-  // A credential name the CLI's glob splitter could not carry => deny Grep.
+  // A credential name with whitespace is just a credential name now.
   const odd = await tmpDir('skippy-rtf2-odd-');
   await fs.writeFile(path.join(odd, 'my key.pem'), 'SECRET');
-  assert.equal(negatives((scan(odd) as { ok: true; scan: { dirs: string[]; files: string[]; entries: number } }).scan), null);
   assert.equal(denied(await evaluateToolCall(readPolicy(odd), { toolName: 'Grep', input: { pattern: 'x' } })).code, 'credential_path');
-  // node_modules and VCS directories are not enumerated (documented carve-out).
+  // node_modules and VCS directories are NOT carved out (F3: the carve-out leaked).
   const nm = await tmpDir('skippy-rtf2-nm-');
   await fs.mkdir(path.join(nm, 'node_modules', 'pkg'), { recursive: true });
+  await fs.mkdir(path.join(nm, '.git'), { recursive: true });
   await fs.writeFile(path.join(nm, 'node_modules', 'pkg', '.env'), 'x');
-  assert.deepEqual((scan(nm) as { ok: true; scan: { files: string[] } }).scan.files, []);
+  await fs.writeFile(path.join(nm, '.git', 'id_rsa'), 'x');
+  assert.deepEqual((scan(nm) as { ok: true; scan: { files: string[] } }).scan.files.sort(), ['.git/id_rsa', 'node_modules/pkg/.env']);
+  assert.equal(denied(await evaluateToolCall(readPolicy(nm), { toolName: 'Grep', input: { pattern: 'x' } })).code, 'credential_path');
+  assert.equal(denied(await evaluateToolCall(readPolicy(nm), { toolName: 'Grep', input: { pattern: 'x', path: 'node_modules' } })).code, 'credential_path');
 });
 
-test('D2: gitignore-style glob matching is over-inclusive (a "maybe" is a match)', () => {
-  const m = extra('globCouldMatch');
-  const yes: Array<[string, string]> = [
-    ['.en?', '.env'],
-    ['*.pe?', 'server.pem'],
-    ['[.]env', '.env'],
-    ['**/*', '.ssh/config'],
-    ['*', '.aws/credentials'],
-    ['**', 'a/b/.env'],
-    ['.ssh/*', '.ssh/id_ed25519'],
-    ['/.ssh/**', '.ssh/x/y'],
-    ['.ssh/', '.ssh/config'],
-    ['sub/**/*.pem', 'sub/deep/k.pem'],
-    ['*.PEM', 'server.pem'],
-    ['a**b', 'axxb'],
-    ['sub\\*.pem', 'sub/k.pem'],
-    ['**/config', '.ssh/config'],
-  ];
-  for (const [g, rel] of yes) assert.equal(m(g, rel), true, `${g} ~ ${rel}`);
-  const no: Array<[string, string]> = [
-    ['*.ts', '.env'],
-    ['sub/**/*.txt', '.ssh/config'],
-    ['src/*', '.env'],
-    ['*.txt', 'server.pem'],
-    ['/inside.txt', 'sub/inside.txt'],
-  ];
-  for (const [g, rel] of no) assert.equal(m(g, rel), false, `${g} !~ ${rel}`);
-});
-
-test('D2: the SDK options carry the Grep rewrite on PreToolUse and a PostToolUse redaction hook', async () => {
+test('D2/F3: the SDK options deny Grep/Glob on PreToolUse (no rewrite) and withhold on PostToolUse', async () => {
   const { wt } = await credentialWorktree();
   const policy = readPolicy(wt);
-  const opts = buildClaudeSdkPermissionOptions(policy);
+  const audit: string[] = [];
+  const opts = buildClaudeSdkPermissionOptions(policy, { onDecision: (e) => audit.push(`${e.via}:${e.decision.allow ? 'allow' : e.decision.code}`) });
   const pre = opts.hooks.PreToolUse?.[0]?.hooks[0];
   assert.ok(pre, 'PreToolUse hook');
   const out = (await pre(
     { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'SECRET' }, tool_use_id: 'tu1', session_id: 's', transcript_path: 't', cwd: wt } as never,
     'tu1',
     { signal: new AbortController().signal },
-  )) as { hookSpecificOutput?: { permissionDecision?: string; updatedInput?: Record<string, unknown> } };
-  assert.equal(out.hookSpecificOutput?.permissionDecision, 'allow');
-  assert.match(String(out.hookSpecificOutput?.updatedInput?.['glob']), /!\/\.env/);
-  // canUseTool (when consulted) hands the same rewritten input to the CLI.
+  )) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; updatedInput?: unknown } };
+  assert.equal(out.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.match(String(out.hookSpecificOutput?.permissionDecisionReason), /credential_path/);
+  assert.equal(out.hookSpecificOutput?.updatedInput, undefined);
   const cut = await opts.canUseTool('Grep', { pattern: 'SECRET' }, { signal: new AbortController().signal, toolUseID: 'tu2' });
-  assert.equal(cut.behavior, 'allow');
-  assert.match(String((cut as { updatedInput?: Record<string, unknown> }).updatedInput?.['glob']), /!\/\.ssh/);
+  assert.equal(cut.behavior, 'deny');
+  // An allowed call passes through the hook untouched (no updatedInput).
+  const ok = (await pre(
+    { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'plain', path: path.join(wt, 'sub') }, tool_use_id: 'tu3', session_id: 's', transcript_path: 't', cwd: wt } as never,
+    'tu3',
+    { signal: new AbortController().signal },
+  )) as Record<string, unknown>;
+  assert.deepEqual(ok, {});
   // PostToolUse: matched to the search tools, replaces credential-bearing output.
   const post = opts.hooks.PostToolUse?.find((m) => /Grep/.test(m.matcher ?? ''))?.hooks[0];
   assert.ok(post, 'PostToolUse hook for Grep/Glob');
-  const audit: string[] = [];
-  const opts2 = buildClaudeSdkPermissionOptions(policy, { onDecision: (e) => audit.push(`${e.via}:${e.decision.allow ? 'allow' : e.decision.code}`) });
-  const post2 = opts2.hooks.PostToolUse?.[0]?.hooks[0];
-  assert.ok(post2);
   const leaked = {
     hook_event_name: 'PostToolUse',
     tool_name: 'Grep',
     tool_input: { pattern: 'SECRET', output_mode: 'content' },
     tool_response: { mode: 'content', numFiles: 0, filenames: [], content: 'server.pem:1:SECRET_PEM\n.env:1:SECRET_ENV=x', numLines: 2 },
-    tool_use_id: 'tu3',
+    tool_use_id: 'tu4',
     session_id: 's',
     transcript_path: 't',
     cwd: wt,
   };
-  const r = (await post2(leaked as never, 'tu3', { signal: new AbortController().signal })) as {
+  const r = (await post(leaked as never, 'tu4', { signal: new AbortController().signal })) as {
     hookSpecificOutput?: { hookEventName?: string; updatedToolOutput?: Record<string, unknown> };
   };
   assert.equal(r.hookSpecificOutput?.hookEventName, 'PostToolUse');
   assert.equal(r.hookSpecificOutput?.updatedToolOutput?.['numFiles'], 0);
   assert.doesNotMatch(JSON.stringify(r.hookSpecificOutput?.updatedToolOutput), /SECRET_/);
-  assert.deepEqual(audit, ['PostToolUse:credential_path']);
+  assert.deepEqual(audit, ['PreToolUse:credential_path', 'canUseTool:credential_path', 'PreToolUse:allow', 'PostToolUse:credential_path']);
 });
 
 test('D2: redactSearchOutput withholds any Grep/Glob result naming a credential path and passes benign results', async () => {

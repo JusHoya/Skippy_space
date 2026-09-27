@@ -10,9 +10,11 @@
 // files, every Read of an 8.3 short name / junction alias, every Grep that
 // could reach a credential entry and every Glob that could list one must
 // come back to the model WITHOUT a secret, while benign reads and searches
-// still work. Layer (b) is exercised separately: a credential inside
-// `node_modules` (not enumerated pre-execution) is still redacted from the
-// rg output by the PostToolUse hook.
+// narrowed to a clean subtree still work. (F3: the tree rg walks decides —
+// a Grep/Glob from the credential-bearing root is denied outright; nothing
+// is rewritten.) Layer (b) is exercised separately: a credential that
+// appears between the gate and rg is still redacted from the rg output by
+// the PostToolUse hook.
 
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -249,12 +251,12 @@ test('live CLI (F2 D1-D3): 8.3 / junction reads, bare Grep, wildcard globs and G
     { name: 'Glob', input: { pattern: 'AWS~1/*' } },
     { name: 'Glob', input: { pattern: 'lnk/*' } },
     { name: 'Glob', input: { pattern: '*', path: w('SSH~1') } },
-    // Benign work must still succeed.
+    // Benign work, narrowed to the clean subtree, must still succeed.
     { name: 'Read', input: { file_path: w('inside.txt') } },
-    { name: 'Grep', input: { pattern: 'BENIGN_MARKER', output_mode: 'content' } },
+    { name: 'Grep', input: { pattern: 'BENIGN_MARKER', path: w('sub'), output_mode: 'content' } },
     { name: 'Grep', input: { pattern: 'BENIGN_MARKER', path: w('sub'), output_mode: 'files_with_matches' } },
-    { name: 'Glob', input: { pattern: '*.txt' } },
-    { name: 'Glob', input: { pattern: 'sub/**/*.txt' } },
+    { name: 'Glob', input: { pattern: '*.txt', path: w('sub') } },
+    { name: 'Glob', input: { pattern: '**/*.txt', path: w('sub') } },
   ];
   const decisions: Array<{ via: string; tool: string; allow: boolean; code?: string }> = [];
   const r = await executeBoardMissionViaSdk({
@@ -269,57 +271,75 @@ test('live CLI (F2 D1-D3): 8.3 / junction reads, bare Grep, wildcard globs and G
   // The credential names themselves are not listed either (Glob **/*).
   const listed = results.filter((x) => !x.isError && /\.env|\.ssh|\.aws|\.pem|credentials|id_ed25519/i.test(x.content));
   assert.deepEqual(listed, [], `no successful result lists a credential name: ${JSON.stringify(listed)}`);
-  // Benign calls: the in-worktree Read, the rewritten Grep and the clean Globs
+  // Benign calls: the in-worktree Read and the searches narrowed to `sub`
   // produced real output.
   const ok = results.filter((x) => !x.isError && /BENIGN_MARKER|inside\.txt|notes\.txt/.test(x.content));
-  assert.ok(ok.length >= 5, `benign reads/searches still work: ${JSON.stringify(results.filter((x) => !x.isError))}`);
+  assert.equal(ok.length, 5, `benign reads/searches still work: ${JSON.stringify(results.filter((x) => !x.isError))}`);
   // Denied BEFORE execution by the policy gate: the 6 Reads, the 6 Globs and
-  // the 2 Greps whose `path` is a short name / junction. The 6 remaining
-  // Greps run with credential negatives appended (allowed, rewritten) and —
-  // asserted above — returned no secret. The run is blocked (G0).
+  // all 8 credential-probing Greps (F3: the tree under the root holds
+  // credentials, so no glob rewrite is attempted). The run is blocked (G0).
   const preDenied = decisions.filter((d) => d.via === 'PreToolUse' && !d.allow);
-  assert.equal(preDenied.length, 14, `PreToolUse denials: ${JSON.stringify(preDenied)}`);
+  assert.equal(preDenied.length, 20, `PreToolUse denials: ${JSON.stringify(preDenied)}`);
   assert.deepEqual(
     preDenied.map((d) => d.tool).sort(),
-    ['Glob', 'Glob', 'Glob', 'Glob', 'Glob', 'Glob', 'Grep', 'Grep', 'Read', 'Read', 'Read', 'Read', 'Read', 'Read'],
+    ['Glob', 'Glob', 'Glob', 'Glob', 'Glob', 'Glob', 'Grep', 'Grep', 'Grep', 'Grep', 'Grep', 'Grep', 'Grep', 'Grep', 'Read', 'Read', 'Read', 'Read', 'Read', 'Read'],
   );
   assert.ok(preDenied.every((d) => d.code === 'credential_path' || d.code === 'path_outside_roots'), JSON.stringify(preDenied));
-  const rewrittenGreps = decisions.filter((d) => d.via === 'PreToolUse' && d.allow && d.tool === 'Grep');
-  assert.equal(rewrittenGreps.length, 8, `6 credential-probing + 2 benign Greps ran rewritten: ${JSON.stringify(decisions)}`);
+  const allowedGreps = decisions.filter((d) => d.via === 'PreToolUse' && d.allow && d.tool === 'Grep');
+  assert.equal(allowedGreps.length, 2, `only the 2 narrowed Greps ran: ${JSON.stringify(decisions)}`);
+  assert.equal(decisions.filter((d) => d.via === 'PostToolUse').length, 0, 'nothing had to be withheld after the fact');
   assert.equal(r.status, 'blocked', JSON.stringify(r));
 });
 
-test('live CLI (F2 D2 layer b): a credential inside node_modules that rg reaches is redacted by the PostToolUse hook', { skip, timeout: 180_000 }, async () => {
+test('live CLI (F2 D2 layer b / F3): node_modules is gated like any directory; a credential planted after the gate is redacted by the PostToolUse hook', { skip, timeout: 180_000 }, async () => {
   results = [];
+  const late = path.join(work, 'late');
+  fs.mkdirSync(late, { recursive: true });
+  for (const f of fs.readdirSync(late)) fs.rmSync(path.join(late, f), { force: true });
   scenario = [
+    // F3: no node_modules carve-out — denied before rg runs.
     { name: 'Grep', input: { pattern: 'SECRET|BENIGN', path: path.join(work, 'node_modules'), output_mode: 'content' } },
     { name: 'Glob', input: { pattern: '**/*', path: path.join(work, 'node_modules') } },
-    { name: 'Grep', input: { pattern: 'BENIGN', path: path.join(work, 'node_modules', 'pkg'), glob: '*.js', output_mode: 'content' } },
+    // Layer (b): `late` is empty at gate time; `.env` lands before rg runs.
+    { name: 'Grep', input: { pattern: 'SECRET|BENIGN', path: late, output_mode: 'content' } },
+    { name: 'Grep', input: { pattern: 'BENIGN', path: path.join(work, 'sub'), output_mode: 'content' } },
   ];
   const decisions: Array<{ via: string; tool: string; allow: boolean }> = [];
+  let planted = false;
   const r = await executeBoardMissionViaSdk({
     ...mission(),
-    enforcement: { onDecision: (e) => decisions.push({ via: e.via, tool: e.toolName, allow: e.decision.allow }) },
+    enforcement: {
+      onDecision: (e) => {
+        decisions.push({ via: e.via, tool: e.toolName, allow: e.decision.allow });
+        if (!planted && e.via === 'PreToolUse' && e.decision.allow && e.toolName === 'Grep') {
+          planted = true;
+          fs.writeFileSync(path.join(late, '.env'), 'SECRET_LATE=lateleak\n');
+        }
+      },
+    },
   });
-  assert.equal(results.length, 3, JSON.stringify(results));
-  const leaked = results.filter((x) => SECRET.test(x.content) || /\.env/.test(x.content));
+  assert.ok(planted, 'the race was staged');
+  assert.equal(results.length, 4, JSON.stringify(results));
+  const leaked = results.filter((x) => SECRET.test(x.content) || /SECRET_LATE|\.env/.test(x.content));
   assert.deepEqual(leaked, [], `PostToolUse withheld the credential-bearing output: ${JSON.stringify(results)}`);
   assert.ok(results.some((x) => /withheld|credential/i.test(x.content)), `the model is told why: ${JSON.stringify(results)}`);
-  assert.ok(results.some((x) => !x.isError && /index\.js/.test(x.content)), `the clean Grep still returns its match: ${JSON.stringify(results)}`);
+  assert.ok(results.some((x) => !x.isError && /notes\.txt/.test(x.content)), `the clean Grep still returns its match: ${JSON.stringify(results)}`);
+  assert.equal(decisions.filter((d) => d.via === 'PreToolUse' && !d.allow).length, 2, JSON.stringify(decisions));
   assert.ok(decisions.some((d) => d.via === 'PostToolUse' && !d.allow), JSON.stringify(decisions));
   assert.equal(r.status, 'blocked', JSON.stringify(r));
+  fs.rmSync(path.join(late, '.env'), { force: true });
 });
 
-test('live CLI (control): benign Read + Grep on the credential-bearing worktree → succeeded', { skip, timeout: 180_000 }, async () => {
+test('live CLI (control): benign Read + narrowed Grep/Glob on the credential-bearing worktree → succeeded', { skip, timeout: 180_000 }, async () => {
   results = [];
   scenario = [
     { name: 'Read', input: { file_path: path.join(work, 'inside.txt') } },
-    { name: 'Grep', input: { pattern: 'BENIGN_MARKER', output_mode: 'content' } },
-    { name: 'Glob', input: { pattern: '*.txt' } },
+    { name: 'Grep', input: { pattern: 'BENIGN_MARKER', path: path.join(work, 'sub'), output_mode: 'content' } },
+    { name: 'Glob', input: { pattern: '*.txt', path: path.join(work, 'sub') } },
   ];
   const r = await executeBoardMissionViaSdk(mission());
   assert.equal(r.status, 'succeeded', JSON.stringify(r));
   assert.equal(results.length, 3);
   assert.ok(results.every((x) => !x.isError && !SECRET.test(x.content)), JSON.stringify(results));
-  assert.ok(results.some((x) => /inside\.txt:1:inside BENIGN_MARKER/.test(x.content)), JSON.stringify(results));
+  assert.ok(results.some((x) => /notes\.txt:1:plain BENIGN_MARKER/.test(x.content)), JSON.stringify(results));
 });

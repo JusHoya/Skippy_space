@@ -196,7 +196,15 @@ test('N2: well-known credential locations are denied even inside an assigned wor
     assert.equal(denied(await evaluateToolCall(policy, { toolName: 'Grep', input: { pattern: 'x', glob: pattern } })).code, 'credential_path', `Grep glob ${pattern}`);
   }
   assert.equal(denied(await evaluateToolCall(policy, { toolName: 'Glob', input: { pattern: '*', path: path.join(wt, '.ssh') } })).code, 'credential_path');
-  assert.equal((await evaluateToolCall(policy, { toolName: 'Glob', input: { pattern: 'src/**/*.ts' } })).allow, true);
+  // F3: the tree rg walks decides, not the pattern — a Glob from the
+  // credential-bearing root is denied even for `src/**/*.ts`; the same
+  // search from a clean subtree runs.
+  await fs.mkdir(path.join(wt, 'clean'), { recursive: true });
+  await fs.writeFile(path.join(wt, 'clean', 'index.ts'), 'export {};');
+  const fromRoot = denied(await evaluateToolCall(policy, { toolName: 'Glob', input: { pattern: 'src/**/*.ts' } }));
+  assert.equal(fromRoot.code, 'credential_path');
+  assert.match(fromRoot.reason, /narrow `path`/);
+  assert.equal((await evaluateToolCall(policy, { toolName: 'Glob', input: { pattern: '**/*.ts', path: path.join(wt, 'clean') } })).allow, true);
 });
 
 // ── N4: charter authority keys cannot be smuggled past the parser ────────────
