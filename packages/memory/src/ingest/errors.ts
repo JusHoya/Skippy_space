@@ -27,6 +27,12 @@
 // instead (N6). Paths outside the inbox never get a sidecar. Writes use
 // `atomicWriteContained` (safe-write.ts), never write-file-atomic (N3).
 //
+// Exact names (PRD OQ-21; M0 case-fold round): the MAC's location, the
+// "sits where the writer puts it" check and the fallback key all use the
+// EXACT inbox-relative path (POSIX separators only), never a case fold, so
+// two drops NTFS keeps distinct never share a record and a record copied to
+// a look-alike name does not authenticate there.
+//
 // E4-2/E4-7: every record carries the dropped content's sha256 when it was
 // read, so a retrying watcher can tell "this exact content already failed,
 // don't loop" apart from "the file changed since the last failure, retry it".
@@ -80,10 +86,18 @@ export interface IngestErrorRecord {
   mac?: string;
 }
 
-/** Location key of a sidecar inside the inbox: POSIX, case-folded on NTFS, exact code units. */
+/**
+ * Location key of a sidecar inside the inbox: POSIX separators, otherwise the
+ * EXACT code units (PRD OQ-21; M0 case-fold round, gap 2). Never case-folded:
+ * JavaScript's `toLowerCase` folds pairs NTFS keeps distinct (U+212A KELVIN
+ * SIGN and `K`, ...), so a folded key let a genuine record copied to
+ * `Kelvin.xyz.ingest-error.json` authenticate for a different drop. The
+ * watcher and `readIngestError` pass on-disk (or drop-derived) names, so the
+ * exact key is what a genuine record is found under; a record copied or
+ * renamed to any other exact path fails its MAC.
+ */
 function locationKey(inboxRel: string): string {
-  const p = inboxRel.replace(/\\/g, '/');
-  return process.platform === 'win32' ? p.toLowerCase() : p;
+  return inboxRel.replace(/\\/g, '/');
 }
 
 /** The canonical MAC input: every field but `mac`, plus the sidecar's own location. */
@@ -131,10 +145,11 @@ export function ingestErrorPath(sourcePath: string): string {
 export function fallbackIngestErrorPath(vaultRoot: string, sourcePath: string): string | null {
   const rel = inboxRelPath(vaultRoot, sourcePath);
   if (rel === null) return null;
-  // Keyed on the inbox-relative path (case-folded on NTFS), not its content:
-  // a rejected drop is never read.
-  const norm = process.platform === 'win32' ? rel.toLowerCase() : rel;
-  const key = createHash('sha256').update(norm).digest('hex');
+  // Keyed on the EXACT inbox-relative path (POSIX separators), not its content
+  // (a rejected drop is never read) and never case-folded: two drops NTFS
+  // keeps distinct (`Kelvin.xyz` with U+212A vs `Kelvin.xyz`) must not share
+  // one record (gap 3).
+  const key = createHash('sha256').update(locationKey(rel)).digest('hex');
   return path.join(vaultRoot, INBOX_DIR, INGEST_ERRORS_DIR, `${key}${INGEST_ERROR_SUFFIX}`);
 }
 
@@ -284,12 +299,9 @@ const RECORD_REASONS: ReadonlySet<string> = new Set([
   'internal-folder',
 ]);
 
+/** Exact (separator-normalized) inbox-relative path equality; see `locationKey`. */
 function sameRel(a: string, b: string): boolean {
-  const norm = (s: string) => {
-    const p = s.replace(/\\/g, '/');
-    return process.platform === 'win32' ? p.toLowerCase() : p;
-  };
-  return norm(a) === norm(b);
+  return locationKey(a) === locationKey(b);
 }
 
 /**

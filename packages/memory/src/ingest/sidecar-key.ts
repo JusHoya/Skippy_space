@@ -18,6 +18,15 @@
 //     `.skippy` hidden segment (also on the real path), created with an
 //     exclusive contained atomic write, and read through a handle that must be
 //     a single-link regular file of exactly 64 hex characters;
+//   - `.skippy` itself must be a PLAIN directory (not a junction, symlink or
+//     other reparse point) whose real path is exactly `<real vault>/.skippy`
+//     (M0 case-fold round, gap 4; also enforced generically for
+//     `allowHiddenNames` in vault-path.ts). A `.skippy` junction to a note
+//     folder such as `10_Atomic/` would otherwise pass the hidden-segment rule
+//     (the folder it points at is not hidden) and plant or read the key there.
+//     On any other shape the writer refuses (no record is written; the watcher
+//     still reports the drop through its events) and the verifier trusts
+//     nothing;
 //   - writers create it on first use; verifiers never create it (no key means
 //     no record can be ours);
 //   - the loaded key is cached per canonical vault root, so concurrent first
@@ -28,9 +37,13 @@
 
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import * as path from 'node:path';
 
 import { TargetExistsError, atomicWriteContained } from '../safe-write.js';
 import { cmpKey, realVaultRoot, resolveContained, type VaultPathOptions } from '../vault-path.js';
+
+/** The control directory that holds the key. */
+const KEY_DIR = '.skippy';
 
 /** Vault-relative location of the sidecar MAC key. */
 export const SIDECAR_KEY_REL = '.skippy/ingest-sidecar.key';
@@ -63,9 +76,37 @@ async function readKeyFile(abs: string): Promise<Buffer> {
   }
 }
 
+/**
+ * Prove `<realRoot>/.skippy` is a plain directory whose real path is exactly
+ * itself (no junction, symlink or other reparse point, no differently spelled
+ * entry). Returns false when it does not exist (yet); throws on any other shape.
+ */
+async function keyDirIsPlain(realRoot: string): Promise<boolean> {
+  const dir = path.join(realRoot, KEY_DIR);
+  let st;
+  try {
+    st = await fs.lstat(dir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw err;
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new SidecarKeyError(`${dir} is not a plain directory (a junction, symlink or file)`);
+  }
+  const real = await fs.realpath(dir);
+  if (real !== dir) throw new SidecarKeyError(`${dir} resolves to ${real}`);
+  return true;
+}
+
 async function loadKey(vaultRoot: string, create: boolean): Promise<Buffer | null> {
+  const realRoot = await realVaultRoot(vaultRoot);
+  if (!(await keyDirIsPlain(realRoot)) && !create) return null;
   const cp = await resolveContained(vaultRoot, SIDECAR_KEY_REL, KEY_OPTS);
-  if (cp.exists) return readKeyFile(cp.abs);
+  if (cp.exists) {
+    if (!(await keyDirIsPlain(cp.realRoot))) throw new SidecarKeyError(`${KEY_DIR}/ vanished`);
+    return readKeyFile(cp.abs);
+  }
   if (!create) return null;
   try {
     await atomicWriteContained(cp, `${randomBytes(32).toString('hex')}\n`, { exclusive: true });
@@ -75,6 +116,7 @@ async function loadKey(vaultRoot: string, create: boolean): Promise<Buffer | nul
   // Read back what is on disk (ours, or a concurrent creator's).
   const again = await resolveContained(vaultRoot, SIDECAR_KEY_REL, KEY_OPTS);
   if (!again.exists) throw new SidecarKeyError('it vanished right after it was created');
+  if (!(await keyDirIsPlain(again.realRoot))) throw new SidecarKeyError(`${KEY_DIR}/ vanished`);
   return readKeyFile(again.abs);
 }
 

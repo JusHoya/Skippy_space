@@ -28,6 +28,17 @@
 //     with `ensureContainedParentDir`, and the file is created with O_EXCL and
 //     must be a single-link regular file; if containment fails the replay
 //     writer disables itself with a logged error instead of writing elsewhere.
+//     Since the M0 case-fold round `.skippy` must be reached without a
+//     reparse point (the real path spells `.skippy` exactly; vault-path.ts),
+//     so a `.skippy` junction to a note folder is refused, not written through.
+//   - the ingest sidecar MAC key `.skippy/ingest-sidecar.key`
+//     (ingest/sidecar-key.ts): a 64-hex secret, not a note. Resolved like the
+//     replay stream (ONLY `.skippy` allowed, also on the real path), and
+//     `.skippy` must additionally be a plain directory (not a junction,
+//     symlink or other reparse point) whose real path is exactly
+//     `<real vault>/.skippy`; created once with an exclusive contained atomic
+//     write, read through a single-link regular-file handle. On any other
+//     shape the writer refuses and no sidecar is written.
 //   - `realVaultRoot` creating the configured vault root directory itself;
 //   - the legacy absolute-path writers in atomic.ts (no production callers, no
 //     longer exported from the package index; kept for atomic.test.ts);
@@ -91,9 +102,11 @@
 //   or appended to by its own name); reserved-path rules compare NFC forms.
 //   createNote / appendNote-with-init refuse, with
 //   VaultPathError('normalization_collision'), to create a note (or directory)
-//   whose NFC (case-folded on win32) name equals an existing sibling's with
-//   different bytes; creates are additionally serialized in-process by that
-//   folded name so two differently-encoded concurrent creates cannot both pass.
+//   whose `foldKey` skeleton (NFKC + full case fold + marks and ignorables
+//   removed; a deliberate superset of NTFS's own folding, PRD OQ-21) equals an
+//   existing sibling's while the bytes differ; creates are additionally
+//   serialized in-process by that skeleton so two look-alike concurrent
+//   creates cannot both pass.
 //
 //   patchFrontmatter(path, expectedHash, key, value)
 //     `updateNote` for one key. The key must be a plain lowercase snake_case
@@ -414,8 +427,8 @@ export interface VaultBrokerOptions {
 const NOTE_PATH_OPTS: VaultPathOptions = { requireMarkdown: true };
 
 /**
- * In-process serialization of note CREATES by `foldKey` (NFC, case-folded on
- * win32), so two concurrent creates of differently-encoded spellings of one
+ * In-process serialization of note CREATES by the `foldKey` skeleton of the
+ * whole path, so two concurrent creates of look-alike spellings of one
  * new name (NFC `café.md` and NFD `café.md`) cannot both pass the
  * normalization-sibling check. This is NOT the note lock: the lock stays keyed
  * on the real path of the actual file (distinct NTFS names never share one);

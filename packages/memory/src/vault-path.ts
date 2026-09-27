@@ -37,11 +37,31 @@
 //   disk), so an operation always acts on the named file, never on a
 //   differently-encoded sibling. Lock keys are built from the real path of the
 //   actual file (vault-broker.ts), so two distinct NTFS names never share a
-//   lock. Creating a NEW entry whose `foldKey()` (NFC, case-folded on win32)
-//   equals that of an existing sibling with different bytes is refused with
-//   `normalization_collision` (`assertNoNormalizationSibling`), so a writer can
-//   never mint a visually identical duplicate; existing entries of either form
-//   are read and updated by their exact names.
+//   lock. Existing entries of any form are read and updated by their exact
+//   names.
+//
+//   Collision rule (PRD OQ-21; M0 case-fold round): creating a NEW entry is
+//   refused with `normalization_collision` (`assertNoNormalizationSibling`)
+//   when ANY existing sibling has the same `foldKey()` skeleton but different
+//   bytes. The skeleton is deliberately a SUPERSET of NTFS's upcase-table
+//   folding (which is not JavaScript's `toLowerCase`: NTFS keeps U+212A KELVIN
+//   SIGN and `K`, `İ` and `i̇`, `ẞ` and `ß`, Georgian/Cherokee case pairs
+//   distinct): NFKC, then lower->upper->lower case mapping, then NFKD with every
+//   combining mark and default-ignorable code point removed. So `Kelvin` next
+//   to `Kelvin`, `40_Daıly` next to `40_Daily`, `Straße` next to `STRASSE`
+//   and, by design, `resume.md` next to `résumé.md` are all refused. The
+//   over-refusal is accepted: agents and the ingest pipeline mint ASCII names,
+//   and humans can still create any name outside the broker. Confusables across
+//   scripts (Cyrillic `а` for Latin `a`) are NOT folded. A segment whose
+//   skeleton is that of a reserved vault name it does not literally spell
+//   (`40_Daıly`, `50_AGENTS` with a mark) is rejected lexically as
+//   `lookalike`, so a squatter can never pre-empt a reserved folder either.
+//
+//   Allowed control directories (`allowHiddenNames`, e.g. `.skippy`) must be
+//   reached WITHOUT a reparse point: the real path must spell the lexical path
+//   exactly up to and including that segment, so a `.skippy` junction to a
+//   note folder (or to the vault root) is rejected even though the folder it
+//   points at is not hidden.
 //
 //   2. REAL (`resolveContained`, async): resolve the vault root with native
 //      realpath, then find the nearest EXISTING ancestor of the target and
@@ -244,6 +264,12 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
         throw new VaultPathError('lookalike', input, `"${seg}" looks like the reserved name "${folded}"`);
       }
     }
+    // Case/mark look-alikes of a reserved name (`40_Daıly`, `40_DAİLY`,
+    // `40_Daíly`): the conservative skeleton matches, the literal name does not.
+    const skeleton = foldKey(seg);
+    if (RESERVED_VAULT_NAMES.has(skeleton) && !RESERVED_VAULT_NAMES.has(ruleKey(seg))) {
+      throw new VaultPathError('lookalike', input, `"${seg}" looks like the reserved name "${skeleton}"`);
+    }
   }
 
   const last = ruleKey(segments[segments.length - 1]!);
@@ -263,50 +289,85 @@ export function ruleKey(s: string): string {
   return s.normalize('NFC').toLowerCase();
 }
 
-/**
- * The key under which two sibling names are "the same name" to a human: NFC,
- * plus case folding on win32 (where case variants are one file anyway).
- * `assertNoNormalizationSibling` refuses to create a name whose key equals an
- * existing sibling's key when the bytes differ.
- */
-export function foldKey(name: string): string {
-  const nfc = name.normalize('NFC');
-  return IS_WIN ? nfc.toLowerCase() : nfc;
-}
+// Combining marks and default-ignorable code points (ZWSP, soft hyphen,
+// variation selectors, Hangul fillers, ...) are dropped from the skeleton.
+const SKELETON_DROP_RE = /[\p{M}\p{Default_Ignorable_Code_Point}]/gu;
 
 /**
- * The existing entries of `dir` whose `foldKey` equals `name`'s but which are
- * a different name on disk (e.g. NFD `café.md` for NFC `café.md`). Case
- * variants of `name` on win32 are the same NTFS entry, not siblings.
+ * The conservative COLLISION skeleton of a name (PRD OQ-21): two names with
+ * equal skeletons are treated as "the same name to a human" and a create of
+ * one next to the other is refused. Deliberately over-inclusive, a superset
+ * of NTFS's case-insensitivity and of Unicode canonical/compatibility
+ * equivalence:
+ *
+ *   1. NFKC (fullwidth `４０` -> `40`, `ﬁ` -> `fi`, U+212A KELVIN SIGN -> `K`,
+ *      U+212B ANGSTROM SIGN -> `Å`, U+2126 OHM SIGN -> `Ω`, `ſ` -> `s`);
+ *   2. `toLowerCase().toUpperCase().toLowerCase()`, a full case fold that
+ *      also collapses the pairs a single `toLowerCase` misses (`ı` -> `I` ->
+ *      `i`, `ß`/`ẞ` -> `SS` -> `ss`, `ς` and `σ`, titlecase digraphs);
+ *   3. NFKD, then remove every combining mark (\p{M}: `é` -> `e`, `İ` ->
+ *      `i` + U+0307 -> `i`) and every default-ignorable code point; NFC for a
+ *      stable result.
+ *
+ * Used ONLY to compare names; never to build a filesystem path, never a lock
+ * key for a file (only the in-process create guard's ordering key).
  */
-export async function normalizationSiblings(dir: string, name: string): Promise<string[]> {
-  let names: string[];
+export function foldKey(name: string): string {
+  const cased = name.normalize('NFKC').toLowerCase().toUpperCase().toLowerCase();
+  return cased.normalize('NFKD').replace(SKELETON_DROP_RE, '').normalize('NFC');
+}
+
+async function readdirOrEmpty(dir: string): Promise<string[]> {
   try {
-    names = await fs.readdir(dir);
+    return await fs.readdir(dir);
   } catch (err) {
     if (isMissing(err)) return [];
     throw err;
   }
-  const key = foldKey(name);
-  const same = (e: string) => (IS_WIN ? e.toLowerCase() === name.toLowerCase() : e === name);
-  return names.filter((e) => !same(e) && foldKey(e) === key);
 }
 
 /**
- * Refuse to CREATE `name` in `dir` when a sibling with the same `foldKey` but
- * different bytes exists (the create would mint a visually identical
- * duplicate). Throws `VaultPathError('normalization_collision')`. Callers only
- * invoke this when `name` itself does not exist.
+ * The existing entries of `dir` that are a DIFFERENT name on disk (other
+ * bytes) with the same NFC form, case-folded on win32 (e.g. the NFD spelling
+ * of an NFC name). The inbox watcher uses this to find the on-disk spelling of
+ * a name that vanished under the spelling it was reported with (D1). This is
+ * not the collision rule; see `collisionSiblings`.
+ */
+export async function normalizationSiblings(dir: string, name: string): Promise<string[]> {
+  const alias = (s: string) => (IS_WIN ? s.normalize('NFC').toLowerCase() : s.normalize('NFC'));
+  const key = alias(name);
+  return (await readdirOrEmpty(dir)).filter((e) => e !== name && alias(e) === key);
+}
+
+/**
+ * The existing entries of `dir` whose `foldKey` skeleton equals `name`'s but
+ * whose bytes differ. Compared by EXACT bytes, never by `toLowerCase`: NTFS
+ * does not fold U+212A and `K` (and many more pairs) the way JavaScript does,
+ * so "equal after toLowerCase" does not mean "the same NTFS entry". Callers
+ * invoke this only after `name` itself was found absent, so a true case alias
+ * of `name` in a case-insensitive directory cannot be among the entries.
+ */
+export async function collisionSiblings(dir: string, name: string): Promise<string[]> {
+  const key = foldKey(name);
+  return (await readdirOrEmpty(dir)).filter((e) => e !== name && foldKey(e) === key);
+}
+
+/**
+ * Refuse to CREATE `name` in `dir` when a sibling with the same `foldKey`
+ * skeleton but different bytes exists (the create would mint a visually
+ * identical or confusable duplicate). Throws
+ * `VaultPathError('normalization_collision')`. Callers only invoke this when
+ * `name` itself does not exist.
  */
 export async function assertNoNormalizationSibling(dir: string, name: string, input: string): Promise<void> {
-  const siblings = await normalizationSiblings(dir, name);
+  const siblings = await collisionSiblings(dir, name);
   if (siblings.length > 0) {
     throw new VaultPathError(
       'normalization_collision',
       input,
-      `${JSON.stringify(name)} would be a visually identical duplicate of the existing ` +
-        `${siblings.map((s) => JSON.stringify(s)).join(', ')} (same name after Unicode NFC` +
-        `${IS_WIN ? '/case' : ''} normalization, different bytes on disk); use the existing name`,
+      `${JSON.stringify(name)} would be a look-alike duplicate of the existing ` +
+        `${siblings.map((s) => JSON.stringify(s)).join(', ')} (same name after Unicode ` +
+        'compatibility, case and diacritic folding, different bytes on disk); use the existing name',
     );
   }
 }
@@ -442,14 +503,39 @@ export function rebaseOntoRoot(givenRoot: string, canonicalRoot: string, absPath
  * root and reject hidden (unless allowed) and reserved-name segments. Native
  * realpath yields long names, so this is what stops an 8.3 alias or an in-vault
  * junction from reaching `.git`/`.obsidian`/`.skippy`.
+ *
+ * `lexical` is the entry whose real path `real` is (built beneath `realRoot`).
+ * Under `allowHiddenNames`, every allowed hidden segment of the lexical path
+ * must be reached without a reparse point: the real path must spell the
+ * lexical path EXACTLY up to and including that segment. Otherwise a
+ * `.skippy` junction to `10_Atomic/` (or to the root) would pass, since the
+ * folder it resolves to is not itself hidden.
  */
 function assertRealSegments(
   realRoot: string,
   real: string,
   input: string,
   opts: VaultPathOptions,
+  lexical: string,
 ): void {
   const rel = path.relative(realRoot, real);
+  if (!opts.allowHidden && opts.allowHiddenNames && opts.allowHiddenNames.length > 0) {
+    const lexSegs = path.relative(realRoot, lexical).split(/[\\/]+/).filter((s) => s !== '');
+    const realSegs = rel.split(/[\\/]+/).filter((s) => s !== '');
+    lexSegs.forEach((seg, i) => {
+      if (!seg.startsWith('.')) return;
+      const want = lexSegs.slice(0, i + 1);
+      const got = realSegs.slice(0, i + 1);
+      if (got.length !== want.length || got.some((s, j) => s !== want[j])) {
+        throw new VaultPathError(
+          'hidden_segment',
+          input,
+          `control directory "${want.join('/')}" resolves to "${got.join('/')}" ` +
+            '(a reparse point or a differently spelled entry); it must be a plain directory',
+        );
+      }
+    });
+  }
   if (rel === '') return;
   for (const raw of rel.split(/[\\/]+/)) {
     // Rules only: evaluated on the on-disk spelling and on its NFC form.
@@ -509,7 +595,7 @@ async function assertRealContainment(
     if (!isPathInside(realRoot, real)) {
       throw new VaultPathError('escapes_root', input, `${cur} resolves to ${real}`);
     }
-    assertRealSegments(realRoot, real, input, opts);
+    assertRealSegments(realRoot, real, input, opts, cur);
     if (cur === abs) {
       if (st.isSymbolicLink() && !opts.allowLinkTarget) {
         throw new VaultPathError('target_is_link', input, 'the target is a symlink or junction');
@@ -599,7 +685,7 @@ export async function ensureContainedParentDir(cp: ContainedPath): Promise<strin
     if (!isPathInside(cp.realRoot, real)) {
       throw new VaultPathError('escapes_root', cp.rel, `${next} resolves to ${real}`);
     }
-    assertRealSegments(cp.realRoot, real, cp.rel, opts);
+    assertRealSegments(cp.realRoot, real, cp.rel, opts, next);
     if (!(await fs.stat(real)).isDirectory()) {
       throw new VaultPathError('parent_not_directory', cp.rel, `${real} is not a directory`);
     }
