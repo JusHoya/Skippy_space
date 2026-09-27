@@ -35,59 +35,84 @@
 //      staged add/modify/delete, `rm --cached`, either side of a rename or
 //      copy, intent-to-add, or unmerged. Skip-worktree / assume-unchanged
 //      paths are FLAGGED. Neither is ever committed or re-synced.
-//   4. Seed a throwaway index (read-tree HEAD), `add -A -- vault` into it,
-//      write-tree -> preliminary tree; the candidate list is every vault path
-//      whose (mode, oid) differs between HEAD and that tree. The throwaway
-//      index lives in a fresh private directory in the OS temp dir
-//      (`<tmp>/skippy-ac-<16 hex>/index`, D1) — never under the git dir, so a
-//      long repo/worktree path can't push `<index>.lock` past MAX_PATH — and
-//      the directory (with any `.lock`) is removed in every case.
+//   4. Seed a throwaway index (read-tree HEAD; a copy of it is kept as the
+//      SEED index), snapshot every attribute source (A1, below), then
+//      `add -A -- vault` into the throwaway index and write-tree ->
+//      preliminary tree; the candidate list is every vault path whose
+//      (mode, oid) differs between HEAD and that tree. In a sparse checkout
+//      `add` refuses (and fails on) out-of-cone paths; if it fails while
+//      core.sparseCheckout is on, the throwaway index is reset to the seed
+//      and the add is redone with `--sparse`, so a sparse checkout never
+//      fails every tick (out-of-cone paths are then flagged, step 5). The
+//      throwaway index lives in a fresh private directory in the OS temp dir
+//      (`<tmp>/skippy-ac-<16 hex>/`, D1) — never under the git dir, so a long
+//      repo/worktree path can't push `<index>.lock` past MAX_PATH — and the
+//      directory (with any `.lock`) is removed in every case. It only ever
+//      holds index files and pathspec lists (paths + object ids), never vault
+//      file content. Every tick first sweeps `<tmp>/skippy-ac-<16 hex>`
+//      directories older than one hour (left by a killed tick; exact name
+//      match, real directories only, never through a symlink/junction, best
+//      effort).
 //   5. Exclusions, each restored to its HEAD state in the temp index (or
 //      removed if HEAD lacks it) with ONE `update-index -z --index-info`.
 //      Each excluded path gets exactly one reason (first match wins):
-//        flagged            skip-worktree / assume-unchanged (step 3)
+//        flagged            skip-worktree / assume-unchanged (step 3), or —
+//                           when core.sparseCheckout is on — outside the
+//                           sparse-checkout definition (`sparse-checkout
+//                           check-rules`; no loadable patterns = inside, as
+//                           git itself treats it)
 //        user-staged        user-owned (step 3)
 //        gitlink            a new or changed mode-160000 entry on either side
 //                           (nested repo, submodule pointer bump, D4); gitlinks
 //                           already in HEAD are left exactly as they are
 //        secret-filename    shared filename rules
-//        too-large-to-scan  blob (or pre-filter working-tree file) larger than
-//                           limits.maxScanBytes (64 MiB, D3) — fail closed
+//        attributes-changed an attribute source changed during the tick
+//                           (A1 != A2, below): EVERY remaining candidate is
+//                           deferred to the next tick
+//        filtered-path      the path has a `filter` attribute (any value:
+//                           `lfs`, a custom driver, even an unconfigured one)
+//                           in EITHER evaluation — `check-attr` against the
+//                           seed index (the pre-add attribute state; the
+//                           working-tree side is pinned by A1 == A2) or
+//                           against the post-add temp index. The vault is
+//                           Markdown and needs no clean filter; a filter can
+//                           turn any content into bytes the blob scan cannot
+//                           judge (an LFS pointer, rot13), so filtered paths
+//                           are never autocommitted (OQ-19)
+//        too-large-to-scan  blob larger than limits.maxScanBytes (64 MiB, D3)
+//                           — never read, fail closed
+//        lfs-pointer        the blob holds a git-lfs pointer version line
+//                           (shared `lfsPointer.versionLines`, all v1 spec
+//                           aliases git-lfs 3.x accepts, matched anywhere in
+//                           the blob: a superset of what git-lfs decodes as a
+//                           pointer), whatever the attributes say. `git push`
+//                           uploads the object a committed pointer names, so
+//                           a pointer to a secret an earlier tick excluded
+//                           (but whose `add` already stored it under
+//                           .git/lfs/objects) must never reach history
 //        secret-content     shared content rules hit the exact blob the commit
 //                           would contain (`cat-file --batch`, fetched in
 //                           batches of at most maxScanBytes; latin1 and again
-//                           with NULs stripped for UTF-16), OR — for a
-//                           PRE-FILTER path (below) — its working-tree bytes,
-//                           i.e. the content the user wrote
-//        worktree-unscannable  pre-filter path whose working-tree file can't
-//                           be read as the bytes git cleaned (missing, not a
-//                           regular file — e.g. a real symlink —, non-UTF-8
-//                           name)
-//        changed-during-scan   pre-filter path whose scanned bytes do not
-//                           provably produce the staged blob (see 5b)
-//      A PRE-FILTER path is EVERY candidate except an unfiltered mode-120000
-//      entry under core.symlinks=true (a real symlink: git stores readlink()
-//      and never runs a filter on it, so the blob scan is exact). That covers
-//      any mode with a `filter` attribute (git-lfs, custom clean filters, D2;
-//      120000 included, EC5 D-A), every mode-120000 candidate when
-//      core.symlinks=false (the Git for Windows default: the "symlink" is a
-//      plain file whose bytes are stored, and `add` still runs the clean
-//      filter on it), and every regular file whatever `check-attr` says now —
-//      a `.gitattributes` flip between step 4's add and check-attr must not
-//      decide whether the working-tree bytes get scanned (EC5 D-G).
-//   5b. Scanned bytes == committed bytes (EC5 D-B/D-F). Each pre-filter
-//      file is read ONCE; that buffer is scanned and then written, byte for
-//      byte, into a private scratch work tree (plus copies of the real
-//      `.gitattributes` of every ancestor directory). `git add` runs there
-//      against a scratch index seeded exactly like the temp index was before
-//      step 4's `add` (read-tree HEAD), so the clean filter, eol/autocrlf
-//      handling and the index-dependent "CRLF already in index" rule are
-//      applied to exactly the scanned bytes in the same context. Any path
-//      whose scratch blob differs from the staged blob (or any failure of the
-//      scratch add) is `changed-during-scan`. The file is never re-read, so a
-//      key -> clean -> key flip between add, scan and verification cannot
-//      pass, and an unchanged CRLF file under core.autocrlf is never
-//      permanently excluded.
+//                           with NULs stripped for UTF-16)
+//      With filtered paths refused, every committed blob is exactly the
+//      scanned blob: the scan needs no proof step. Mode-120000 entries are
+//      scanned the same way (core.symlinks=false: the blob IS the file's
+//      bytes; a real symlink: the blob is the link target). eol/autocrlf,
+//      `working-tree-encoding` and `ident` stay exactly as git applies them:
+//      they are fixed, public transforms (CR/LF, re-encoding of the same
+//      characters, the blob's own id) that cannot turn a clean blob into a
+//      secret on checkout, and the blob they produce is what gets scanned.
+//      Attribute snapshots A1 (before the add) and A2 (after the scans and
+//      both check-attr runs) cover every source git reads: the in-tree
+//      `.gitattributes` at the repo root and anywhere under vault/ (walked
+//      without following links; nested repositories skipped),
+//      `$GIT_COMMON_DIR/info/attributes`, the global file (`git var
+//      GIT_ATTR_GLOBAL`: core.attributesFile or the XDG default) and the
+//      system file (`git var GIT_ATTR_SYSTEM`), each recorded as its path
+//      plus its full content (or absent / a link / unreadable). Only a flip
+//      AND flip-back entirely inside the window between two observations can
+//      go unseen (see OQ-19); a flip that is still in place at A2 defers the
+//      tick.
 //      All are reported in `skipped` (byte order) and `skippedDetail`
 //      ({path, reason}).
 //   6. If nothing is left, no-op. Otherwise write-tree -> final tree.
@@ -113,18 +138,19 @@
 //
 // Secrets: `commit-tree` never runs hooks, so a repo's own secret-scanning
 // pre-commit hook can never see (or block) this commit. The built-in guard
-// (step 5) is the only line of defense. Pre-filter paths are scanned both
-// post-filter (the blob) and pre-filter (the working-tree bytes, proven to be
-// the bytes behind the blob, 5b), so an LFS pointer, a reversible clean
-// filter or a filtered symlink-as-file cannot smuggle a secret into history.
+// (step 5) is the only line of defense. It scans exactly the committed
+// blobs, and refuses every path whose committed bytes could differ from what
+// the user wrote (filtered-path) or could make `git push` upload something
+// else (lfs-pointer), so neither a clean filter nor git-lfs can smuggle a
+// secret into history.
 //
 // Test seam: `runAutocommit(root, now, { onPhase })` calls
-// `onPhase('added')` after step 4's add/write-tree and
-// `onPhase('scanned')` after the pre-filter reads, before 5b. Production
-// callers pass nothing.
+// `onPhase('added')` after step 4's add/write-tree and `onPhase('scanned')`
+// after the blob scan and both `check-attr` runs, before the closing
+// attribute snapshot (A2). Production callers pass nothing.
 
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,8 +161,11 @@ const VAULT_PATHSPEC = 'vault';
 const PENDING_MARKER_NAME = 'skippy-autocommit-pending';
 const PENDING_MARKER_VERSION = 2;
 const GITLINK_MODE = '160000';
-const SYMLINK_MODE = '120000';
 const GITATTRIBUTES = '.gitattributes';
+/** Name of every private temp dir a tick creates (and the sweep removes). */
+const TEMP_DIR_RE = /^skippy-ac-[0-9a-f]{16}$/;
+/** A `skippy-ac-*` dir untouched for this long belongs to a killed tick. */
+export const STALE_TEMP_DIR_MS = 60 * 60 * 1000;
 const SYNC_RETRY_ATTEMPTS = 3;
 const SYNC_RETRY_DELAY_MS = 20;
 const MAX_GIT_OUTPUT = 1024 * 1024 * 1024;
@@ -156,9 +185,14 @@ const CONTENT_RULES = SECRET_PATTERNS.content.map((r) => ({
   re: new RegExp(r.pattern),
   ci: r.ignoreAsciiCase === true,
 }));
-/** Largest blob / pre-filter file the guard will scan (and so commit). */
+/** Largest blob the guard will scan (and so commit). */
 export const MAX_SCAN_BYTES = SECRET_PATTERNS.limits.maxScanBytes;
 if (!Number.isSafeInteger(MAX_SCAN_BYTES) || MAX_SCAN_BYTES <= 0) throw new Error('limits.maxScanBytes must be a positive integer');
+/** git-lfs pointer version lines (latin1 byte strings), shared with Rust. */
+const LFS_POINTER_LINES = SECRET_PATTERNS.lfsPointer.versionLines;
+if (!Array.isArray(LFS_POINTER_LINES) || LFS_POINTER_LINES.length === 0 || !LFS_POINTER_LINES.every((l) => typeof l === 'string' && l.length > 0)) {
+  throw new Error('lfsPointer.versionLines must be a non-empty list of strings');
+}
 
 /** ASCII-only lowercase (identical to Rust's `to_ascii_lowercase`). */
 function asciiLower(s) {
@@ -184,6 +218,16 @@ export function matchesSecretContent(bytes) {
     }
   }
   return false;
+}
+
+/**
+ * @param {Buffer} bytes exact blob content. True if it contains a git-lfs
+ * pointer version line anywhere (a superset of what git-lfs 3.x decodes as a
+ * pointer: its decoder needs `version <alias>` verbatim on a line).
+ */
+export function matchesLfsPointer(bytes) {
+  const raw = bytes.toString('latin1');
+  return LFS_POINTER_LINES.some((l) => raw.includes(l));
 }
 
 /** byte string (latin1) <-> display string (UTF-8). */
@@ -304,6 +348,37 @@ function makePrivateTempDir() {
   return dir;
 }
 
+/**
+ * Best-effort sweep of `<tmp>/skippy-ac-<16 hex>` directories not modified
+ * for STALE_TEMP_DIR_MS (left behind by a killed tick). Exact name match
+ * only; `lstat` must report a real directory, so a symlink or junction with
+ * that name is never followed (nor removed). A live tick's directory is
+ * always younger than the threshold. Returns the names removed.
+ */
+export function sweepStaleTempDirs(nowMs = Date.now()) {
+  const removed = [];
+  let names;
+  try {
+    names = readdirSync(tmpdir());
+  } catch {
+    return removed;
+  }
+  for (const name of names) {
+    if (!TEMP_DIR_RE.test(name)) continue;
+    const dir = join(tmpdir(), name);
+    try {
+      const st = lstatSync(dir);
+      if (!st.isDirectory() || st.isSymbolicLink()) continue;
+      if (nowMs - st.mtimeMs < STALE_TEMP_DIR_MS) continue;
+      rmSync(dir, { recursive: true, force: true });
+      removed.push(name);
+    } catch {
+      /* best effort: another process may be sweeping or using it */
+    }
+  }
+  return removed;
+}
+
 /** Blob sizes by oid (`cat-file --batch-check`); throws on a missing object. */
 function blobSizes(root, oids) {
   const sizes = new Map();
@@ -324,8 +399,9 @@ function blobSizes(root, oids) {
 }
 
 /**
- * Content-scan blobs by oid. Returns Map<oid, 'secret-content' |
- * 'too-large-to-scan'> for the blobs that must not be committed. Blobs over
+ * Content-scan blobs by oid. Returns Map<oid, 'too-large-to-scan' |
+ * 'lfs-pointer' | 'secret-content'> for the blobs that must not be committed
+ * (an LFS pointer wins over a content hit). Blobs over
  * MAX_SCAN_BYTES are never read (D3); the rest are fetched with
  * `cat-file --batch` in groups of at most MAX_SCAN_BYTES total, so memory
  * (and Node's string/buffer limits) stay bounded however big the vault is.
@@ -365,7 +441,9 @@ function scanBlobsForSecrets(root, oids) {
       if (header[0] !== oid || size !== sizes.get(oid) || pos + size > out.length) {
         throw new Error('cat-file --batch: unexpected header');
       }
-      if (matchesSecretContent(out.subarray(pos, pos + size))) verdicts.set(oid, 'secret-content');
+      const blob = out.subarray(pos, pos + size);
+      if (matchesLfsPointer(blob)) verdicts.set(oid, 'lfs-pointer');
+      else if (matchesSecretContent(blob)) verdicts.set(oid, 'secret-content');
       pos += size + 1; // trailing LF
     }
   }
@@ -374,11 +452,11 @@ function scanBlobsForSecrets(root, oids) {
 
 /**
  * The subset of `paths` with a `filter` attribute set to anything (`set` or
- * any driver name, e.g. `lfs`); `unspecified` / `unset` mean no filter. One
- * `check-attr -z --stdin` call, raw byte paths on stdin. Only `filter` can
- * make the blob differ materially from the bytes the user wrote (`text`,
- * `eol`, `diff` do not; `working-tree-encoding` output is still scanned as a
- * blob, with the UTF-16 view).
+ * any driver name, e.g. `lfs`, configured or not); `unspecified` / `unset`
+ * mean no filter. One `check-attr -z --stdin` call, raw byte paths on stdin;
+ * `env` selects the index git falls back to for a `.gitattributes` missing
+ * from the working tree (the seed index = the pre-add state, or the temp
+ * index = the post-add state).
  */
 function filteredPaths(root, paths, env) {
   if (paths.length === 0) return new Set();
@@ -387,6 +465,7 @@ function filteredPaths(root, paths, env) {
     input: Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1'),
   });
   const f = out.toString('latin1').split('\0');
+  if (f.length !== paths.length * 3 + 1 || f[f.length - 1] !== '') throw new Error('check-attr: unexpected output');
   const filtered = new Set();
   for (let i = 0; i + 2 < f.length; i += 3) {
     if (f[i + 1] !== 'filter') throw new Error('check-attr: unexpected output');
@@ -395,90 +474,136 @@ function filteredPaths(root, paths, env) {
   return filtered;
 }
 
-/** True if a byte-string path is valid UTF-8 (round-trips). */
-function isUtf8Path(bytePath) {
-  return toBytePath(toDisplayPath(bytePath)) === bytePath;
-}
-
-/** Effective `core.symlinks` (git's built-in default is true). */
-function coreSymlinks(root) {
-  return git(root, ['config', '--type=bool', '--default=true', '--get', 'core.symlinks']) !== 'false';
-}
-
 /**
- * Read one pre-filter working-tree file exactly ONCE and scan it (D2, D-A).
- * Returns {reason: 'too-large-to-scan' | 'worktree-unscannable' |
- * 'secret-content'} or, when clean, {bytes} — the very buffer that was
- * scanned, which 5b then proves is what the staged blob was cleaned from.
+ * State of one attribute file: its full content, or absent / a link /
+ * another non-regular entry / unreadable. `followLinks` is false for in-tree
+ * `.gitattributes` (git refuses to read those through a symlink) and true for
+ * the info/global/system files (git opens them normally).
  */
-function readAndScanWorktreeFile(root, bytePath) {
-  if (!isUtf8Path(bytePath)) return { reason: 'worktree-unscannable' };
-  const full = join(root, toDisplayPath(bytePath));
-  let bytes;
+function attributeFileState(path, followLinks) {
+  let st;
   try {
-    const st = lstatSync(full);
-    if (!st.isFile()) return { reason: 'worktree-unscannable' };
-    if (st.size > MAX_SCAN_BYTES) return { reason: 'too-large-to-scan' };
-    bytes = readFileSync(full);
-  } catch {
-    return { reason: 'worktree-unscannable' };
+    st = lstatSync(path);
+  } catch (e) {
+    return e.code === 'ENOENT' || e.code === 'ENOTDIR' ? 'absent' : `error:${e.code}`;
   }
-  if (bytes.length > MAX_SCAN_BYTES) return { reason: 'too-large-to-scan' };
-  return matchesSecretContent(bytes) ? { reason: 'secret-content' } : { bytes };
-}
-
-/** Write scanned bytes to `<scratch>/<path>` (5b); throws on failure. */
-function writeScratchFile(scratch, bytePath, bytes) {
-  const dest = join(scratch, toDisplayPath(bytePath));
-  mkdirSync(dirname(dest), { recursive: true });
-  writeFileSync(dest, bytes);
-}
-
-/**
- * 5b: the subset of `paths` (already written to `scratch` from their scanned
- * buffers) whose scratch `git add` — seeded with `seedIndex` (the temp index
- * as it was before step 4's add; may not exist for an unborn HEAD) and the
- * real `.gitattributes` of every ancestor directory — does NOT yield the
- * staged blob `expectedOid(p)`. Any git failure makes every path unproven
- * (fail closed).
- */
-function unprovenPaths(root, gitDir, scratch, seedIndex, specFile, paths, expectedOid) {
-  if (paths.length === 0) return new Set();
-  const dirs = new Set(['']);
-  for (const p of paths) {
-    for (let i = p.indexOf('/'); i >= 0; i = p.indexOf('/', i + 1)) dirs.add(p.slice(0, i));
-  }
-  for (const d of [...dirs].sort(byteOrder)) {
-    const rel = toDisplayPath(d ? `${d}/${GITATTRIBUTES}` : GITATTRIBUTES);
-    const dest = join(scratch, rel);
-    if (existsSync(dest)) continue; // a scanned candidate itself: its scanned bytes win
+  if (st.isSymbolicLink()) {
+    let target = '';
     try {
-      const src = join(root, rel);
-      if (!lstatSync(src).isFile()) continue; // git ignores a non-regular .gitattributes too
-      mkdirSync(dirname(dest), { recursive: true });
-      copyFileSync(src, dest);
+      target = readlinkSync(path);
     } catch {
-      /* absent: git falls back to the index copy, in both trees alike */
+      /* keep '' */
+    }
+    if (!followLinks) return `link:${target}`;
+    try {
+      return `link:${target}:${readFileSync(path).toString('latin1')}`;
+    } catch (e) {
+      return `link:${target}:error:${e.code}`;
     }
   }
-  const env = { GIT_DIR: gitDir, GIT_WORK_TREE: scratch, GIT_INDEX_FILE: seedIndex };
-  const staged = new Map();
+  if (!st.isFile()) return 'other';
   try {
-    writeFileSync(specFile, Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1'));
-    // fsmonitor off: never spawn a daemon for the scratch tree; longpaths on:
-    // the scratch prefix is longer than the repo root's, and a path that
-    // only fails there would otherwise be excluded forever.
-    const cfg = ['-c', 'core.fsmonitor=false', '-c', 'core.longpaths=true'];
-    gitRaw(scratch, [...cfg, 'add', `--pathspec-from-file=${specFile}`, '--pathspec-file-nul'], { env });
-    for (const rec of splitZ(gitRaw(scratch, ['ls-files', '-s', '-z', '--', VAULT_PATHSPEC], { env }))) {
-      const tab = rec.indexOf('\t');
-      const [, oid, stage] = rec.slice(0, tab).split(' ');
-      if (stage === '0') staged.set(rec.slice(tab + 1), oid);
-    }
-  } catch {
-    return new Set(paths);
+    return `file:${readFileSync(path).toString('latin1')}`;
+  } catch (e) {
+    return `error:${e.code}`;
   }
-  return new Set(paths.filter((p) => staged.get(p) !== expectedOid(p)));
+}
+
+/**
+ * Every `.gitattributes` under `dir` (relative keys `vault/.../.gitattributes`
+ * -> state), walked without following links; a directory holding `.git` (a
+ * nested repository or the vault's own submodule checkout) is not entered —
+ * git reads no superproject attributes there.
+ */
+function walkVaultAttributes(root, rel, out) {
+  const dir = join(root, rel);
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (e) {
+    out.set(`dir:${rel}`, `error:${e.code}`);
+    return;
+  }
+  if (entries.some((e) => e.name === '.git')) return;
+  for (const e of entries) {
+    const child = `${rel}/${e.name}`;
+    if (e.name === GITATTRIBUTES) out.set(`wt:${child}`, attributeFileState(join(root, child), false));
+    else if (e.isDirectory() && !e.isSymbolicLink()) walkVaultAttributes(root, child, out);
+  }
+}
+
+/** Resolve `git var <name>`; null if git cannot say. */
+function gitVarPath(root, name) {
+  try {
+    return git(root, ['var', name]) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A1 / A2: every attribute source git reads for a vault path — the in-tree
+ * `.gitattributes` at the root and anywhere under vault/, the repo's
+ * info/attributes, and the global and system files (paths re-resolved on
+ * every call, so a core.attributesFile change is seen too). Two snapshots
+ * are equal iff no source changed.
+ */
+function attributeSnapshot(root) {
+  const snap = new Map();
+  snap.set(`wt:${GITATTRIBUTES}`, attributeFileState(join(root, GITATTRIBUTES), false));
+  const vault = join(root, VAULT_PATHSPEC);
+  let vst = null;
+  try {
+    vst = lstatSync(vault);
+  } catch {
+    /* absent */
+  }
+  if (vst && vst.isDirectory() && !vst.isSymbolicLink()) walkVaultAttributes(root, VAULT_PATHSPEC, snap);
+  else snap.set('dir:vault', vst ? 'not-a-directory' : 'absent');
+  let info = null;
+  try {
+    const p = git(root, ['rev-parse', '--git-path', 'info/attributes']);
+    info = isAbsolute(p) ? p : resolve(root, p);
+  } catch {
+    /* recorded as unresolved */
+  }
+  snap.set('info', info ? `${info}\0${attributeFileState(info, true)}` : 'unresolved');
+  for (const name of ['GIT_ATTR_GLOBAL', 'GIT_ATTR_SYSTEM']) {
+    const p = gitVarPath(root, name);
+    snap.set(name, p ? `${p}\0${attributeFileState(p, true)}` : 'unresolved');
+  }
+  return snap;
+}
+
+function sameSnapshot(a, b) {
+  if (a.size !== b.size) return false;
+  for (const [k, v] of a) if (b.get(k) !== v) return false;
+  return true;
+}
+
+/**
+ * The subset of `paths` outside the sparse-checkout definition, when
+ * core.sparseCheckout is on (`sparse-checkout check-rules -z`, which prints
+ * the paths inside). If the patterns cannot be loaded, every path counts as
+ * inside — exactly how git itself treats a sparse checkout without patterns.
+ */
+function sparseCheckoutEnabled(root) {
+  return git(root, ['config', '--type=bool', '--default=false', '--get', 'core.sparseCheckout']) === 'true';
+}
+
+function outsideSparseCheckout(root, paths) {
+  if (paths.length === 0) return new Set();
+  if (!sparseCheckoutEnabled(root)) return new Set();
+  let out;
+  try {
+    out = gitRaw(root, ['sparse-checkout', 'check-rules', '-z'], {
+      input: Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1'),
+    });
+  } catch {
+    return new Set();
+  }
+  const inside = new Set(splitZ(out));
+  return new Set(paths.filter((p) => !inside.has(p)));
 }
 
 export function commitAndAdvanceHead(root, tree, head, message) {
@@ -669,6 +794,7 @@ function recoverPendingSync(root, gitDir) {
 export function runAutocommit(root, now = () => new Date().toISOString(), { onPhase } = {}) {
   if (!existsSync(join(root, 'vault'))) return { status: 'noop', skipped: [], skippedDetail: [], recovered: null };
 
+  sweepStaleTempDirs();
   const gitDir = resolveGitDir(root);
 
   // Step 0: finish (or safely discard) an interrupted sync first.
@@ -687,8 +813,9 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
 
   const tempDir = makePrivateTempDir();
   const indexFile = join(tempDir, 'index');
-  const seedIndex = join(tempDir, 'seed-index'); // 5b: the temp index before add
-  const scratch = join(tempDir, 'wt'); // 5b: scanned bytes, never re-read from the real tree
+  // The temp index as it was before `add` (absent for an unborn HEAD, which
+  // git reads as an empty index): the pre-add attribute evaluation uses it.
+  const seedIndex = join(tempDir, 'seed-index');
   const env = { GIT_INDEX_FILE: indexFile };
   try {
     const headEntries = treeEntries(root, head);
@@ -699,8 +826,19 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
       git(root, ['read-tree', head], { env });
       copyFileSync(indexFile, seedIndex);
     }
+    const attrsBefore = attributeSnapshot(root); // A1
     // -A so deletions are captured; .gitignore respected; vault/ only.
-    git(root, ['add', '-A', '--', VAULT_PATHSPEC], { env });
+    try {
+      git(root, ['add', '-A', '--', VAULT_PATHSPEC], { env });
+    } catch (e) {
+      // A sparse checkout makes `add` refuse (and fail on) out-of-cone
+      // paths: redo it from the seed with --sparse; those paths are then
+      // flagged below, so the tick never fails for that reason.
+      if (!sparseCheckoutEnabled(root)) throw e;
+      if (head) copyFileSync(seedIndex, indexFile);
+      else rmSync(indexFile, { force: true });
+      git(root, ['add', '-A', '--sparse', '--', VAULT_PATHSPEC], { env });
+    }
     const preliminaryTree = git(root, ['write-tree'], { env });
     onPhase?.('added');
     const prelimEntries = treeEntries(root, preliminaryTree);
@@ -708,54 +846,43 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
 
     const modeOf = (entries, p) => (entries.has(p) ? entries.get(p).split(' ')[0] : null);
     const blobOf = (p) => prelimEntries.get(p).split(' ')[1];
+    const outsideSparse = outsideSparseCheckout(root, allChanged);
 
-    /** @type {Map<string, string>} path -> reason; first match wins. */
-    const reasons = new Map();
+    /** @type {Map<string, string>} path -> reason decided before the attribute check. */
+    const early = new Map();
     for (const p of allChanged) {
-      if (snapshot.flagged.has(p)) reasons.set(p, 'flagged');
-      else if (owned.has(p)) reasons.set(p, 'user-staged');
-      else if (modeOf(headEntries, p) === GITLINK_MODE || modeOf(prelimEntries, p) === GITLINK_MODE) reasons.set(p, 'gitlink');
-      else if (matchesSecretFilename(p)) reasons.set(p, 'secret-filename');
+      if (snapshot.flagged.has(p) || outsideSparse.has(p)) early.set(p, 'flagged');
+      else if (owned.has(p)) early.set(p, 'user-staged');
+      else if (modeOf(headEntries, p) === GITLINK_MODE || modeOf(prelimEntries, p) === GITLINK_MODE) early.set(p, 'gitlink');
+      else if (matchesSecretFilename(p)) early.set(p, 'secret-filename');
     }
 
-    // Post-filter scan: the exact blobs the commit would contain.
-    const toScan = allChanged.filter((p) => !reasons.has(p) && prelimEntries.has(p));
+    // filtered-path: a `filter` attribute in the pre-add (seed index) OR the
+    // post-add (temp index) evaluation. Deletions carry no blob.
+    /** @type {Map<string, string>} */
+    const late = new Map();
+    const present = allChanged.filter((p) => !early.has(p) && prelimEntries.has(p));
+    const filteredBefore = filteredPaths(root, present, { GIT_INDEX_FILE: seedIndex });
+    const filteredAfter = filteredPaths(root, present, env);
+    for (const p of present) if (filteredBefore.has(p) || filteredAfter.has(p)) late.set(p, 'filtered-path');
+
+    // The exact blobs the commit would contain: size cap, LFS pointer, secrets.
+    const toScan = present.filter((p) => !late.has(p));
     const blobVerdicts = scanBlobsForSecrets(root, toScan.map(blobOf));
     for (const p of toScan) {
       const v = blobVerdicts.get(blobOf(p));
-      if (v) reasons.set(p, v);
-    }
-
-    // Pre-filter scan (D2, D-A, D-G): every remaining candidate except an
-    // unfiltered real symlink (core.symlinks=true). Each file is read once;
-    // the scanned buffer goes to the scratch tree, and 5b proves it is what
-    // the staged blob holds.
-    const remaining = toScan.filter((p) => !reasons.has(p));
-    const isSymlink = (p) => modeOf(prelimEntries, p) === SYMLINK_MODE;
-    const symlinkCandidates = remaining.filter(isSymlink);
-    const filteredLinks = filteredPaths(root, symlinkCandidates, env);
-    const realSymlinks = symlinkCandidates.length > 0 && coreSymlinks(root);
-    const scanned = [];
-    for (const p of remaining) {
-      if (realSymlinks && isSymlink(p) && !filteredLinks.has(p)) continue;
-      const r = readAndScanWorktreeFile(root, p);
-      if (r.reason) {
-        reasons.set(p, r.reason);
-        continue;
-      }
-      try {
-        writeScratchFile(scratch, p, r.bytes);
-        scanned.push(p);
-      } catch {
-        reasons.set(p, 'changed-during-scan'); // cannot prove it: fail closed
-      }
+      if (v) late.set(p, v);
     }
     onPhase?.('scanned');
-    const specFile = join(tempDir, 'verify-pathspec');
-    for (const p of unprovenPaths(root, gitDir, scratch, seedIndex, specFile, scanned, blobOf)) {
-      reasons.set(p, 'changed-during-scan');
-    }
 
+    // A2: any attribute source changed since A1 -> defer the whole tick.
+    const attrsChanged = !sameSnapshot(attrsBefore, attributeSnapshot(root));
+    /** @type {Map<string, string>} path -> reason; first match wins. */
+    const reasons = new Map();
+    for (const p of allChanged) {
+      const r = early.get(p) ?? (attrsChanged ? 'attributes-changed' : late.get(p));
+      if (r) reasons.set(p, r);
+    }
     const excluded = allChanged.filter((p) => reasons.has(p));
     const commitPaths = allChanged.filter((p) => !reasons.has(p));
     const skipped = excluded.map(toDisplayPath);
