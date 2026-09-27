@@ -124,7 +124,7 @@ test('all eight real board charters derive a policy and none yields a bypass', a
   for (const id of BOARD_IDS) {
     const c = await loadCharter(`board.${id}` as CharterAgentId);
     assert.equal(c.loaded, true, `${id} charter loaded`);
-    const policy = derivePolicy(c, { cwd });
+    const policy = derivePolicy(c, { projectRoot: cwd });
     assert.equal(policy.permissionMode, 'ask', `${id} permission_mode`);
     assert.notEqual(policy.sdkPermissionMode as string, 'bypassPermissions');
     assert.deepEqual(policy.writeRoots, [], `${id}: no worktree => no write root`);
@@ -158,11 +158,11 @@ test('skippy and staff charters also derive without bypass', async () => {
     .filter((f) => f.endsWith('.md'))
     .map((f) => `staff.${f.slice(0, -3)}` as CharterAgentId);
   for (const id of ['skippy' as CharterAgentId, ...staff]) {
-    const policy = derivePolicy(await loadCharter(id), { cwd });
+    const policy = derivePolicy(await loadCharter(id), { projectRoot: cwd });
     assert.notEqual(policy.sdkPermissionMode as string, 'bypassPermissions', id);
   }
   // psych-monitor disallows Write/Edit/Bash/Agent: the denial must hold.
-  const psych = derivePolicy(await loadCharter('staff.psych-monitor' as CharterAgentId), { cwd });
+  const psych = derivePolicy(await loadCharter('staff.psych-monitor' as CharterAgentId), { projectRoot: cwd });
   assert.ok(!psych.allowedTools.includes('Write'));
   assert.equal(denied(await evaluateToolCall(psych, { toolName: 'Write', input: { file_path: path.join(cwd, 'x') } })).code, 'disallowed');
 });
@@ -172,7 +172,7 @@ test('skippy and staff charters also derive without bypass', async () => {
 test('a tool the charter does not grant is refused by canUseTool and the PreToolUse hook', async () => {
   clearCharterCache();
   const cwd = await tmpDir('skippy-policy-cwd-');
-  const coding = derivePolicy(await loadCharter('board.coding' as CharterAgentId), { cwd });
+  const coding = derivePolicy(await loadCharter('board.coding' as CharterAgentId), { projectRoot: cwd });
   // Coding does not grant WebFetch.
   const r = await canUse(coding, 'WebFetch', { url: 'https://example.com', prompt: 'x' }, approveAll);
   assert.equal(r.behavior, 'deny');
@@ -195,7 +195,7 @@ test('a tool the charter does not grant is refused by canUseTool and the PreTool
 
 test('approval-required actions are denied by default and the decision is made once per tool use', async () => {
   const cwd = await tmpDir('skippy-policy-cwd-');
-  const policy = derivePolicy(charter({ permission_mode: 'ask', tools: ['Bash', 'Read'] }), { cwd, worktreePath: cwd });
+  const policy = derivePolicy(charter({ permission_mode: 'ask', tools: ['Bash', 'Read'] }), { worktreePath: cwd });
   // Default approver: none => Bash is refused.
   assert.equal((await canUse(policy, 'Bash', { command: 'echo hi' })).behavior, 'deny');
   // With a concrete approval it is allowed...
@@ -251,19 +251,19 @@ test('disallowed_tools beats tools', async () => {
   const edit = await evaluateToolCall(policy, { toolName: 'Edit', input: { file_path: path.join(wt, 'a.txt'), old_string: 'a', new_string: 'b' } });
   assert.equal(edit.allow, true);
   // Server-level MCP disallow.
-  const p2 = derivePolicy(charter({ mcp_servers: ['obsidian'], disallowed_tools: ['mcp__obsidian'] }), { cwd: wt });
+  const p2 = derivePolicy(charter({ mcp_servers: ['obsidian'], disallowed_tools: ['mcp__obsidian'] }), { projectRoot: wt });
   assert.equal(denied(await evaluateToolCall(p2, { toolName: 'mcp__obsidian__obsidian_search', input: { query: 'x' } })).code, 'disallowed');
 });
 
 test('unknown tools are denied at runtime and fail closed in a charter', async () => {
   const cwd = await tmpDir('skippy-policy-cwd-');
-  const policy = derivePolicy(charter({ tools: ['Read'], mcp_servers: ['obsidian'] }), { cwd });
+  const policy = derivePolicy(charter({ tools: ['Read'], mcp_servers: ['obsidian'] }), { projectRoot: cwd });
   for (const toolName of ['CronCreate', 'EnterWorktree', 'RemoteTrigger', 'Teleport', 'mcp__obsidian__obsidian_delete_vault']) {
     assert.equal(denied(await evaluateToolCall(policy, { toolName, input: {} }, { approver: approveAll })).code, 'unknown_tool', toolName);
   }
   assert.equal((await canUse(policy, 'Teleport', {}, approveAll)).behavior, 'deny');
   assert.throws(
-    () => derivePolicy(charter({ tools: ['Read', 'Teleport'] }), { cwd }),
+    () => derivePolicy(charter({ tools: ['Read', 'Teleport'] }), { projectRoot: cwd }),
     (e: unknown) => e instanceof ToolPolicyError && e.code === 'unknown_tool',
   );
 });
@@ -305,7 +305,7 @@ test('writes outside the write roots are denied by the policy path hook', async 
   assert.equal(r.behavior, 'deny');
 
   // No worktree assigned => read-only: every built-in write is refused.
-  const ro = derivePolicy(charter({ permission_mode: 'acceptEdits', tools: ['Write'] }), { cwd: wt });
+  const ro = derivePolicy(charter({ permission_mode: 'acceptEdits', tools: ['Write'] }), { projectRoot: wt });
   assert.equal(denied(await evaluateToolCall(ro, { toolName: 'Write', input: { file_path: path.join(wt, 'a'), content: 'x' } }, { approver: approveAll })).code, 'path_outside_roots');
 
   // A replacement guard (e.g. WS-D's FR-SEC-02 broker) is honored.
@@ -350,14 +350,14 @@ test('invalid or unknown charter permission fields fail closed', async () => {
   ];
   for (const [fm, code] of cases) {
     assert.throws(
-      () => derivePolicy(charter({ tools: ['Read'], ...fm }), { cwd }),
+      () => derivePolicy(charter({ tools: ['Read'], ...fm }), { projectRoot: cwd }),
       (e: unknown) => e instanceof ToolPolicyError && e.code === code,
       `${JSON.stringify(fm)} -> ${code}`,
     );
   }
   // A placeholder (missing file) charter grants nothing.
   assert.throws(
-    () => derivePolicy(charter({ placeholder: true }, false), { cwd }),
+    () => derivePolicy(charter({ placeholder: true }, false), { projectRoot: cwd }),
     (e: unknown) => e instanceof ToolPolicyError && e.code === 'charter_not_loaded',
   );
   // Relative roots are rejected.
@@ -431,7 +431,7 @@ test('broker rejects unauthorized MCP dispatches over the real MCP protocol', as
 
   // A server the charter does not list is never built, and the broker denies it.
   const onlyObsidian = charter({ mcp_servers: ['obsidian'], memory: { letta_agent_id: 'bd_x' } });
-  const p = derivePolicy(onlyObsidian, { cwd: vault });
+  const p = derivePolicy(onlyObsidian, { projectRoot: vault });
   assert.equal(denied(await authorizeMcpDispatch(p, 'letta', 'letta_search_archival', { query: 'x' })).code, 'mcp_server_not_allowed');
   assert.deepEqual(Object.keys(await buildMcpServers(research, vault, { policy: p })), ['obsidian']);
 });
@@ -469,7 +469,7 @@ test('broker enforces the board vault scope and lets an in-scope write through',
   await fs.access(path.join(vault, '50_Agents', 'research', 'ok.md'));
 
   // Plan mode forbids every mutation, even in scope.
-  const plan = derivePolicy(charter({ permission_mode: 'plan', mcp_servers: ['obsidian'], memory: { vault_subdir: '50_Agents/research/' } }), { cwd: vault });
+  const plan = derivePolicy(charter({ permission_mode: 'plan', mcp_servers: ['obsidian'], memory: { vault_subdir: '50_Agents/research/' } }), { projectRoot: vault });
   let ran = false;
   const handler = brokered({ policy: plan }, 'obsidian', 'obsidian_append_block', () => {
     ran = true;
@@ -485,15 +485,15 @@ test('broker enforces the board vault scope and lets an in-scope write through',
 test('network destinations are validated and spawning is limited to Board -> Task', async () => {
   const cwd = await tmpDir('skippy-policy-cwd-');
   const c = charter({ tools: ['WebFetch', 'WebSearch', 'Agent', 'Read'] });
-  const noHosts = derivePolicy(c, { cwd });
+  const noHosts = derivePolicy(c, { projectRoot: cwd });
   assert.equal(denied(await evaluateToolCall(noHosts, { toolName: 'WebFetch', input: { url: 'https://example.com/a', prompt: 'x' } })).code, 'approval_required');
   assert.equal(denied(await evaluateToolCall(noHosts, { toolName: 'WebSearch', input: { query: 'x' } })).code, 'approval_required');
 
-  const hosts = derivePolicy(c, { cwd, networkAllowedHosts: ['example.com'] });
+  const hosts = derivePolicy(c, { projectRoot: cwd, networkAllowedHosts: ['example.com'] });
   assert.equal((await evaluateToolCall(hosts, { toolName: 'WebFetch', input: { url: 'https://docs.example.com/a', prompt: 'x' } })).allow, true);
   assert.equal(denied(await evaluateToolCall(hosts, { toolName: 'WebFetch', input: { url: 'https://example.com.evil.net/', prompt: 'x' } })).code, 'approval_required');
   assert.equal(denied(await evaluateToolCall(hosts, { toolName: 'WebFetch', input: { url: 'file:///etc/passwd', prompt: 'x' } }, { approver: approveAll })).code, 'network_destination_denied');
-  assert.throws(() => derivePolicy(c, { cwd, networkAllowedHosts: ['*'] }), ToolPolicyError);
+  assert.throws(() => derivePolicy(c, { projectRoot: cwd, networkAllowedHosts: ['*'] }), ToolPolicyError);
 
   // Board may spawn a task agent; a task agent may not spawn (no grandchildren).
   assert.equal((await evaluateToolCall(noHosts, { toolName: 'Agent', input: { description: 'd', prompt: 'p' } })).allow, true);
@@ -504,7 +504,7 @@ test('network destinations are validated and spawning is limited to Board -> Tas
   assert.equal(plan.sdkPermissionMode, 'plan');
   assert.equal(denied(await evaluateToolCall(plan, { toolName: 'Write', input: { file_path: path.join(cwd, 'a'), content: 'x' } }, { approver: approveAll })).code, 'mode_forbids');
 
-  const dontAsk = derivePolicy(charter({ permission_mode: 'dontAsk', tools: ['Bash'] }), { cwd });
+  const dontAsk = derivePolicy(charter({ permission_mode: 'dontAsk', tools: ['Bash'] }), { projectRoot: cwd });
   assert.equal(denied(await evaluateToolCall(dontAsk, { toolName: 'Bash', input: { command: 'ls' } }, { approver: approveAll })).code, 'approval_required');
 });
 
@@ -512,7 +512,7 @@ test('network destinations are validated and spawning is limited to Board -> Tas
 
 test('an executor that cannot enforce the policy is ineligible', async () => {
   const cwd = await tmpDir('skippy-policy-cwd-');
-  const policy = derivePolicy(charter({ tools: ['Read', 'Bash'], mcp_servers: ['obsidian'] }), { cwd });
+  const policy = derivePolicy(charter({ tools: ['Read', 'Bash'], mcp_servers: ['obsidian'] }), { projectRoot: cwd });
   assert.doesNotThrow(() => assertExecutorEligible(policy, CLAUDE_AGENT_SDK_CAPABILITIES));
   const observeOnly = { ...CLAUDE_AGENT_SDK_CAPABILITIES, adapter: 'observe-only', preExecutionToolGate: false };
   assert.throws(
@@ -770,13 +770,13 @@ test('D4: misspelled or unknown disallowed_tools entries fail closed', async () 
   const cwd = await tmpDir('skippy-policy-cwd-');
   for (const bad of [['edit', 'write'], ['Wirte'], ['bash'], ['mcp__obsidain'], ['mcp__obsidian__obsidian_nuke'], ['Bash(rm:*)'], ['*']]) {
     assert.throws(
-      () => derivePolicy(charter({ tools: ['Read', 'Edit', 'Write'], disallowed_tools: bad }), { cwd }),
+      () => derivePolicy(charter({ tools: ['Read', 'Edit', 'Write'], disallowed_tools: bad }), { projectRoot: cwd }),
       (e: unknown) => e instanceof ToolPolicyError && (e.code as string) === 'unknown_disallowed_tool',
       JSON.stringify(bad),
     );
   }
   for (const ok of [['Edit', 'Write'], ['Task', 'KillShell'], ['mcp__obsidian'], ['mcp__obsidian__*'], ['mcp__letta__letta_edit_core'], []]) {
-    assert.doesNotThrow(() => derivePolicy(charter({ tools: ['Read'], disallowed_tools: ok }), { cwd }), JSON.stringify(ok));
+    assert.doesNotThrow(() => derivePolicy(charter({ tools: ['Read'], disallowed_tools: ok }), { projectRoot: cwd }), JSON.stringify(ok));
   }
   // Every shipped charter (boards, staff, skippy, task agents) still derives.
   const tasksDir = path.join(REPO_ROOT, 'agent_space', 'tasks');
@@ -787,7 +787,7 @@ test('D4: misspelled or unknown disallowed_tools entries fail closed', async () 
       return m ? m[1]!.split(',').map((s) => s.trim()).filter(Boolean) : [];
     };
     assert.doesNotThrow(
-      () => derivePolicy(charter({ tools: list('tools'), disallowed_tools: list('disallowed_tools') }), { cwd }),
+      () => derivePolicy(charter({ tools: list('tools'), disallowed_tools: list('disallowed_tools') }), { projectRoot: cwd }),
       `task charter ${f}`,
     );
   }

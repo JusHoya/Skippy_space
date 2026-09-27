@@ -13,6 +13,11 @@
 //! - If the child exits, log + restart with 2s backoff unless the
 //!   `SKIPPY_NO_RESTART` env var is set.
 //! - Forward `ANTHROPIC_API_KEY` and `SKIPPY_MODEL` to the child env.
+//! - Run the child with an explicit, dedicated working directory (the app's
+//!   local data dir, `sidecar/` subfolder) so its `process.cwd()` is never
+//!   Tauri's launch directory, a repo, or the user's home. The runtime treats
+//!   its cwd as meaningless (no policy root is ever derived from it —
+//!   red-team N2, FR-SEC-01); this makes that true at the process level too.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -132,7 +137,8 @@ pub async fn spawn_supervisor(app: AppHandle, handle: SidecarHandle) {
             format!("spawning node {}", entry.display()),
         ));
 
-        match spawn_once(&entry, &handle).await {
+        let cwd = sidecar_working_dir(&app);
+        match spawn_once(&entry, cwd.as_deref(), &handle).await {
             Ok(status) => {
                 let msg = format!("sidecar exited with status {status:?}");
                 warn!("{msg}");
@@ -157,15 +163,43 @@ pub async fn spawn_supervisor(app: AppHandle, handle: SidecarHandle) {
     }
 }
 
+/// The sidecar's explicit working directory: `<app_local_data_dir>/sidecar`,
+/// created on demand. `None` (with a warning) only if the platform path
+/// cannot be resolved or created — the caller then refuses to spawn rather
+/// than inherit an ambient cwd.
+fn sidecar_working_dir(app: &AppHandle) -> Option<PathBuf> {
+    let base = match app.path().app_local_data_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("app_local_data_dir unavailable; sidecar cwd cannot be pinned: {e}");
+            return None;
+        }
+    };
+    let dir = base.join("sidecar");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("cannot create sidecar working dir {}: {e}", dir.display());
+        return None;
+    }
+    Some(dir)
+}
+
 /// One spawn + watch cycle. Returns the exit status (or an error if the
-/// process refused to start at all).
-async fn spawn_once(entry: &Path, handle: &SidecarHandle) -> Result<std::process::ExitStatus> {
+/// process refused to start at all). `cwd` is mandatory: an ambient working
+/// directory is never inherited.
+async fn spawn_once(
+    entry: &Path,
+    cwd: Option<&Path>,
+    handle: &SidecarHandle,
+) -> Result<std::process::ExitStatus> {
+    let cwd = cwd.ok_or_else(|| anyhow!("sidecar working directory could not be pinned; refusing to inherit the ambient cwd"))?;
     let mut cmd = Command::new("node");
     cmd.arg(entry);
+    cmd.current_dir(cwd);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    info!("sidecar cwd pinned to {}", cwd.display());
 
     // Forward env vars that the runtime cares about, if set.
     for var in ["ANTHROPIC_API_KEY", "SKIPPY_MODEL"] {

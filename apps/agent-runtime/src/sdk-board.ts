@@ -25,8 +25,14 @@
 // `allowedTools`, `disallowedTools`, a `canUseTool` + `PreToolUse` deny gate,
 // an explicit `cwd`, no ambient settings and a strict MCP allowlist. If the
 // policy cannot be derived or this adapter cannot enforce it, the mission is
-// refused before the SDK is even imported. Without an assigned worktree the
-// board runs read-only (no built-in write root).
+// refused before the SDK is even imported. Filesystem roots come only from the
+// explicit execution context (`worktreePath` = the only write root,
+// `projectRoot` = an extra read-only root); the sidecar's ambient
+// `process.cwd()` is never consulted (red-team N2). Without either, the board
+// has NO read roots: every built-in filesystem read is denied and the CLI runs
+// in a dedicated empty scratch directory.
+
+import { mkdirSync } from 'node:fs';
 
 import type { ExecutorTerminal, ModelId } from '@skippy/shared';
 import type {
@@ -86,25 +92,34 @@ export interface ExecuteBoardMissionParams {
   maxTurns?: number;
   /** Charter the policy is derived from; loaded from agent_space when omitted. */
   charter?: Charter;
-  /** Assigned worktree (absolute): the only built-in write root. Omitted =>
-   * read-only execution rooted at the process cwd. */
+  /** Assigned worktree (absolute): the only built-in write root (and a read
+   * root). */
   worktreePath?: string;
+  /** Explicitly configured project root (absolute): a read-only root. Must be
+   * validated configuration handed in by the runtime, never the sidecar cwd. */
+  projectRoot?: string;
   /** Approval + path-guard hooks; default approver denies (no approval channel). */
   enforcement?: SdkEnforcementHooks;
 }
 
 /**
  * Derive the enforced policy for a board mission and prove this adapter can
- * enforce it. Throws ToolPolicyError (the mission must be refused).
+ * enforce it. Throws ToolPolicyError (the mission must be refused). No
+ * ambient `process.cwd()` is ever used: roots are exactly the ones the caller
+ * assigned; with none, the read roots are empty and the executor's cwd is the
+ * dedicated no-root scratch directory (created here so the CLI can start).
  */
 export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Promise<ExecutionPolicy> {
   const charter =
     params.charter ?? (await loadCharter(`board.${params.boardId}` as CharterAgentId));
   const policy = derivePolicy(charter, {
-    cwd: params.worktreePath ?? process.cwd(),
     ...(params.worktreePath ? { worktreePath: params.worktreePath } : {}),
+    ...(params.projectRoot ? { projectRoot: params.projectRoot } : {}),
   });
   assertExecutorEligible(policy, CLAUDE_AGENT_SDK_CAPABILITIES);
+  if (policy.readRoots.length === 0) {
+    mkdirSync(policy.cwd, { recursive: true });
+  }
   return policy;
 }
 

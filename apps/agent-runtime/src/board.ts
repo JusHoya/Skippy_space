@@ -66,6 +66,9 @@ export interface BoardDelegation {
   constraints?: string[];
   deadline?: string;
   fromAgentId: string;
+  /** Worktree assigned to this delegation (absolute). The ONLY built-in write
+   * root for a live executor; absent => the executor has no write root. */
+  worktreePath?: string;
 }
 
 /** Output of `receiveDelegation` — the triage decision only. An `accept` means
@@ -91,7 +94,26 @@ export type BoardExecutor = (req: {
   boardId: BoardId;
   charter: Charter;
   missionBrief: string;
+  /** Assigned worktree (absolute; write + read root), when one exists. */
+  worktreePath?: string;
+  /** Explicitly configured read-only project root, when one exists. */
+  projectRoot?: string;
 }) => Promise<ExecutorTerminal>;
+
+/**
+ * The read-only project root the runtime is configured with
+ * (`SKIPPY_PROJECT_ROOT`, absolute), or undefined. This is the ONLY source of
+ * a non-worktree read root for live executors: the sidecar's ambient
+ * `process.cwd()` is never used (red-team N2, FR-SEC-01). The value is
+ * validated by `derivePolicy` (absolute; not a drive root, home directory or
+ * an ancestor of it) — an invalid value refuses the mission rather than
+ * widening it.
+ */
+export function configuredProjectRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const raw = env.SKIPPY_PROJECT_ROOT;
+  if (typeof raw !== 'string' || raw.trim() === '') return undefined;
+  return raw.trim();
+}
 
 /** Injectable collaborators (tests supply fakes; production uses defaults). */
 export interface BoardDeps {
@@ -102,7 +124,7 @@ export interface BoardDeps {
 }
 
 /** Production live executor: charter-scoped MCP servers + Claude Agent SDK. */
-const sdkExecutor: BoardExecutor = async ({ boardId, charter, missionBrief }) => {
+const sdkExecutor: BoardExecutor = async ({ boardId, charter, missionBrief, worktreePath, projectRoot }) => {
   // Build this board's MCP servers (obsidian/letta) from its charter, so the
   // real agent can do surgical vault edits, semantic search, and archival
   // memory. Only happens on the live path — never when the gate is closed.
@@ -114,8 +136,11 @@ const sdkExecutor: BoardExecutor = async ({ boardId, charter, missionBrief }) =>
     model: getModelFor(`board.${boardId}`),
     missionBrief,
     mcpServers,
-    // The tool policy is derived from this same charter (T02).
+    // The tool policy is derived from this same charter (T02). Filesystem
+    // roots are exactly the explicit ones below — never process.cwd() (N2).
     charter,
+    ...(worktreePath ? { worktreePath } : {}),
+    ...(projectRoot ? { projectRoot } : {}),
   });
 };
 
@@ -408,10 +433,13 @@ export class Board {
               mode: 'live',
               ts: new Date().toISOString(),
             });
+            const projectRoot = configuredProjectRoot();
             const terminal = await this.executeLive({
               boardId: this.boardId,
               charter: this.charter,
               missionBrief: env.missionBrief,
+              ...(env.worktreePath ? { worktreePath: env.worktreePath } : {}),
+              ...(projectRoot ? { projectRoot } : {}),
             });
             // No acceptance criteria exist yet (pre-M1), so the validation
             // disposition is `not_defined`; see PRD OQ-13.

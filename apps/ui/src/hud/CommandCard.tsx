@@ -1,8 +1,19 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { BOARD_COSTUMES, numToHex, type BoardId } from '@skippy/sprite-kit';
 import { useUiStore } from '../stores/uiStore';
 import { useClaudeCodeStore } from '../stores/claudeCodeStore';
-import { spawnClaudeCode } from '../lib/claudeCode';
+import {
+  getClaudeCodeSpawnAvailability,
+  spawnClaudeCode,
+  type ClaudeCodeSpawnAvailability,
+} from '../lib/claudeCode';
+
+/** Until the shell answers, the spawn lane is treated as ineligible. */
+const SPAWN_UNKNOWN: ClaudeCodeSpawnAvailability = {
+  available: false,
+  reason: 'checking claude-code lane eligibility…',
+  ungatedOptIn: false,
+};
 
 interface Slot {
   hotkey: string;
@@ -209,6 +220,20 @@ export default function CommandCard() {
   const selectedId = useUiStore((s) => s.selectedAgentId);
   const setTaskBrief = useClaudeCodeStore((s) => s.setTaskBrief);
 
+  // FR-SEC-01 / red-team N3: the PTY claude lane has no enforced charter
+  // policy in M0, so the shell reports it ineligible unless a developer opted
+  // in. The "R" slot is disabled with the reason as its tooltip.
+  const [spawnAvailability, setSpawnAvailability] = useState<ClaudeCodeSpawnAvailability>(SPAWN_UNKNOWN);
+  useEffect(() => {
+    let cancelled = false;
+    void getClaudeCodeSpawnAvailability().then((a) => {
+      if (!cancelled) setSpawnAvailability(a);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const { slots, accentHex } = useMemo<{ slots: Slot[]; accentHex: string }>(() => {
     if (selectedId === 'skippy') {
       return { slots: SKIPPY_SLOTS, accentHex: '#66FCF1' };
@@ -225,6 +250,10 @@ export default function CommandCard() {
 
   const handleSpawnClaudeCode = useCallback(async () => {
     if (!selectedId) return;
+    if (!spawnAvailability.available) {
+      console.warn(`[skippy/ui] claude-code lane ineligible: ${spawnAvailability.reason ?? 'no reason given'}`);
+      return;
+    }
     // Only Skippy and the eight Board captains may spawn claude-code task
     // agents. Anyone else falls through to a no-op (the button is also hidden
     // there because GENERIC_SLOTS doesn't carry the action).
@@ -257,7 +286,7 @@ export default function CommandCard() {
     // Stash the brief on the store right away so the TerminalCluster tab gets
     // a meaningful label even before the `claude_code_spawned` envelope arrives.
     setTaskBrief(result.spawnId, trimmed);
-  }, [selectedId, setTaskBrief]);
+  }, [selectedId, setTaskBrief, spawnAvailability]);
 
   return (
     <div
@@ -269,13 +298,20 @@ export default function CommandCard() {
       {slots.map((slot, idx) => {
         const enabled = slot.label !== '' && slot.action !== undefined ? true : !!slot.label;
         const hasHandler = slot.action === 'spawn_claude_code';
+        const spawnBlocked = hasHandler && !spawnAvailability.available;
+        const title = spawnBlocked
+          ? `${slot.label} — unavailable: ${spawnAvailability.reason ?? 'ineligible'}`
+          : hasHandler && spawnAvailability.ungatedOptIn
+            ? `${slot.label} — ${spawnAvailability.reason ?? ''}`
+            : slot.label || 'empty';
         return (
           <button
             key={`${slot.hotkey}-${idx}`}
             type="button"
-            className={`slot ${slot.label ? '' : 'empty'} ${slot.action ? 'wired' : ''}`}
-            disabled={!enabled || !hasHandler}
-            title={slot.label || 'empty'}
+            className={`slot ${slot.label ? '' : 'empty'} ${slot.action ? 'wired' : ''} ${spawnBlocked ? 'ineligible' : ''}`}
+            disabled={!enabled || !hasHandler || spawnBlocked}
+            aria-disabled={!enabled || !hasHandler || spawnBlocked}
+            title={title}
             onClick={hasHandler ? handleSpawnClaudeCode : undefined}
           >
             <span className="hotkey" style={slot.label ? { color: accentHex } : undefined}>

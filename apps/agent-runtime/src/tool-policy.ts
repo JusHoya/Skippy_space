@@ -10,9 +10,20 @@
 //   1. `derivePolicy(charter, ctx)` validates the charter's authority fields
 //      (`permission_mode`, `tools`, `disallowed_tools`, `mcp_servers`) and throws
 //      a ToolPolicyError for anything unknown or invalid — including a request
-//      for `bypassPermissions`, which is never granted. Filesystem roots come
-//      from the *execution context* (the worktree the caller assigns), never
-//      from charter text; no worktree => no built-in write root at all.
+//      for `bypassPermissions`, which is never granted. Charter keys are
+//      compared after normalisation (trim, lowercase, `-` -> `_`): an alias
+//      spelling of a known authority key, an unknown authority-looking key at
+//      any depth, or an authority key nested below the top level fails closed
+//      (red-team N4). Filesystem roots come ONLY from the *execution context*
+//      (the assigned worktree and/or an explicitly configured project root),
+//      never from charter text and never from the sidecar's ambient
+//      `process.cwd()` (red-team N2): no roots => read roots are empty and every
+//      built-in filesystem read is denied (the board can still use the brokered
+//      vault MCP tools). A root may not be a drive root, the user's home
+//      directory or an ancestor of it. Well-known credential locations
+//      (`.ssh/`, `.aws/`, `.env*`, `*.pem`, `id_rsa*`, `.npmrc`, `.netrc`,
+//      `.git-credentials`, `.claude/.credentials*`, `.codex/auth*`, …) are
+//      denied even inside the roots as defense in depth (FR-SEC-02).
 //   2. `evaluateToolCall(policy, call, hooks)` is the single decision function.
 //      Hard limits (grant, disallow, known tool, roots, arguments, no
 //      grandchildren) are checked first and cannot be overridden by approval.
@@ -45,6 +56,7 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, realpathSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import type {
@@ -138,12 +150,44 @@ export const MCP_TOOL_CLASSES: Readonly<Record<string, Readonly<Record<string, A
 /** Charter keys that carry authority and that this module understands. */
 const KNOWN_AUTHORITY_KEYS = new Set(['permission_mode', 'tools', 'disallowed_tools', 'mcp_servers']);
 
+/** Every top-level charter key the schema knows (PRD §6.1 + agent_space/
+ * CLAUDE.md + the staff/task charter extensions). A key outside this set is
+ * tolerated only when it does not look authority-related. */
+const KNOWN_CHARTER_KEYS = new Set([
+  ...KNOWN_AUTHORITY_KEYS,
+  'agent',
+  'board',
+  'task',
+  'role',
+  'display_name',
+  'codename',
+  'costume',
+  'model',
+  'effort',
+  'memory',
+  'spawnable_task_agents',
+  'ports_from',
+  'reports_to',
+  'parent_staff',
+  'owns_pipeline',
+  'execution_profile',
+  'placeholder',
+  'reason',
+  'error',
+]);
+
 /** A frontmatter key matching this pattern is treated as an authority field.
  * If it is not in KNOWN_AUTHORITY_KEYS it fails closed rather than being
  * silently ignored (e.g. `allowed_tools`, `dangerously_skip_permissions`,
  * `sandbox`, `network_hosts`, `write_roots`). */
 const AUTHORITY_KEY_PATTERN =
   /(permission|allow|bypass|danger|sandbox|network|approv|tool|mcp|root|scope|sudo|trust)/i;
+
+/** Canonical spelling used to compare charter keys: trimmed, lower-cased,
+ * `-` folded to `_`. */
+function normalizeCharterKey(key: string): string {
+  return key.trim().toLowerCase().replace(/-/g, '_');
+}
 
 const MCP_SERVER_NAME = /^[a-z][a-z0-9-]*(?:_[a-z0-9-]+)*$/;
 
@@ -162,6 +206,7 @@ export type ToolPolicyErrorCode =
   | 'invalid_mcp_servers'
   | 'unknown_authority_field'
   | 'invalid_context'
+  | 'invalid_root'
   | 'adapter_ineligible';
 
 export class ToolPolicyError extends Error {
@@ -193,9 +238,11 @@ export interface ExecutionPolicy {
   readonly disallowedTools: readonly string[];
   /** MCP servers this agent may reach (charter `mcp_servers`). */
   readonly mcpServers: readonly string[];
-  /** Working directory for the executor. */
+  /** Working directory for the executor: inside a root, or — when no root was
+   * assigned — a dedicated empty scratch directory that is NOT a read root. */
   readonly cwd: string;
-  /** Absolute roots the agent may read with built-in tools. */
+  /** Absolute roots the agent may read with built-in tools (worktree and/or
+   * project root). Empty when no root was assigned => all reads denied. */
   readonly readRoots: readonly string[];
   /** Absolute roots the agent may write with built-in tools (the assigned
    * worktree only; empty when no worktree was assigned => read-only). */
@@ -208,13 +255,31 @@ export interface ExecutionPolicy {
 }
 
 export interface PolicyContext {
-  /** Executor working directory (absolute). Defaults to the worktree. */
-  cwd?: string;
-  /** Assigned worktree (absolute). The ONLY built-in write root. */
+  /** Assigned worktree (absolute). The ONLY built-in write root; also a read
+   * root. */
   worktreePath?: string;
+  /** Explicitly configured project root (absolute): a read-only root. Must be
+   * handed in by the runtime from configuration — never the sidecar cwd. */
+  projectRoot?: string;
+  /** Executor working directory (absolute). Must lie inside one of the roots.
+   * Defaults to the worktree, else the project root, else (no roots) the
+   * dedicated no-root scratch directory. It is NOT a root by itself. */
+  cwd?: string;
   /** Hostnames WebFetch may reach without approval (from a future execution
    * profile, never from charter text). Default: none. */
   networkAllowedHosts?: readonly string[];
+}
+
+/**
+ * Working directory handed to an executor that has NO filesystem roots. It is
+ * deliberately an empty, dedicated directory (created by the executor adapter
+ * before launch) and is never a read root, so a relative path resolved against
+ * it is still denied. Overridable for tests via SKIPPY_NO_ROOT_CWD.
+ */
+export function noRootWorkingDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.SKIPPY_NO_ROOT_CWD;
+  if (override && path.isAbsolute(override)) return path.resolve(override);
+  return path.join(os.tmpdir(), 'skippy-agent-runtime', 'no-root');
 }
 
 function fail(code: ToolPolicyErrorCode, charter: Charter, msg: string): never {
@@ -308,6 +373,88 @@ function requireAbsolute(charter: Charter, label: string, p: string | undefined)
 }
 
 /**
+ * Why `root` may not serve as a filesystem root for an agent, or null. A root
+ * must be absolute and interpretable (no `~`, env-var, UNC/device forms), and
+ * may not be a drive/filesystem root, the user's home directory, or an
+ * ancestor of the home directory — lexically or after resolving reparse
+ * points. Such a root would put every credential store on disk in scope.
+ */
+export function rootRejection(root: string, home: string = os.homedir()): string | null {
+  if (typeof root !== 'string' || root.trim() === '') return 'root must be a non-empty string';
+  if (!path.isAbsolute(root)) return 'root must be an absolute path';
+  const interpreted = interpretToolPath(root, path.parse(path.resolve(root)).root);
+  if (!interpreted.ok) return `root refused: ${interpreted.reason}`;
+  const abs = path.resolve(interpreted.path);
+  if (path.parse(abs).root === abs) return 'a drive or filesystem root may not be a root';
+  const homeAbs = path.resolve(home);
+  const forms = new Set([key(abs), key(realish(abs))]);
+  const homeForms = new Set([key(homeAbs), key(realish(homeAbs))]);
+  for (const r of forms) {
+    for (const h of homeForms) {
+      if (r === h) return 'the user home directory may not be a root';
+      if (contains(r, h)) return 'an ancestor of the user home directory may not be a root';
+    }
+  }
+  return null;
+}
+
+function requireRoot(charter: Charter, label: string, p: string | undefined): string | undefined {
+  const abs = requireAbsolute(charter, label, p);
+  if (abs === undefined) return undefined;
+  const why = rootRejection(abs);
+  if (why) fail('invalid_root', charter, `${label} ${JSON.stringify(p)} rejected: ${why}`);
+  return abs;
+}
+
+/**
+ * Walk the frontmatter and fail closed on any authority-shaped key that is
+ * not exactly a known top-level authority key (FR-BOARD-01, red-team N4):
+ *   - a top-level key whose normalised form is a known authority key but whose
+ *     spelling differs (`Tools`, `disallowed-tools`, ` tools`);
+ *   - a top-level key outside the charter schema that matches the authority
+ *     pattern (`allowed_tools`, `dangerously_skip_permissions`);
+ *   - any nested key (any depth, inside mappings or sequences) that is or looks
+ *     like an authority key — authority is top-level only.
+ */
+function checkCharterKeys(charter: Charter): void {
+  const visit = (value: unknown, depth: number, trail: string): void => {
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => visit(v, depth + 1, `${trail}[${i}]`));
+      return;
+    }
+    if (value === null || typeof value !== 'object') return;
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      const norm = normalizeCharterKey(key);
+      const label = trail ? `${trail}.${key}` : key;
+      if (depth === 0) {
+        if (KNOWN_AUTHORITY_KEYS.has(norm) && key !== norm) {
+          fail(
+            'unknown_authority_field',
+            charter,
+            `authority field \`${key}\` must be spelled exactly \`${norm}\`; refusing an alias spelling (FR-BOARD-01)`,
+          );
+        }
+        if (!KNOWN_CHARTER_KEYS.has(norm) && AUTHORITY_KEY_PATTERN.test(norm)) {
+          fail(
+            'unknown_authority_field',
+            charter,
+            `unrecognized authority field \`${key}\`; refusing rather than silently ignoring it (FR-BOARD-01)`,
+          );
+        }
+      } else if (KNOWN_AUTHORITY_KEYS.has(norm) || AUTHORITY_KEY_PATTERN.test(norm)) {
+        fail(
+          'unknown_authority_field',
+          charter,
+          `authority-shaped field \`${label}\` is nested; authority fields are top-level only (FR-BOARD-01)`,
+        );
+      }
+      visit(v, depth + 1, label);
+    }
+  };
+  visit(charter.frontmatter, 0, '');
+}
+
+/**
  * Derive the enforced execution policy for a charter. Throws ToolPolicyError
  * on any unknown/invalid authority field — callers must treat that as
  * "ineligible to run", never as "run unrestricted".
@@ -317,15 +464,7 @@ export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): Executi
     fail('charter_not_loaded', charter, 'charter file was not loaded; a placeholder charter grants no authority');
   }
 
-  for (const key of Object.keys(charter.frontmatter)) {
-    if (!KNOWN_AUTHORITY_KEYS.has(key) && AUTHORITY_KEY_PATTERN.test(key)) {
-      fail(
-        'unknown_authority_field',
-        charter,
-        `unrecognized authority field \`${key}\`; refusing rather than silently ignoring it (FR-BOARD-01)`,
-      );
-    }
-  }
+  checkCharterKeys(charter);
 
   const permissionMode = parsePermissionMode(charter);
 
@@ -365,13 +504,23 @@ export function derivePolicy(charter: Charter, ctx: PolicyContext = {}): Executi
     }
   }
 
-  const worktree = requireAbsolute(charter, 'worktreePath', ctx.worktreePath);
-  const cwd = requireAbsolute(charter, 'cwd', ctx.cwd) ?? worktree;
-  if (cwd === undefined) {
-    fail('invalid_context', charter, 'an absolute cwd or worktreePath is required');
-  }
+  // Roots come only from the execution context. There is deliberately no
+  // fallback to process.cwd(): the sidecar's ambient directory (Tauri's launch
+  // dir, a home directory, …) is never a root (red-team N2).
+  const worktree = requireRoot(charter, 'worktreePath', ctx.worktreePath);
+  const project = requireRoot(charter, 'projectRoot', ctx.projectRoot);
   const writeRoots = worktree ? [worktree] : [];
-  const readRoots = [...new Set([cwd, ...writeRoots])];
+  const readRoots = [...new Set([...writeRoots, ...(project ? [project] : [])])];
+  const explicitCwd = requireAbsolute(charter, 'cwd', ctx.cwd);
+  let cwd: string;
+  if (explicitCwd !== undefined) {
+    if (!readRoots.some((r) => contains(r, explicitCwd) && contains(realish(r), realish(explicitCwd)))) {
+      fail('invalid_context', charter, `cwd ${JSON.stringify(ctx.cwd)} must lie inside an assigned root (a cwd is never a root by itself)`);
+    }
+    cwd = explicitCwd;
+  } else {
+    cwd = worktree ?? project ?? noRootWorkingDirectory();
+  }
 
   const hosts = (ctx.networkAllowedHosts ?? []).map((h) => h.trim().toLowerCase());
   for (const h of hosts) {
@@ -420,6 +569,7 @@ export type DenyCode =
   | 'path_outside_roots'
   | 'path_outside_vault_scope'
   | 'network_destination_denied'
+  | 'credential_path'
   | 'no_grandchildren'
   | 'approval_required';
 
@@ -700,6 +850,74 @@ function hasDotDotSegment(p: string): boolean {
   return p.split(/[\\/]/).some((s) => s === '..');
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Credential locations (FR-SEC-02 "credentials belong in OS or
+// provider-managed stores"; red-team N2 defense in depth)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Even inside an assigned root, built-in filesystem tools may not touch the
+// well-known places credentials live. This is a name-based deny list applied
+// to every interpreted path argument and to every Glob / Grep-glob
+// alternative (each segment is tested, so `*.pem`, `.env*` or `.ssh/**` as a
+// pattern is refused just like the literal file). It is deliberately broad —
+// a false positive costs one denied read; a false negative leaks a secret.
+
+/** Directory names that are credential stores wherever they appear. */
+const CREDENTIAL_DIR_SEGMENTS: ReadonlySet<string> = new Set([
+  '.ssh',
+  '.aws',
+  '.gnupg',
+  '.kube',
+  '.azure',
+  '.docker',
+]);
+
+/** Basename patterns (tested case-insensitively) of well-known credential files. */
+const CREDENTIAL_BASENAME_PATTERNS: readonly RegExp[] = [
+  /^\.env(?:$|[.*])/i, // .env, .env.local, .env.production, `.env*`
+  /\.(?:pem|key|p12|pfx|jks|keystore|ppk)$/i,
+  /^id_(?:rsa|dsa|ecdsa|ed25519)/i, // id_rsa, id_rsa.pub, id_ed25519*
+  /^\.npmrc$/i,
+  /^\.?_?netrc$/i, // .netrc, _netrc, netrc
+  /^\.pypirc$/i,
+  /^\.git-credentials$/i,
+  /^\.htpasswd$/i,
+  /^\.credentials/i, // .claude/.credentials.json
+  /credentials\.json$/i, // application_default_credentials.json
+];
+
+/** `<dir>/<basename-prefix>*` pairs: `.codex/auth*`, `.claude/.credentials*`. */
+const CREDENTIAL_DIR_PREFIX: readonly (readonly [string, string])[] = [
+  ['.codex', 'auth'],
+  ['.claude', '.credentials'],
+];
+
+/**
+ * Why `p` (an interpreted absolute path, or a glob alternative) names a
+ * well-known credential location, or null.
+ */
+export function credentialPathRejection(p: string): string | null {
+  const segs = p.split(/[\\/]/).filter((s) => s !== '' && s !== '.');
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i] as string;
+    const lower = seg.toLowerCase();
+    if (CREDENTIAL_DIR_SEGMENTS.has(lower)) {
+      return `"${seg}" is a credential store directory`;
+    }
+    for (const [dir, prefix] of CREDENTIAL_DIR_PREFIX) {
+      const next = segs[i + 1];
+      if (lower === dir && next !== undefined && next.toLowerCase().startsWith(prefix)) {
+        return `"${dir}/${next}" is a credential file`;
+      }
+    }
+  }
+  const last = segs[segs.length - 1];
+  if (last !== undefined && CREDENTIAL_BASENAME_PATTERNS.some((re) => re.test(last))) {
+    return `"${last}" matches a credential file pattern`;
+  }
+  return null;
+}
+
 /** Directory rg will enumerate for one glob alternative: the text before the
  * first glob metacharacter, cut after the last separator (the CLI's Glob
  * `b3f` split), or the whole literal when there is no metacharacter. */
@@ -747,6 +965,8 @@ async function checkPathArg(
 ): Promise<ArgCheck> {
   const r = interpretToolPath(raw, base);
   if (!r.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" refused: ${r.reason}` };
+  const cred = credentialPathRejection(r.path);
+  if (cred) return { ok: false, code: 'credential_path', reason: `${label} "${raw}" (${r.path}) denied: ${cred}` };
   const g = await guard(r.path, roots, base);
   if (!g.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${g.reason}` };
   return argOk;
@@ -766,7 +986,11 @@ async function checkGlobPattern(
     const why = pathAmbiguity(alt, false);
     if (why) return bad(`alternative "${alt}": ${why}`);
     if (hasDotDotSegment(alt)) return bad(`alternative "${alt}" contains a ".." segment`);
+    const cred = credentialPathRejection(alt);
+    if (cred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: alternative "${alt}": ${cred}` };
     const root = globRootFor(alt, searchBase);
+    const rootCred = credentialPathRejection(root);
+    if (rootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${root}: ${rootCred}` };
     const g = await guard(root, roots, searchBase);
     if (!g.ok) return bad(`alternative "${alt}" searches ${root}: ${g.reason}`);
   }
@@ -792,6 +1016,8 @@ function checkGrepGlob(glob: string): ArgCheck {
       if (why) return bad(`"${alt}": ${why}`);
       if (path.isAbsolute(alt) || /^[a-zA-Z]:/.test(alt)) return bad(`"${alt}" is absolute`);
       if (hasDotDotSegment(alt)) return bad(`"${alt}" contains a ".." segment`);
+      const cred = credentialPathRejection(alt);
+      if (cred) return { ok: false, code: 'credential_path', reason: `grep glob "${glob}" refused: "${alt}": ${cred}` };
     }
   }
   return argOk;
@@ -845,10 +1071,10 @@ async function checkReadArgs(
       }
       const p = pathField('path');
       if (p.bad) return p.bad;
-      if (p.value !== undefined) {
-        const c = await checkPathArg('path', p.value, roots, base, guard);
-        if (!c.ok) return c;
-      }
+      // No `path` => rg searches the executor cwd; that implicit base must
+      // pass the same root check (with no roots assigned it is denied).
+      const c = await checkPathArg('path', p.value ?? '', roots, base, guard);
+      if (!c.ok) return c;
       const g = pathField('glob');
       if (g.bad) return g.bad;
       if (g.value !== undefined) return checkGrepGlob(g.value);

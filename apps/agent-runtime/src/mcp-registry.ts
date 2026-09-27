@@ -208,9 +208,10 @@ export function buildLettaServer(
  *
  * Authority: servers are built only from the charter-derived policy allowlist,
  * and every tool dispatches through the broker. When no policy is passed it is
- * derived from the charter (read-only context: cwd = process.cwd(), no write
- * root). A charter whose policy cannot be derived (invalid/unknown authority
- * field, bypass request, placeholder) gets NO servers — fail closed.
+ * derived from the charter with NO filesystem roots (MCP tools are vault-scoped
+ * by the broker; the sidecar's ambient cwd is never a root — red-team N2). A
+ * charter whose policy cannot be derived (invalid/unknown authority field,
+ * bypass request, placeholder) gets NO servers — fail closed.
  */
 export async function buildMcpServers(
   charter: Charter,
@@ -222,7 +223,7 @@ export async function buildMcpServers(
     effective = broker;
   } else {
     try {
-      effective = { policy: derivePolicy(charter, { cwd: process.cwd() }) };
+      effective = { policy: derivePolicy(charter, {}) };
     } catch (err) {
       logger.warn({
         msg: 'tool policy could not be derived; building no MCP servers (fail closed)',

@@ -24,6 +24,30 @@ import { isTauri, safeInvoke } from './tauri';
  * decide whether to show a toast / fall back. This keeps the renderer from
  * crashing when the dev env doesn't have `claude` installed yet.
  */
+/** Mirrors `claude_spawn::SpawnAvailability` on the Rust side. */
+export interface ClaudeCodeSpawnAvailability {
+  available: boolean;
+  reason: string | null;
+  ungatedOptIn: boolean;
+}
+
+/**
+ * Ask the Rust shell whether the PTY claude lane may run. The lane is
+ * ineligible by default (FR-SEC-01: no enforced charter policy until T10) and
+ * only a developer opt-in (`SKIPPY_ALLOW_UNGATED_CLAUDE_SPAWN=1`) enables it.
+ * Outside Tauri, or if the query fails, the answer is "unavailable".
+ */
+export async function getClaudeCodeSpawnAvailability(): Promise<ClaudeCodeSpawnAvailability> {
+  if (!isTauri()) {
+    return { available: false, reason: 'not running inside the Tauri shell', ungatedOptIn: false };
+  }
+  const res = await safeInvoke<ClaudeCodeSpawnAvailability>('claude_code_spawn_availability');
+  if (!res) {
+    return { available: false, reason: 'availability query failed; treating the lane as ineligible', ungatedOptIn: false };
+  }
+  return res;
+}
+
 export async function spawnClaudeCode(
   req: ClaudeCodeSpawnRequest,
 ): Promise<ClaudeCodeSpawnResult | null> {
