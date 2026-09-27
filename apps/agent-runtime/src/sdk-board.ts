@@ -47,6 +47,7 @@ import type {
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { resolveExecutionGate } from './execution-gate.js';
+import { buildClaudeExecutorEnv } from './executor-env.js';
 import { logger } from './logger.js';
 import {
   CLAUDE_AGENT_SDK_CAPABILITIES,
@@ -76,6 +77,9 @@ export type ClaudeAgentSdkModule = Pick<typeof import('@anthropic-ai/claude-agen
 export interface ExecuteBoardMissionDeps {
   /** Defaults to a dynamic import of `@anthropic-ai/claude-agent-sdk`. */
   loadSdk?: () => Promise<ClaudeAgentSdkModule>;
+  /** TEST-ONLY: applied last over the executor's scrubbed environment
+   * (executor-env.ts). Production never passes it. */
+  executorEnvOverrides?: Readonly<Record<string, string>>;
 }
 
 function loadClaudeAgentSdk(): Promise<ClaudeAgentSdkModule> {
@@ -1518,6 +1522,12 @@ export async function executeBoardMissionViaSdk(
     });
     const observer = new RunStreamObserver(policy, failures, denials, truncations);
     const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
+    // An explicit, allowlisted environment: `env` REPLACES the CLI's
+    // environment, so nothing ambient (RIPGREP_CONFIG_PATH, a falsy
+    // USE_BUILTIN_RIPGREP, CLAUDE_CODE_* toggles, …) reaches the executor
+    // (M0-G06, FR-SEC-01, OQ-18; see executor-env.ts).
+    const env = buildClaudeExecutorEnv(process.env, deps.executorEnvOverrides);
+    mkdirSync(env.CLAUDE_CONFIG_DIR, { recursive: true });
     const q = sdk.query({
       prompt: params.missionBrief,
       options: {
@@ -1526,6 +1536,7 @@ export async function executeBoardMissionViaSdk(
         maxTurns: params.maxTurns ?? 8,
         ...permission,
         mcpServers: filterMcpServers(policy, params.mcpServers),
+        env,
       },
     });
 

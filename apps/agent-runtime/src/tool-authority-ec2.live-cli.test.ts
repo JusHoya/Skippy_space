@@ -5,7 +5,9 @@
 //
 // It captures the exact argv and cwd the CLI hands rg for each Glob / Grep
 // call — via a tiny logging `rg.exe` shim compiled with `rustc` and selected
-// with the CLI's own `USE_BUILTIN_RIPGREP=0` switch (system rg from PATH) —
+// with the CLI's own `USE_BUILTIN_RIPGREP=0` switch (system rg from PATH;
+// injected through the test-only `executorEnvOverrides`, since the
+// executor's scrubbed env otherwise forces the embedded rg — M0-G06) —
 // and asserts that `cliGlobSplit` (Glob) and `interpretToolPath` (Grep)
 // compute the same search path (rg's LAST positional argument, the tree it
 // walks), the same `--glob`, and that rg's cwd is the session cwd. It also
@@ -256,19 +258,24 @@ async function run(root: string, calls: ToolUse[]): Promise<{ records: RgRecord[
   scenario = calls;
   fs.rmSync(shimLog, { force: true });
   const decisions: Decision[] = [];
-  await executeBoardMissionViaSdk({
-    boardId: 'coding',
-    systemPrompt: `${MAIN_MARK} You are the Coding Board Captain.`,
-    model: 'claude-sonnet-4-6' as never,
-    missionBrief: 'do the thing',
-    charter,
-    worktreePath: root,
-    maxTurns: calls.length + 3,
-    enforcement: {
-      onDecision: (e) =>
-        decisions.push({ via: e.via, tool: e.toolName, allow: e.decision.allow, ...(e.decision.allow ? {} : { code: e.decision.code }) }),
+  await executeBoardMissionViaSdk(
+    {
+      boardId: 'coding',
+      systemPrompt: `${MAIN_MARK} You are the Coding Board Captain.`,
+      model: 'claude-sonnet-4-6' as never,
+      missionBrief: 'do the thing',
+      charter,
+      worktreePath: root,
+      maxTurns: calls.length + 3,
+      enforcement: {
+        onDecision: (e) =>
+          decisions.push({ via: e.via, tool: e.toolName, allow: e.decision.allow, ...(e.decision.allow ? {} : { code: e.decision.code }) }),
+      },
     },
-  });
+    // The executor env forces the embedded rg (M0-G06); this capture harness
+    // deliberately re-selects the logging shim through the test-only seam.
+    { executorEnvOverrides: { USE_BUILTIN_RIPGREP: '0', SKIPPY_RG_SHIM_LOG: shimLog } },
+  );
   const raw = fs.existsSync(shimLog) ? fs.readFileSync(shimLog, 'utf8') : '';
   const all = raw
     .split('\n')

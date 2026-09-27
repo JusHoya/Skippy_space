@@ -23,7 +23,7 @@ import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
-import { executeBoardMissionViaSdk } from './sdk-board.js';
+import { executeBoardMissionViaSdk, type ExecuteBoardMissionDeps } from './sdk-board.js';
 
 const LIVE = process.env.SKIPPY_LIVE_CLI_MOCK === '1';
 const skip = LIVE ? false : 'set SKIPPY_LIVE_CLI_MOCK=1 to run against the bundled CLI';
@@ -326,6 +326,13 @@ function mission(): Parameters<typeof executeBoardMissionViaSdk>[0] {
   };
 }
 
+/** The executor's env is an allowlist (M0-G06), so the CLI retry budget this
+ * suite depends on is injected through the test-only seam, read at call time
+ * (the M0-G01 controls raise it temporarily). */
+function liveDeps(): ExecuteBoardMissionDeps {
+  return { executorEnvOverrides: { CLAUDE_CODE_MAX_RETRIES: process.env.CLAUDE_CODE_MAX_RETRIES ?? '0' } };
+}
+
 test('live CLI (N1): task agent denied Read-outside-roots + Bash, parent reports success → blocked(policy_refused)', { skip, timeout: 120_000 }, async () => {
   const outside = path.join(path.parse(tmp).root, 'Windows', 'win.ini');
   scenario = {
@@ -336,10 +343,13 @@ test('live CLI (N1): task agent denied Read-outside-roots + Bash, parent reports
     ],
   };
   const decisions: Array<{ tool: string; allow: boolean }> = [];
-  const r = await executeBoardMissionViaSdk({
-    ...mission(),
-    enforcement: { onDecision: (e) => decisions.push({ tool: e.toolName, allow: e.decision.allow }) },
-  });
+  const r = await executeBoardMissionViaSdk(
+    {
+      ...mission(),
+      enforcement: { onDecision: (e) => decisions.push({ tool: e.toolName, allow: e.decision.allow }) },
+    },
+    liveDeps(),
+  );
   assert.ok(decisions.some((d) => !d.allow), `the gate denied nothing: ${JSON.stringify(decisions)}`);
   assert.equal(r.status, 'blocked', JSON.stringify(r));
   assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
@@ -348,7 +358,7 @@ test('live CLI (N1): task agent denied Read-outside-roots + Bash, parent reports
 
 test('live CLI (control): an allowed in-worktree Read with no denials → succeeded', { skip, timeout: 120_000 }, async () => {
   scenario = { mainTools: [{ name: 'Read', input: { file_path: path.join(tmp, 'work', 'inside.txt') } }], subTools: [] };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'succeeded', JSON.stringify(r));
 });
 
@@ -365,7 +375,7 @@ test('live CLI (D1 sub401): task agent gets 401 → failed(provider_error), not 
     subTools: [],
     subFailure: { http: 401, body: { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } } },
   };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
   assert.match(r.status === 'failed' ? `${r.reason.message} ${r.reason.detail ?? ''}` : '', /task agent/);
@@ -378,21 +388,21 @@ test('live CLI (D1 sub400): task agent gets 400 → failed(provider_error)', { s
     subTools: [],
     subFailure: { http: 400, body: { type: 'error', error: { type: 'invalid_request_error', message: 'mock error' } } },
   };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
 });
 
 test('live CLI (D1 subrefusal): task agent refused (stop_reason refusal) → failed(model_refused)', { skip, timeout: 120_000 }, async () => {
   scenario = { mainTools: [spawnTaskAgent], subTools: [], subFailure: { refusal: true } };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'model_refused');
 });
 
 test('live CLI (D1 control): a task agent that finishes normally → succeeded', { skip, timeout: 120_000 }, async () => {
   scenario = { mainTools: [spawnTaskAgent], subTools: [] };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'succeeded', JSON.stringify(r));
 });
 
@@ -406,7 +416,7 @@ test('live CLI (D2 unknowntool): main-thread WebSearch + NotebookEdit withheld b
     ],
     subTools: [],
   };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'blocked', JSON.stringify(r));
   assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
   assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /WebSearch/);
@@ -417,7 +427,7 @@ test('live CLI (D2 unknowntool): main-thread WebSearch + NotebookEdit withheld b
 
 test('live CLI (OQ-20 maintruncend): main stream ends without message_delta/message_stop → failed(provider_error), not succeeded', { skip, timeout: 120_000 }, async () => {
   scenario = { mainTools: [], subTools: [], mainTruncEnd: true };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
   assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', /without a stop reason \(truncated\)/);
@@ -426,7 +436,7 @@ test('live CLI (OQ-20 maintruncend): main stream ends without message_delta/mess
 
 test('live CLI (OQ-20 maintooltrunc): truncated final turn after a tool turn (stale result stop_reason) → failed(provider_error)', { skip, timeout: 120_000 }, async () => {
   scenario = { mainTools: [{ name: 'Read', input: { file_path: path.join(tmp, 'work', 'inside.txt') } }], subTools: [], mainTruncEnd: true };
-  const r = await executeBoardMissionViaSdk(mission());
+  const r = await executeBoardMissionViaSdk(mission(), liveDeps());
   assert.equal(r.status, 'failed', JSON.stringify(r));
   assert.equal(r.status === 'failed' && r.reason.code, 'provider_error');
 });
@@ -446,7 +456,7 @@ async function scriptedRun(script: NonNullable<Scenario['script']>): Promise<Awa
   scenario = { mainTools: [], subTools: [], script };
   scriptAttempts.clear();
   nonStreamedRequests = 0;
-  return executeBoardMissionViaSdk(mission());
+  return executeBoardMissionViaSdk(mission(), liveDeps());
 }
 
 test('live CLI (OQ-20 t_pairSlowSub): turn truncated while a background task runs (no result before the wake-up) → failed(provider_error)', { skip, timeout: 120_000 }, async () => {

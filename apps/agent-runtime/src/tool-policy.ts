@@ -64,7 +64,13 @@
 //      pre-execution gate; a PostToolUse `updatedToolOutput` in the tool's
 //      own output shape replaces what the model sees (the CLI validates it
 //      with the tool's `outputSchema` and falls back to the original on
-//      mismatch).
+//      mismatch). The gates FAIL CLOSED (M0-G07): the CLI turns a hook that
+//      throws into `{}` (no objection), so any unexpected error inside a gate
+//      is an explicit deny / withheld output, and the `onDecision` audit
+//      observer is invoked guarded — its failure never changes a decision.
+//      The executor's process environment is an allowlist (executor-env.ts,
+//      M0-G06, OQ-22) so ambient variables cannot swap the rg the OQ-18
+//      tree gate models.
 //   4. `assertExecutorEligible` refuses an adapter whose declared capabilities
 //      cannot enforce the policy.
 //   5. The in-process MCP tools dispatch through `authorizeMcpDispatch` (see
@@ -1852,6 +1858,22 @@ export function lineCredentialRejection(line: string, searchRoot: string, cliCwd
   return null;
 }
 
+/** An empty Grep/Glob result in the tool's own output shape (so the CLI's
+ * `outputSchema` check accepts it as the replacement). */
+function withheldSearchReplacement(tool: 'Grep' | 'Glob', mode?: unknown): Record<string, unknown> {
+  if (tool === 'Glob') return { durationMs: 0, numFiles: 0, filenames: [], truncated: false };
+  const m = typeof mode === 'string' ? mode : 'files_with_matches';
+  const replacement: Record<string, unknown> = { mode: m, numFiles: 0, filenames: [] };
+  if (m === 'content') {
+    replacement['content'] = SEARCH_REDACTION_NOTICE;
+    replacement['numLines'] = 1;
+  } else if (m === 'count') {
+    replacement['content'] = '';
+    replacement['numMatches'] = 0;
+  }
+  return replacement;
+}
+
 /**
  * Judge a Grep/Glob result. Returns the replacement output (same shape) and
  * the reason when the result names a credential path or cannot be judged,
@@ -1873,20 +1895,10 @@ export function redactSearchOutput(
     // The tree the CLI actually handed rg (see `cliGlobSplit`).
     searchRoot = path.resolve(policy.cwd, cliGlobSplit(input['pattern'], pathArg, policy.cwd).baseDir);
   }
-  const withhold =(reason: string, mode?: unknown): { replacement: Record<string, unknown>; reason: string } => {
-    const full = `${canonical} output withheld (search root ${searchRoot}): ${reason}`;
-    if (canonical === 'Glob') return { replacement: { durationMs: 0, numFiles: 0, filenames: [], truncated: false }, reason: full };
-    const m = typeof mode === 'string' ? mode : 'files_with_matches';
-    const replacement: Record<string, unknown> = { mode: m, numFiles: 0, filenames: [] };
-    if (m === 'content') {
-      replacement['content'] = SEARCH_REDACTION_NOTICE;
-      replacement['numLines'] = 1;
-    } else if (m === 'count') {
-      replacement['content'] = '';
-      replacement['numMatches'] = 0;
-    }
-    return { replacement, reason: full };
-  };
+  const withhold = (reason: string, mode?: unknown): { replacement: Record<string, unknown>; reason: string } => ({
+    replacement: withheldSearchReplacement(canonical, mode),
+    reason: `${canonical} output withheld (search root ${searchRoot}): ${reason}`,
+  });
   // Anything but the documented object shape (or a plain string, which the
   // CLI uses for tool errors) cannot be judged: withheld.
   let res: Record<string, unknown>;
@@ -1932,7 +1944,30 @@ export function redactSearchOutput(
 }
 
 export interface SdkEnforcementHooks extends EnforcementHooks {
+  /** Audit observer. It observes, never decides: a throw (or a rejected
+   * promise) is swallowed and cannot change the decision (M0-G07). */
   onDecision?: (e: PolicyAuditEvent) => void;
+}
+
+/** Invoke the audit observer; its failure never changes a decision. */
+function notifyDecision(hooks: SdkEnforcementHooks, e: PolicyAuditEvent): void {
+  try {
+    const r: unknown = (hooks.onDecision as ((e: PolicyAuditEvent) => unknown) | undefined)?.(e);
+    if (r && typeof (r as { then?: unknown }).then === 'function') {
+      (r as Promise<unknown>).then(undefined, () => undefined);
+    }
+  } catch {
+    /* an observer error is not a policy input */
+  }
+}
+
+/** `String(err)` that cannot itself throw. */
+function describeError(err: unknown): string {
+  try {
+    return String(err);
+  } catch {
+    return '(unprintable error)';
+  }
 }
 
 /** Canonical (sorted-key) JSON of a value; throws on cycles/BigInt. */
@@ -1984,44 +2019,72 @@ export function buildClaudeSdkPermissionOptions(
     try {
       return await evaluateToolCall(policy, call, hooks);
     } catch (err) {
-      return deny('invalid_arguments', `policy evaluation failed: ${String(err)}`);
+      return deny('invalid_arguments', `policy evaluation failed: ${describeError(err)}`);
     }
   };
 
+  // FAIL CLOSED (M0-G07): the CLI turns a hook that throws into `{}` — a
+  // pass-through, and for the auto-approved read tools `canUseTool` is never
+  // consulted — so no exception may escape a gate. Every observer call goes
+  // through `notifyDecision` (its failure cannot change the decision), and
+  // any unexpected error inside a gate is an explicit deny / withheld output.
+  const preToolUseDeny = (decision: PolicyDecision & { allow: false }) => ({
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse' as const,
+      permissionDecision: 'deny' as const,
+      permissionDecisionReason: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
+    },
+  });
+
   const preToolUse: HookCallback = async (hookInput, toolUseID) => {
-    if (hookInput.hook_event_name !== 'PreToolUse') return {};
-    const input =
-      hookInput.tool_input && typeof hookInput.tool_input === 'object'
-        ? (hookInput.tool_input as Record<string, unknown>)
-        : {};
-    const decision = await safeEvaluate({
-      toolName: hookInput.tool_name,
-      input,
-      subagentId: hookInput.agent_id,
-    });
-    remember(
-      hookInput.tool_use_id ?? toolUseID,
-      callFingerprint(hookInput.tool_name, input, hookInput.agent_id),
-      decision,
-    );
-    hooks.onDecision?.({ agentId: policy.agentId, toolName: hookInput.tool_name, decision, via: 'PreToolUse' });
-    if (decision.allow) return {}; // defer to the normal permission flow (canUseTool)
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
-      },
-    };
+    try {
+      if (hookInput.hook_event_name !== 'PreToolUse') return {};
+      const input =
+        hookInput.tool_input && typeof hookInput.tool_input === 'object'
+          ? (hookInput.tool_input as Record<string, unknown>)
+          : {};
+      const decision = await safeEvaluate({
+        toolName: hookInput.tool_name,
+        input,
+        subagentId: hookInput.agent_id,
+      });
+      remember(
+        hookInput.tool_use_id ?? toolUseID,
+        callFingerprint(hookInput.tool_name, input, hookInput.agent_id),
+        decision,
+      );
+      notifyDecision(hooks, { agentId: policy.agentId, toolName: hookInput.tool_name, decision, via: 'PreToolUse' });
+      if (decision.allow) return {}; // defer to the normal permission flow (canUseTool)
+      return preToolUseDeny(decision);
+    } catch (err) {
+      return preToolUseDeny({ allow: false, code: 'invalid_arguments', reason: `policy gate failed: ${describeError(err)}` });
+    }
   };
 
   const postToolUse: HookCallback = async (hookInput) => {
-    if (hookInput.hook_event_name !== 'PostToolUse') return {};
-    const verdict = redactSearchOutput(policy, hookInput.tool_name, hookInput.tool_input, hookInput.tool_response);
+    const raw = hookInput as unknown as Record<string, unknown> | null | undefined;
+    const rawToolName = typeof raw?.['tool_name'] === 'string' ? raw['tool_name'] : '(unknown)';
+    let verdict: { replacement: Record<string, unknown>; reason: string } | null;
+    try {
+      if (hookInput.hook_event_name !== 'PostToolUse') return {};
+      verdict = redactSearchOutput(policy, hookInput.tool_name, hookInput.tool_input, hookInput.tool_response);
+    } catch (err) {
+      // An output that could not be judged is withheld, never passed through.
+      let tool: 'Grep' | 'Glob' = 'Grep';
+      let mode: unknown;
+      try {
+        if (canonicalTool(rawToolName) === 'Glob') tool = 'Glob';
+        const res = raw?.['tool_response'];
+        if (res && typeof res === 'object') mode = (res as Record<string, unknown>)['mode'];
+      } catch {
+        /* keep the Grep default */
+      }
+      verdict = { replacement: withheldSearchReplacement(tool, mode), reason: `output could not be judged: ${describeError(err)}` };
+    }
     if (!verdict) return {};
-    hooks.onDecision?.({
+    notifyDecision(hooks, {
       agentId: policy.agentId,
-      toolName: hookInput.tool_name,
+      toolName: rawToolName,
       decision: deny('credential_path', verdict.reason, 'read'),
       via: 'PostToolUse',
     });
@@ -2035,21 +2098,30 @@ export function buildClaudeSdkPermissionOptions(
   };
 
   const canUseTool: CanUseTool = async (toolName, input, options): Promise<PermissionResult> => {
-    const cached = decided.get(options.toolUseID);
-    decided.delete(options.toolUseID);
-    let decision =
-      cached && cached.fingerprint === callFingerprint(toolName, input, options.agentID) ? cached.decision : undefined;
-    if (!decision) {
-      decision = await safeEvaluate({ toolName, input, subagentId: options.agentID });
-      hooks.onDecision?.({ agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
+    try {
+      const cached = decided.get(options.toolUseID);
+      decided.delete(options.toolUseID);
+      let decision =
+        cached && cached.fingerprint === callFingerprint(toolName, input, options.agentID) ? cached.decision : undefined;
+      if (!decision) {
+        decision = await safeEvaluate({ toolName, input, subagentId: options.agentID });
+        notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
+      }
+      return decision.allow
+        ? { behavior: 'allow', updatedInput: input, toolUseID: options.toolUseID }
+        : {
+            behavior: 'deny',
+            message: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
+            toolUseID: options.toolUseID,
+          };
+    } catch (err) {
+      const toolUseID = (options as { toolUseID?: unknown } | undefined)?.toolUseID;
+      return {
+        behavior: 'deny',
+        message: `Denied by Skippy tool policy (invalid_arguments): policy gate failed: ${describeError(err)}`,
+        ...(typeof toolUseID === 'string' ? { toolUseID } : {}),
+      };
     }
-    return decision.allow
-      ? { behavior: 'allow', updatedInput: input, toolUseID: options.toolUseID }
-      : {
-          behavior: 'deny',
-          message: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
-          toolUseID: options.toolUseID,
-        };
   };
 
   const builtins = policy.allowedTools.filter((t) => builtinClass(t) !== undefined);
@@ -2104,7 +2176,12 @@ export async function authorizeMcpDispatch(
   hooks: SdkEnforcementHooks = {},
 ): Promise<PolicyDecision> {
   const toolName = mcpToolName(server, tool);
-  const decision = await evaluateToolCall(policy, { toolName, input: args }, hooks);
-  hooks.onDecision?.({ agentId: policy.agentId, toolName, decision, via: 'mcp-broker' });
+  let decision: PolicyDecision;
+  try {
+    decision = await evaluateToolCall(policy, { toolName, input: args }, hooks);
+  } catch (err) {
+    decision = deny('invalid_arguments', `policy evaluation failed: ${describeError(err)}`);
+  }
+  notifyDecision(hooks, { agentId: policy.agentId, toolName, decision, via: 'mcp-broker' });
   return decision;
 }
