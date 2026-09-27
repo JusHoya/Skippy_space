@@ -59,7 +59,9 @@ typescript-eslint's recommended config deliberately disables core rules that `ts
 - Earlier runs failed at `pnpm/action-setup@v4` with "Multiple versions of pnpm specified" because the step set `version: 9` while `package.json` declares `packageManager: pnpm@9.15.0`. `gh run list` showed no successful run. The old ubuntu `rust` job had also failed, at `cargo test` with exit 101 (run 28278478351; its log has since expired). The explicit version is removed; the action now reads `packageManager`.
 - `ts` job (ubuntu-latest): install → typecheck → lint → `pnpm -r test` → `test:scripts` → `build:runtime` → UI build.
 - `windows` job (windows-latest): install → typecheck → lint → `pnpm -r test` → `test:scripts` → `build:runtime` → UI build → Rust toolchain + cache → `cargo check` → `cargo test`.
-- Triggers: `push` to `main` and `pull_request`. The workflow does not run for a push to `m0/foundation` alone; it runs when a PR is opened.
+- Triggers: `push` to `main` and to `m0/foundation` (the pivot trunk), and `pull_request`.
+- **First green run:** commit `3f70549`, 2026-09-27. Both the push run (36331998837) and the PR #1 run (36332001896) passed on both jobs: ubuntu-latest `ts` and windows-latest `windows`, Node 22. That run covered install, typecheck, lint, `pnpm -r test`, `test:scripts`, the runtime and UI builds, and `cargo check`/`cargo test` (81 passed). The Windows runner has symlink privilege, so the real-symlink tests that skip locally ran there.
+- Getting there needed test-portability fixes: the runner's temp dir is an 8.3 short path (`RUNNER~1`), and some fixtures assumed Windows path semantics. No product behavior changed.
 - Everything in CI is offline and mocked (Letta disabled, Obsidian unbound, no OTel exporter, no provider credentials). Live provider tests are opt-in and never part of CI.
 - YAML parsed with `js-yaml`.
 
@@ -67,9 +69,8 @@ typescript-eslint's recommended config deliberately disables core rules that `ts
 
 The following were **not** run. No claim is made beyond what is stated.
 
-- **GitHub CI for this branch**: not executed. The fixed workflow will first run when a PR is opened.
-- **Linux execution**: the `ts` job targets ubuntu-latest; no Linux run has happened locally or on GitHub. All results above are Windows 11 only.
-- **Node 22**: CI pins Node 22; every result above was measured on Node 24.18.0 only.
+- **Local measurements are Windows 11 / Node 24.18.0 only.** Linux and Node 22 are covered by CI (see above), not by the local table.
+- **Rust on Linux**: CI runs `cargo check`/`cargo test` only in the Windows job.
 - **Lint coverage outside `src/`**: `pnpm lint` runs `eslint src` per package, so `scripts/*.mjs` (including the Node autocommit engine) and `tests/visual` are neither linted nor typechecked.
 - **Playwright visual tests (`pnpm test:visual`)**: the last attempt failed 4/4 because the local browser cache was stale (`chromium_headless_shell-1223` missing). `pnpm exec playwright install` was not run (network download, out of scope).
 - **Native PTY/sidecar/IPC/Channels tests**: need a running Tauri app. `cargo test` covers Rust unit tests only (git_autocommit, envelope, claude_spawn). Native desktop-boundary tests belong to T07/T17 (FR-OPS-03).

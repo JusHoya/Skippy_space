@@ -15,7 +15,7 @@ Baseline results and unrun checks: [M0-BASELINE.md](M0-BASELINE.md). Defaults in
 | EC3 | Vault write containment (A03, FR-SEC-02, FR-WIKI-02) | Partial | Single broker. Windows path, junction and real-ancestor checks, rechecked at write time. Hash CAS. Identity and byte-exact preservation. Append-only and reserved paths. Provenance capability. The Unicode skeleton covers all 973 NTFS aliases in the BMP. | G09–G11 |
 | EC4 | Original retention (A04, FR-WIKI-03) | Met | Originals by hash. Declared encodings. Unsupported files kept with authenticated error sidecars. Crash-safe resume. Dedup. Every drop ingested or reported. | none |
 | EC5 | Autocommit isolation (A05, FR-WIKI-06) | Not met | Isolated temp index. User-staged work preserved. Non-ASCII paths, literal pathspecs, gitlinks, sparse checkout. Filtered paths and LFS pointers refused. 67-case parity between the Node and Rust engines. Aba stress runs show 0 leaks. | G12–G18 |
-| EC6 | Baseline and CI (T00, FR-OPS-03) | Met, against the T00 exit evidence | Explicit lint scripts, glob test runners, a Windows Rust/build CI job, and a fixed pnpm setup. CI for this branch has not run (it only triggers on a PR). | G20 |
+| EC6 | Baseline and CI (T00, FR-OPS-03) | Met, against the T00 exit evidence | Explicit lint scripts, glob test runners, a Windows Rust/build CI job, and a fixed pnpm setup. First green CI run on both jobs at `3f70549` (see baseline). | none |
 | EC7 | Unrun checks recorded | Met | [M0-BASELINE.md](M0-BASELINE.md), verified against observed runs. | none |
 
 ## Open issues (tracked; carry into M1/M2)
@@ -43,7 +43,7 @@ Severity reflects the final adversarial verification. "Default config" means the
 | M0-G17 | Medium-low | EC5 | A marker dropped after a branch switch leaves a staged revert (same commit, different ref). | On a ref mismatch with `HEAD == new`, sync rather than drop. |
 | M0-G18 | Low | EC5 | A literal-pathspec reset can wipe a staged child entry when a directory became a file. Not re-verified after the round-5 rewrite. | Re-verify, then scope the reset to exact entries. |
 | M0-G19 | Low | Cost | Task agents ignore the board's `maxTurns` (60 sub-turns seen against `maxTurns: 6`). | Enforce per-agent turn and budget caps (FR-COST, T12). |
-| M0-G20 | Info | EC6 | CI has never run green (26 historical runs failed). The fixed workflow will first run when a PR is opened. | Open a PR from `m0/foundation`. |
+| M0-G20 | Resolved | EC6 | CI had never run green (26 historical runs failed). Resolved 2026-09-27: first green run at `3f70549` on ubuntu and windows, after test-portability fixes. | none |
 
 Deferred by the PRD, not counted: OQ-13 validation disposition, OQ-14 approval channel, OQ-17 (secrets in ordinarily named files, hardlinks), no `cancelled` producer yet, the process-exit shutdown race and hung-provider timeout (T07), and the proper Claude CLI adapter (T10).
 
@@ -61,7 +61,7 @@ Deferred by the PRD, not counted: OQ-13 validation disposition, OQ-14 approval c
    - User-staged vault notes are not autocommitted.
    - Filtered and LFS vault paths are never autocommitted.
    - The Unicode skeleton over-refuses some names (OQ-21).
-4. Push `m0/foundation` and open a PR so CI runs (M0-G20).
+4. `m0/foundation` is the pivot trunk and stays off `main` until the owner confirms it. Draft PR #1 (`m0/foundation` → `main`) exists only to run CI and must not be merged yet. M1+ branches target `m0/foundation`.
 
 ## Routing ledger (summary)
 
