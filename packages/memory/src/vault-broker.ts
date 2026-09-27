@@ -6,14 +6,28 @@
 // us), the memory jobs (distill/link/lint), ingest's source note, the
 // daily-note generator and the Letta archival mirror.
 //
-// Remaining writers into the vault tree that do NOT go through the broker:
+// Remaining writers into the vault tree that do NOT go through the broker
+// (the "exempt-writer list"; each one still proves real containment):
 //   - ingest's content-addressed originals store and its `.note.json` commit
 //     markers under `60_Sources/originals/` (ingest/originals.ts), and the
-//     `*.ingest-error.json` sidecars next to inbox drops (ingest/errors.ts):
-//     binary/JSON payloads, not notes, written with write-file-atomic;
+//     `*.ingest-error.json` sidecars inside the real `00_Inbox/`
+//     (ingest/errors.ts): binary/JSON payloads, not notes. Written with
+//     `atomicWriteContained` (safe-write.ts) after `resolveContained`.
+//   - ingest's removal of a fully preserved inbox drop (jobs/ingest.ts), only
+//     for single-link regular files whose real path is inside the real
+//     `00_Inbox/` with no reparse point in between (ingest/containment.ts).
+//   - the per-session replay stream `.skippy/replays/<ulid>.jsonl`
+//     (apps/agent-runtime/src/replay-writer.ts): an append-only JSONL log, not
+//     a note, so it has no §8.3 frontmatter and needs a long-lived O_APPEND fd
+//     the broker's per-call lock/replace model cannot provide. It is resolved
+//     with `resolveContained` allowing ONLY the `.skippy` hidden segment (never
+//     `.git`/`.obsidian`, also on the real path), its directories are created
+//     with `ensureContainedParentDir`, and the file is created with O_EXCL and
+//     must be a single-link regular file; if containment fails the replay
+//     writer disables itself with a logged error instead of writing elsewhere.
 //   - `realVaultRoot` creating the configured vault root directory itself;
-//   - the legacy absolute-path writers in atomic.ts (no production callers;
-//     kept for atomic.test.ts);
+//   - the legacy absolute-path writers in atomic.ts (no production callers, no
+//     longer exported from the package index; kept for atomic.test.ts);
 //   - git autocommit (scripts/git-autocommit.mjs, shell git_autocommit.rs)
 //     writes only repository metadata, never note content;
 //   - humans and the Obsidian app itself (external; detected via the hash
@@ -31,9 +45,19 @@
 //     content and hash so the caller can rebase -> apply the mutator's patch ->
 //     preserve `id`, `created_at`, unknown frontmatter keys and the body unless
 //     the patch replaces it -> stamp `updated_at` -> recheck containment and
-//     re-hash immediately before the atomic replace (write-file-atomic).
+//     re-hash immediately before the atomic replace (`atomicWriteContained`,
+//     safe-write.ts: random O_EXCL temp file, fsync, rename, single-link check;
+//     write-file-atomic's predictable temp name followed planted hardlinks, N3).
 //     `agent_log` and `daily` notes are append-only; updating them, or changing
 //     a note's type to or from those types, throws `AppendOnlyViolationError`.
+//
+//   Reserved append-only paths (N4): every `.md` under `40_Daily/` is reserved
+//   for `daily` notes and `50_Agents/<board>/agent_log.md` for `agent_log`
+//   notes (the paths daily.ts and jobs/archival-mirror.ts write). createNote
+//   refuses any other type there, updateNote/patchFrontmatter refuse those
+//   paths outright, and appendNote's `init` must carry the reserved type. The
+//   check runs on the lexical path and again on the REAL path under the lock,
+//   so case and junction aliases cannot squat a reserved path either.
 //     YAML is parsed without the timestamp type, so unknown dates keep their
 //     type and spelling, and only the frontmatter lines of changed keys are
 //     rewritten (comments and untouched values survive). Known limitation: when
@@ -68,7 +92,7 @@
 //
 // Residual TOCTOU: containment is proven, then re-proven under the lock just
 // before the write. A local process that can swap a directory for a junction in
-// the microseconds between that recheck and write-file-atomic's rename could
+// the microseconds between that recheck and the atomic writer's rename could
 // still redirect it. Closing that fully needs handle-relative (openat-style)
 // I/O, which Node does not expose on Windows. Obsidian does not honor our lock,
 // so an external edit landing between the final re-hash and the rename is not
@@ -78,7 +102,6 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
-import writeFileAtomic from 'write-file-atomic';
 import { lock } from 'proper-lockfile';
 
 import { assertNoRelativeMdLinks } from './atomic.js';
@@ -89,6 +112,7 @@ import {
   validateFrontmatter,
   type NoteFrontmatterInput,
 } from './frontmatter.js';
+import { TargetExistsError, atomicWriteContained } from './safe-write.js';
 import {
   VaultPathError,
   ensureContainedParentDir,
@@ -103,6 +127,45 @@ export const APPEND_ONLY_TYPES: readonly string[] = ['agent_log', 'daily'];
 
 export function isAppendOnlyType(type: unknown): boolean {
   return typeof type === 'string' && APPEND_ONLY_TYPES.includes(type);
+}
+
+/**
+ * The append-only type a vault-relative path is reserved for, or null (N4).
+ * Any `.md` under `40_Daily/` -> `daily` (daily.ts writes `40_Daily/YYYY-MM-DD.md`;
+ * the folder's `_template.md` is itself `type: daily`), and
+ * `50_Agents/<board>/agent_log.md` -> `agent_log` (jobs/archival-mirror.ts).
+ * Case-insensitive, since NTFS is.
+ */
+export function reservedAppendOnlyType(relPath: string): 'daily' | 'agent_log' | null {
+  const segs = relPath.split(/[\\/]+/).filter((x) => x !== '' && x !== '.');
+  if (segs.length === 0) return null;
+  const first = segs[0]!.toLowerCase();
+  const last = segs[segs.length - 1]!.toLowerCase();
+  if (first === '40_daily' && segs.length >= 2 && last.endsWith('.md')) return 'daily';
+  if (first === '50_agents' && segs.length === 3 && last === 'agent_log.md') return 'agent_log';
+  return null;
+}
+
+/** Throw unless a note of `type` may be created at `checkedRel` (lexical or real). */
+function assertReservedCreate(notePath: string, checkedRel: string, type: unknown): void {
+  const reserved = reservedAppendOnlyType(checkedRel);
+  if (reserved !== null && type !== reserved) {
+    throw new AppendOnlyViolationError(
+      notePath,
+      `"${checkedRel}" is reserved for append-only "${reserved}" notes (got type "${String(type ?? 'none')}")`,
+    );
+  }
+}
+
+/** Throw if `checkedRel` is a reserved append-only path (general edits never apply there). */
+function assertNotReservedForEdit(notePath: string, checkedRel: string): void {
+  const reserved = reservedAppendOnlyType(checkedRel);
+  if (reserved !== null) {
+    throw new AppendOnlyViolationError(
+      notePath,
+      `"${checkedRel}" is reserved for append-only "${reserved}" notes; use appendNote`,
+    );
+  }
 }
 
 /** Frontmatter keys that define a note's identity and may never change. */
@@ -340,7 +403,7 @@ export class VaultBroker {
    */
   private async withLock<T>(
     cp: ContainedPath,
-    fn: (target: string, assertLockHeld: () => void) => Promise<T>,
+    fn: (target: string, assertLockHeld: () => void, realRel: string) => Promise<T>,
   ): Promise<T | { lockedOut: true }> {
     const realParent = await ensureContainedParentDir(cp);
     // Re-prove containment now that any missing directories exist.
@@ -370,8 +433,11 @@ export class VaultBroker {
     const assertLockHeld = () => {
       if (compromised !== null) throw new VaultLockCompromisedError(cp.rel, compromised);
     };
+    // The REAL vault-relative path (on-disk case, junctions resolved), for the
+    // reserved append-only path check (N4).
+    const realRel = path.relative(cp.realRoot, target).split(path.sep).join('/');
     try {
-      return await fn(target, assertLockHeld);
+      return await fn(target, assertLockHeld, realRel);
     } finally {
       await release().catch(() => {
         /* a compromised lock may already be gone */
@@ -390,12 +456,14 @@ export class VaultBroker {
     body: string,
   ): Promise<BrokerResult> {
     const cp = await this.resolve(relPath);
+    assertReservedCreate(cp.rel, cp.rel, frontmatter['type']);
     assertNoRelativeMdLinks(body, cp.rel);
     const contents = serializeNote(frontmatter, body); // throws on invalid §8.3
     const absPath = this.reportPath(cp);
 
-    const out = await this.withLock(cp, async (target, assertLockHeld) => {
-      if (await recheckContained(cp, target)) {
+    const out = await this.withLock(cp, async (target, assertLockHeld, realRel) => {
+      assertReservedCreate(cp.rel, realRel, frontmatter['type']);
+      const existsResult = async () => {
         const current = await readRegularFile(target, cp.rel);
         return {
           ok: false as const,
@@ -404,9 +472,19 @@ export class VaultBroker {
           reason: 'exists' as const,
           currentHash: hashContent(current),
         };
+      };
+      if (await recheckContained(cp, target)) return existsResult();
+      try {
+        await atomicWriteContained(cp, contents, {
+          target,
+          exclusive: true,
+          beforeCommit: assertLockHeld,
+        });
+      } catch (err) {
+        // An external writer (Obsidian ignores our lock) created it meanwhile.
+        if (err instanceof TargetExistsError) return existsResult();
+        throw err;
       }
-      assertLockHeld();
-      await writeFileAtomic(target, contents);
       return {
         ok: true as const,
         path: cp.rel,
@@ -430,10 +508,12 @@ export class VaultBroker {
     mutate: NoteMutator,
   ): Promise<BrokerResult> {
     const cp = await this.resolve(relPath);
+    assertNotReservedForEdit(cp.rel, cp.rel);
     const absPath = this.reportPath(cp);
     if (!cp.exists) return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
 
-    const out = await this.withLock(cp, async (target, assertLockHeld): Promise<BrokerResult> => {
+    const out = await this.withLock(cp, async (target, assertLockHeld, realRel): Promise<BrokerResult> => {
+      assertNotReservedForEdit(cp.rel, realRel);
       if (!(await recheckContained(cp, target))) {
         return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
       }
@@ -493,6 +573,7 @@ export class VaultBroker {
 
       // Immediately before the replace: re-prove containment, make sure the lock
       // is still ours, and re-hash to catch an external writer that ignores it.
+      // (atomicWriteContained rechecks containment and the lock once more.)
       await recheckContained(cp, target);
       assertLockHeld();
       const latestBytes = await readRegularFile(target, cp.rel);
@@ -501,7 +582,7 @@ export class VaultBroker {
         const raw = latestBytes.toString('utf8');
         return { ok: false, path: cp.rel, absPath, reason: 'conflict', currentHash: latest, current: raw };
       }
-      await writeFileAtomic(target, contents);
+      await atomicWriteContained(cp, contents, { target, beforeCommit: assertLockHeld });
       return {
         ok: true,
         path: cp.rel,
@@ -554,17 +635,29 @@ export class VaultBroker {
           `appendNote init must be one of ${APPEND_ONLY_TYPES.join('/')}`,
         );
       }
+      assertReservedCreate(cp.rel, cp.rel, opts.init.frontmatter['type']);
       assertNoRelativeMdLinks(opts.init.body, cp.rel);
       initContents = serializeNote(opts.init.frontmatter, opts.init.body);
     }
 
-    const out = await this.withLock(cp, async (target, assertLockHeld): Promise<BrokerResult> => {
+    const out = await this.withLock(cp, async (target, assertLockHeld, realRel): Promise<BrokerResult> => {
+      const reserved = reservedAppendOnlyType(realRel);
       const exists = await recheckContained(cp, target);
       if (!exists) {
         if (initContents === null) return { ok: false, path: cp.rel, absPath, reason: 'not_found' };
+        assertReservedCreate(cp.rel, realRel, opts.init?.frontmatter['type']);
         const contents = initContents + chunk;
-        assertLockHeld();
-        await writeFileAtomic(target, contents);
+        try {
+          await atomicWriteContained(cp, contents, {
+            target,
+            exclusive: true,
+            beforeCommit: assertLockHeld,
+          });
+        } catch (err) {
+          // Created externally meanwhile: never clobber it; the caller retries.
+          if (err instanceof TargetExistsError) return { ok: false, path: cp.rel, absPath, reason: 'exists' };
+          throw err;
+        }
         return { ok: true, path: cp.rel, absPath, hash: hashContent(contents), created: true, changed: true };
       }
 
@@ -573,6 +666,12 @@ export class VaultBroker {
         throw new AppendOnlyViolationError(
           cp.rel,
           `appendNote is only for ${APPEND_ONLY_TYPES.join('/')} notes (found type "${String(snap.frontmatter['type'] ?? 'none')}")`,
+        );
+      }
+      if (reserved !== null && snap.frontmatter['type'] !== reserved) {
+        throw new AppendOnlyViolationError(
+          cp.rel,
+          `"${realRel}" is reserved for "${reserved}" notes (found type "${String(snap.frontmatter['type'])}")`,
         );
       }
       const valid = validateFrontmatter(snap.frontmatter);
@@ -594,7 +693,7 @@ export class VaultBroker {
       } finally {
         await handle.close();
       }
-      const after = await fs.readFile(target);
+      const after = await readRegularFile(target, cp.rel);
       return { ok: true, path: cp.rel, absPath, hash: hashContent(after), created: false, changed: true };
     });
     return 'lockedOut' in out ? this.locked(cp) : out;

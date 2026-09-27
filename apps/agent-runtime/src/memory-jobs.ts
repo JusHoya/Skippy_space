@@ -27,6 +27,7 @@ import {
   mockDistill,
   watchInbox,
   recordUnsupported,
+  recordIngestRejection,
   type DistillFn,
   type JobEvent,
   type InboxWatcher,
@@ -221,6 +222,26 @@ export function startMemoryJobs(): MemoryJobsHandle {
           phase: 'error',
           sourcePath: absPath,
           detail: `unsupported format "${ext}"; original left intact, see .ingest-error.json`,
+        });
+      })();
+    },
+    onRejected: (absPath, reason, detail) => {
+      // N6: an inbox entry ingest must not read (junction/symlink, hardlink,
+      // 8.3/reserved name, over the size cap, unreadable) gets an explicit
+      // sidecar (next to it, or under 00_Inbox/_ingest-errors/ when that is not
+      // safely writable) and a `memory_job` error event. The file is never
+      // read, modified or followed.
+      void (async () => {
+        try {
+          await recordIngestRejection(vaultRoot, absPath, reason, detail);
+        } catch (err) {
+          logger.warn({ msg: 'failed to record rejected-drop sidecar', err: String(err) });
+        }
+        emitJob({
+          job: 'ingest',
+          phase: 'error',
+          sourcePath: absPath,
+          detail: `rejected (${reason}); original left intact, see .ingest-error.json`,
         });
       })();
     },

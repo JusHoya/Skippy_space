@@ -13,8 +13,11 @@
 // MUST write through `VaultBroker` (vault-broker.ts), which layers containment,
 // compare-and-swap and append-only enforcement over the same write-file-atomic +
 // proper-lockfile primitives. No production code calls these legacy writers any
-// more (atomic.test.ts still covers them); the wikilink guard below is shared
-// with the broker.
+// more and the package index no longer exports them (atomic.test.ts still covers
+// them); the wikilink guard below is shared with the broker. Do not revive them:
+// write-file-atomic's temp name is predictable and opened with 'w', so a planted
+// hardlink redirects the write (M0 red-team round 2, N3). Vault writes use
+// `atomicWriteContained` (safe-write.ts).
 
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';

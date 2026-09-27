@@ -7,7 +7,9 @@
 // M0 WS-D: the in-house tmp+rename writer and O_EXCL lock sentinel are gone. The
 // note is created through the vault broker (`createNote`), which proves the path
 // is contained in the vault, holds a proper-lockfile lock across the existence
-// check and the write-file-atomic replace, and never overwrites an existing note.
+// check and the atomic replace, and never overwrites an existing note. The daily
+// path is reserved for `daily` notes (N4): the broker refuses other types there,
+// and a note squatting on it (written outside the broker) is an explicit error.
 // Later additions to a daily note go through `VaultBroker.appendNote`.
 
 import * as path from 'node:path';
@@ -108,21 +110,49 @@ ${boardList}
 }
 
 /**
+ * A non-daily note (or a note without valid daily frontmatter) is squatting on
+ * the reserved daily path (N4). Reported explicitly instead of `created:false`,
+ * because agents would otherwise append to nothing and the day's log is lost.
+ */
+export class DailyNoteSquattedError extends Error {
+  readonly code = 'VAULT_DAILY_SQUATTED';
+  constructor(
+    readonly notePath: string,
+    readonly foundType: unknown,
+  ) {
+    super(
+      `Daily note path "${notePath}" is occupied by a note of type "${String(foundType ?? 'none')}"; ` +
+        'daily paths are reserved for append-only `daily` notes. Move or rename that note.',
+    );
+    this.name = 'DailyNoteSquattedError';
+  }
+}
+
+/**
  * Generate the daily auto-note for `date` under `{vaultRoot}/40_Daily/`.
- * Idempotent: returns `{ created: false }` if the note already exists or another
- * writer holds its lock (it is creating the same note).
+ * Idempotent: returns `{ created: false }` if a valid `daily` note already
+ * exists or another writer holds its lock (it is creating the same note).
+ * Throws `DailyNoteSquattedError` if something other than a `daily` note sits
+ * at the path (N4), and propagates containment errors (e.g. a hardlinked note).
  */
 export async function generateDailyNote(
   opts: GenerateDailyNoteOptions,
 ): Promise<GenerateDailyNoteResult> {
   const finalPath = dailyNotePath(opts.vaultRoot, opts.date);
+  const rel = dailyNoteRelPath(opts.date);
   const broker = new VaultBroker(opts.vaultRoot);
   const res = await broker.createNote(
-    dailyNoteRelPath(opts.date),
+    rel,
     dailyFrontmatter(opts.date, ulid()),
     renderDailyBody(opts.date),
   );
   if (res.ok) return { path: finalPath, created: true };
-  // 'exists' or 'locked': someone already has (or is creating) today's note.
+  if (res.reason === 'exists') {
+    const existing = await broker.readNote(rel);
+    const type = existing?.frontmatter['type'];
+    if (type !== 'daily') throw new DailyNoteSquattedError(rel, type);
+  }
+  // 'exists' (a genuine daily note) or 'locked': someone already has (or is
+  // creating) today's note.
   return { path: finalPath, created: false };
 }

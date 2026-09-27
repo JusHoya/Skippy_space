@@ -80,6 +80,13 @@ export class VaultPathError extends Error {
 export interface VaultPathOptions {
   /** Allow `.`-prefixed segments such as `.obsidian`. Default false (G0 denied paths). */
   allowHidden?: boolean;
+  /**
+   * Allow ONLY these `.`-prefixed segment names (compared case-insensitively),
+   * e.g. `['.skippy']` for the replay writer. Narrower than `allowHidden`: the
+   * same list is applied to the REAL path, so a `.skippy` junction that
+   * resolves to `.git` is still rejected.
+   */
+  allowHiddenNames?: readonly string[];
   /** Require a `.md` final segment. Default false; the note broker sets true. */
   requireMarkdown?: boolean;
   /** Accept an existing target that is a directory (not just a regular file). Default false. */
@@ -104,6 +111,15 @@ const RESERVED_RE = /^(con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\
 const SHORT_NAME_RE = /~\d/;
 
 const IS_WIN = process.platform === 'win32';
+
+/** Whether a `.`-prefixed segment is permitted under `opts`. */
+function hiddenAllowed(seg: string, opts: VaultPathOptions): boolean {
+  if (opts.allowHidden) return true;
+  const names = opts.allowHiddenNames;
+  if (!names || names.length === 0) return false;
+  const key = seg.toLowerCase();
+  return names.some((n) => n.toLowerCase() === key);
+}
 
 /**
  * Lexically validate an untrusted vault-relative path and return its canonical
@@ -143,7 +159,7 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
     if (/[. ]$/.test(seg)) throw new VaultPathError('trailing_dot_space', input);
     if (RESERVED_RE.test(seg)) throw new VaultPathError('reserved_name', input);
     if (SHORT_NAME_RE.test(seg)) throw new VaultPathError('short_name', input);
-    if (!opts.allowHidden && seg.startsWith('.')) {
+    if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) {
       throw new VaultPathError('hidden_segment', input);
     }
   }
@@ -156,7 +172,7 @@ export function normalizeVaultRelPath(input: unknown, opts: VaultPathOptions = {
 }
 
 /** Case-normalize for comparison: NTFS is case-insensitive on win32. */
-function cmpKey(p: string): string {
+export function cmpKey(p: string): string {
   const resolved = path.resolve(p);
   return IS_WIN ? resolved.toLowerCase() : resolved;
 }
@@ -225,7 +241,7 @@ function assertRealSegments(
     if (RESERVED_RE.test(seg)) {
       throw new VaultPathError('reserved_name', input, `real path segment "${seg}"`);
     }
-    if (!opts.allowHidden && seg.startsWith('.')) {
+    if (seg.startsWith('.') && !hiddenAllowed(seg, opts)) {
       throw new VaultPathError('hidden_segment', input, `real path segment "${seg}"`);
     }
   }

@@ -14,8 +14,12 @@
 // Crash-safe, containment-safe ordering (each step is safe to re-run; a crash
 // at any point leaves at least one intact, contained copy of the content):
 //
-//   0. Prove `sourcePath` itself lies inside the real vault (E3-2) before
-//      reading it at all.
+//   0. Prove `sourcePath` is an ingestable inbox file before reading it at all
+//      (E3-2, N1, N6; ingest/containment.ts): lexically under `00_Inbox/`, real
+//      path inside the REAL `00_Inbox/` with no junction/symlink in any segment,
+//      no hidden/8.3/reserved segment, a single-link regular file of at most
+//      MAX_INGEST_BYTES. Anything else is rejected with a sidecar (inside the
+//      inbox) and never read, modified or deleted.
 //   1. Read the raw bytes of the drop and hash them (sha256). The hash is
 //      computed once, over the exact original bytes, and used for every
 //      sidecar/store/marker path below (E4-8: no more re-deriving a possibly
@@ -32,8 +36,12 @@
 //   5. Acquire an exclusive per-content-hash lock (E4-3) so two concurrent
 //      drops of identical bytes serialize rather than race into duplicate
 //      notes. Everything from here to the `finally` release is inside it.
-//   6. Dedup / resume-after-full-completion short circuit: if a completion
-//      MARKER already exists for this hash and its note still exists, verify
+//   6. Dedup / resume-after-full-completion short circuit: if a VALID
+//      completion MARKER exists for this hash (N7: its hash matches its file
+//      name, its ext is a declared extractor, and its `sourceNotePath` is a
+//      contained `60_Sources/` note, read via the broker, recording this
+//      `source_sha256` and the marker's id; an invalid marker is ignored and
+//      rewritten by the normal path) and its note still exists, verify
 //      the STORED original itself still exists and hashes correctly (E4-1) —
 //      repairing it from the (already-verified) inbox bytes if not — then
 //      safely remove the inbox copy (E4-4/E3-2) and return.
@@ -59,18 +67,27 @@
 // `extractor_*`/`source_encoding`/`source_bom_stripped` passthrough fields
 // (PRD §8.3 schema is `.passthrough()`).
 
+import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { ulid } from 'ulid';
 import { lock } from 'proper-lockfile';
 
-import { makeFrontmatter, parseNote, validateFrontmatter } from '../frontmatter.js';
+import { makeFrontmatter } from '../frontmatter.js';
 import { VaultBroker } from '../vault-broker.js';
 import { assertNoRelativeMdLinks } from '../atomic.js';
+import { cmpKey } from '../vault-path.js';
 import { getExtractor, InvalidEncodingError } from '../ingest/extractors.js';
-import { writeIngestError } from '../ingest/errors.js';
-import { resolveInsideVault } from '../ingest/containment.js';
+import { INGEST_ERROR_SUFFIX, writeIngestError } from '../ingest/errors.js';
+import {
+  INGEST_ERRORS_DIR,
+  IngestSourceRejectedError,
+  MAX_INGEST_BYTES,
+  inboxRelPath,
+  readInboxFile,
+  resolveInboxPath,
+} from '../ingest/containment.js';
 import {
   OriginalIntegrityError,
   ensureOriginalsDir,
@@ -79,9 +96,13 @@ import {
   readMarker,
   repairOriginal,
   sha256Hex,
+  storedOriginalIsIntact,
   writeMarker,
+  type NoteMarker,
 } from '../ingest/originals.js';
 import type { JobEvent } from './types.js';
+
+export { IngestSourceRejectedError, MAX_INGEST_BYTES } from '../ingest/containment.js';
 
 export interface RunIngestOptions {
   /** Absolute path to the vault root (folder containing `00_Inbox/`, `60_Sources/`). */
@@ -146,92 +167,176 @@ export function deriveTitle(body: string, sourcePath: string): string {
   return stem.length > 0 ? stem : base;
 }
 
-/** Scan `60_Sources/*.md` for a note whose frontmatter `source_sha256` matches `hash`. */
+
+/** A source note found by content hash, read through the broker. */
+interface SourceNoteRef {
+  sourceId: string;
+  /** Absolute path beneath the caller's vault root (for reporting). */
+  sourceNotePath: string;
+  body: string;
+}
+
+const SOURCE_NOTE_REL_RE = /^60_Sources\/[^/]+\.md$/i;
+
+/**
+ * Read `60_Sources/<name>.md` through the broker (containment, no hidden or
+ * 8.3 segments, single-link regular file) and return it iff its frontmatter
+ * `source_sha256` is `hash` (and, when given, its `id` is `expectedId`).
+ */
+async function readSourceNote(
+  vaultRoot: string,
+  broker: VaultBroker,
+  rel: string,
+  hash: string,
+  expectedId?: string,
+): Promise<SourceNoteRef | null> {
+  if (!SOURCE_NOTE_REL_RE.test(rel)) return null;
+  const snap = await broker.readNote(rel);
+  if (!snap) return null;
+  if (snap.frontmatter['source_sha256'] !== hash) return null;
+  const id = snap.frontmatter['id'];
+  if (typeof id !== 'string' || id.length === 0) return null;
+  if (expectedId !== undefined && id !== expectedId) return null;
+  return { sourceId: id, sourceNotePath: path.join(vaultRoot, ...snap.path.split('/')), body: snap.body };
+}
+
+/**
+ * Scan `60_Sources/*.md` for a note whose frontmatter `source_sha256` matches
+ * `hash`. Every candidate is read through the broker (N7), so a hardlinked or
+ * junction-reached "note" is never read.
+ */
 async function findNoteBySourceHash(
   vaultRoot: string,
+  broker: VaultBroker,
   hash: string,
-): Promise<{ sourceId: string; sourceNotePath: string; title: string; body: string } | null> {
-  const sourcesDir = path.join(vaultRoot, '60_Sources');
+): Promise<SourceNoteRef | null> {
   let entries: string[];
   try {
-    entries = await fs.readdir(sourcesDir);
+    entries = await fs.readdir(path.join(vaultRoot, '60_Sources'));
   } catch {
     return null;
   }
   for (const entry of entries) {
     if (!entry.toLowerCase().endsWith('.md')) continue;
-    const p = path.join(sourcesDir, entry);
-    let raw: string;
     try {
-      raw = await fs.readFile(p, 'utf8');
+      const found = await readSourceNote(vaultRoot, broker, `60_Sources/${entry}`, hash);
+      if (found) return found;
     } catch {
-      continue;
+      // Uncontained / hardlinked / unreadable candidate: never trusted.
     }
-    const parsed = parseNote(raw);
-    if (parsed.frontmatter['source_sha256'] !== hash) continue;
-    const v = validateFrontmatter(parsed.frontmatter);
-    if (!v.ok) continue;
-    return {
-      sourceId: v.value.id,
-      sourceNotePath: p,
-      title: v.value.title,
-      body: parsed.body,
-    };
   }
   return null;
 }
 
 /**
- * Rename the inbox drop to a stable hidden temp name inside the SAME
+ * Validate a completion marker against the vault (N7). `readMarker` already
+ * checked that its `hash` equals the file-name hash and its `ext` is a
+ * declared extractor extension. Here `sourceNotePath` must lexically be
+ * `<vaultRoot>/60_Sources/<name>.md` and that note, read through the broker,
+ * must carry `source_sha256 === hash` and `id === marker.sourceId`. Returns the
+ * note, or a reason string for an invalid marker.
+ */
+async function validateMarker(
+  vaultRoot: string,
+  broker: VaultBroker,
+  hash: string,
+  marker: NoteMarker,
+): Promise<SourceNoteRef | { invalid: string }> {
+  const rel = path
+    .relative(path.resolve(vaultRoot), path.resolve(vaultRoot, marker.sourceNotePath))
+    .split(path.sep)
+    .join('/');
+  if (!SOURCE_NOTE_REL_RE.test(rel)) {
+    return { invalid: `sourceNotePath ${JSON.stringify(marker.sourceNotePath)} is not a 60_Sources/ note` };
+  }
+  try {
+    const note = await readSourceNote(vaultRoot, broker, rel, hash, marker.sourceId);
+    return note ?? { invalid: `${rel} is missing or does not record source_sha256 ${hash} for ${marker.sourceId}` };
+  } catch (err) {
+    return { invalid: `${rel} cannot be read safely: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
+/**
+ * Rename the inbox drop to a hidden temp name inside the SAME (real, verified)
  * directory, re-hash it, and delete it ONLY if the bytes still match
  * `expectedHash` (E4-4). The rename freezes the file against a concurrent
  * writer between the hash check and the delete; a mismatch means someone
  * changed the file since it was preserved, so it is restored under its
  * original name instead of discarded, ready for the next watcher pass to
- * re-ingest. `sourcePath` is proven to lie inside the real vault (E3-2)
- * before anything is touched; if it does not, or is already gone, this is a
- * safe no-op.
+ * re-ingest. The drop must pass the strict inbox rules (ingest/containment.ts:
+ * real path inside the real `00_Inbox/`, no reparse point in between,
+ * single-link regular file) immediately before the rename, and the temp file
+ * must still be a single-link regular file in that same real directory after
+ * it; otherwise nothing is deleted (N1).
  */
 async function safeRemoveInboxFile(
   vaultRoot: string,
   sourcePath: string,
   expectedHash: string,
 ): Promise<void> {
-  let cp;
+  let t;
   try {
-    cp = await resolveInsideVault(vaultRoot, sourcePath);
+    t = await resolveInboxPath(vaultRoot, sourcePath);
   } catch {
-    // Cannot prove containment (e.g. the inbox itself resolves outside the
-    // real vault) — never delete something we can't prove is ours.
+    // Cannot prove it is an inbox file — never delete something we can't prove is ours.
     return;
   }
-  if (!cp.exists) return; // already gone (a prior run, or a racing removal)
+  if (!t.exists) return; // already gone (a prior run, or a racing removal)
 
-  const tmpAbs = path.join(path.dirname(cp.abs), `.${path.basename(cp.abs)}.${ulid()}.ingest-tmp`);
+  const src = t.cp.abs;
+  const dir = path.dirname(src);
+  const tmpAbs = path.join(dir, `.${randomBytes(16).toString('hex')}.ingest-tmp`);
   try {
-    await fs.rename(cp.abs, tmpAbs);
+    await fs.rename(src, tmpAbs);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return; // raced away already
     throw err;
   }
 
+  const restore = () =>
+    fs.rename(tmpAbs, src).catch(() => {
+      // The original name got reclaimed by a new writer in the meantime; leave
+      // the temp copy on disk rather than silently discard content.
+    });
+
   try {
-    const bytes = await fs.readFile(tmpAbs);
+    const st = await fs.lstat(tmpAbs);
+    const realDir = await fs.realpath(dir);
+    if (st.isSymbolicLink() || !st.isFile() || st.nlink !== 1 || cmpKey(realDir) !== cmpKey(dir)) {
+      await restore();
+      return;
+    }
+    const handle = await fs.open(tmpAbs, 'r');
+    let bytes: Buffer;
+    try {
+      const hst = await handle.stat();
+      if (!hst.isFile() || hst.nlink !== 1 || hst.size > MAX_INGEST_BYTES) {
+        await handle.close();
+        await restore();
+        return;
+      }
+      bytes = await handle.readFile();
+    } finally {
+      await handle.close().catch(() => {});
+    }
     if (sha256Hex(bytes) !== expectedHash) {
       // Content changed concurrently since it was preserved: this is no
       // longer safe to delete. Restore it under its original name so it is
       // picked up again (watcher `change`/startup-scan retry, E4-2).
-      await fs.rename(tmpAbs, cp.abs).catch(() => {
-        // Original name got reclaimed by a new writer in the meantime; leave
-        // the temp copy on disk rather than silently discard content.
-      });
+      await restore();
       return;
     }
     await fs.rm(tmpAbs, { force: true });
   } catch (err) {
-    await fs.rename(tmpAbs, cp.abs).catch(() => {});
+    await restore();
     throw err;
   }
+}
+
+/** Map a rejection reason onto the sidecar record's reason. */
+function rejectionRecordReason(err: IngestSourceRejectedError) {
+  return err.reason === 'outside-inbox' ? ('path-rejected' as const) : err.reason;
 }
 
 /**
@@ -251,17 +356,41 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
   let sidecarWritten = false;
 
   try {
-    // Step 0: the drop itself must be proven to lie inside the real vault
-    // before we ever read it (E3-2 — a junction swapped in for `00_Inbox/`
-    // must not let us read, let alone later delete, something outside).
-    await resolveInsideVault(vaultRoot, sourcePath);
-
     ext = (/\.[^./\\]+$/.exec(sourcePath)?.[0] ?? '').toLowerCase();
 
-    // Step 1: read once as bytes and hash immediately. The hash is over the
-    // exact original bytes and is reused for every sidecar/store/marker path
-    // below — never re-derived per call site (E4-8).
-    const raw = await fs.readFile(sourcePath);
+    // Steps 0+1: the drop must be a single-link regular file whose real path
+    // is inside the real `00_Inbox/` with no reparse point in between and no
+    // hidden/8.3/reserved segment, at most MAX_INGEST_BYTES long (N1/N6). Read
+    // once, bounded, through a handle whose identity is re-verified, and hash
+    // immediately; the hash is reused for every sidecar/store/marker path
+    // below — never re-derived per call site (E4-8). A rejected drop is never
+    // read or modified; it gets a sidecar if it is (lexically) in the inbox.
+    // Our own error records are never ingest sources (a `.json` sidecar has a
+    // declared extractor and would otherwise be ingested and deleted).
+    const inboxRel = inboxRelPath(vaultRoot, sourcePath);
+    if (
+      inboxRel !== null &&
+      (inboxRel.toLowerCase().endsWith(INGEST_ERROR_SUFFIX) ||
+        inboxRel.split('/').some((s) => s.toLowerCase() === INGEST_ERRORS_DIR))
+    ) {
+      throw new IngestSourceRejectedError('path-rejected', sourcePath, 'ingest-error records are not ingest sources');
+    }
+
+    let raw: Buffer;
+    try {
+      raw = (await readInboxFile(vaultRoot, sourcePath)).bytes;
+    } catch (err) {
+      if (err instanceof IngestSourceRejectedError && inboxRel !== null) {
+        await writeIngestError(vaultRoot, sourcePath, rejectionRecordReason(err), err.message, ext)
+          .then(() => {
+            sidecarWritten = true;
+          })
+          .catch(() => {
+            // Best-effort: the thrown rejection is still reported via onJob.
+          });
+      }
+      throw err;
+    }
     hash = sha256Hex(raw);
 
     const extractor = getExtractor(sourcePath);
@@ -300,6 +429,7 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
     }
 
     const title = deriveTitle(text, sourcePath);
+    const broker = new VaultBroker(vaultRoot);
 
     // Step 5: serialize per content hash (E4-3) so two concurrent identical
     // drops cannot both observe "no marker yet" and both mint a note.
@@ -312,33 +442,30 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
     });
 
     try {
-      // Step 6: dedup / resume-after-full-completion short circuit.
+      // Step 6: dedup / resume-after-full-completion short circuit. The
+      // marker is only trusted after validation (N7): its hash matches its
+      // file name, its ext is declared, and its note is a contained
+      // `60_Sources/` note recording this hash. An invalid marker is ignored
+      // (and reported); normal ingest then proceeds and rewrites it.
       const existingMarker = await readMarker(vaultRoot, hash);
       if (existingMarker) {
-        const stillThere = await fs
-          .access(existingMarker.sourceNotePath)
-          .then(() => true)
-          .catch(() => false);
-        if (stillThere) {
-          const raw2 = await fs.readFile(existingMarker.sourceNotePath, 'utf8');
-          const parsed2 = parseNote(raw2);
-
+        const v = await validateMarker(vaultRoot, broker, hash, existingMarker);
+        if ('invalid' in v) {
+          onJob?.({
+            job: 'ingest',
+            phase: 'progress',
+            sourcePath,
+            detail: `ignoring invalid completion marker for ${hash}: ${v.invalid}`,
+          });
+        } else {
           // E4-1: never trust the marker's presence alone — verify the
           // STORED original still exists and hashes correctly before
           // removing the (only remaining, if this is a repair) inbox copy.
+          // An uncontained store path throws here (fail closed).
           const storedPath = originalStorePath(vaultRoot, hash, existingMarker.ext);
-          let storedOk = false;
-          try {
-            const storedBytes = await fs.readFile(storedPath);
-            storedOk = sha256Hex(storedBytes) === hash;
-          } catch {
-            storedOk = false;
-          }
-          if (!storedOk) {
-            // `raw` already hashes to `hash` (verified above), and `hash` is
-            // durably committed via the completion marker — a missing or
-            // corrupted stored copy is repaired unconditionally, not
-            // treated as an integrity fault to reject.
+          if (!(await storedOriginalIsIntact(vaultRoot, hash, existingMarker.ext))) {
+            // `raw` hashes to `hash` and `hash` is durably committed via the
+            // validated marker — repair the store from the inbox bytes.
             await repairOriginal(vaultRoot, raw, existingMarker.ext);
           }
 
@@ -352,10 +479,10 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
             detail: 'deduplicated: identical content already ingested',
           });
           return {
-            sourceNotePath: existingMarker.sourceNotePath,
-            sourceId: existingMarker.sourceId,
+            sourceNotePath: v.sourceNotePath,
+            sourceId: v.sourceId,
             title,
-            body: parsed2.body,
+            body: v.body,
             sourceSha256: hash,
             // E4-8: report the ACTUAL stored path (the existing marker's
             // extension), not this drop's possibly-different extension.
@@ -375,7 +502,7 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
       let sourceId: string;
       let sourceNotePath: string;
       let body: string;
-      const orphan = await findNoteBySourceHash(vaultRoot, hash);
+      const orphan = await findNoteBySourceHash(vaultRoot, broker, hash);
       if (orphan) {
         sourceId = orphan.sourceId;
         sourceNotePath = orphan.sourceNotePath;
@@ -404,11 +531,7 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
 
         // WS-D: create-only through the vault broker (containment + lock + atomic
         // write; a fresh ULID path never collides, and nothing is ever clobbered).
-        const res = await new VaultBroker(vaultRoot).createNote(
-          `60_Sources/${sourceId}.md`,
-          fm,
-          body,
-        );
+        const res = await broker.createNote(`60_Sources/${sourceId}.md`, fm, body);
         if (!res.ok) {
           throw new Error(
             `ingest: could not write source note ${sourceNotePath} (reason: ${res.reason})`,
@@ -450,16 +573,15 @@ export async function runIngest(opts: RunIngestOptions): Promise<IngestResult> {
   } catch (err) {
     // Only write a sidecar here for failure modes we can name with
     // confidence (E4-7: `OriginalIntegrityError`'s dedicated
-    // `integrity-check-failed` reason existed but nothing ever used it; the
-    // wikilink/unsupported-format/invalid-encoding cases already write their
-    // own sidecar inline, above, closer to the actual cause). Deliberately
-    // NOT a catch-all "unexpected-failure" sidecar for every other thrown
-    // error: those include the regression suite's `crashAfter` injection
-    // (simulating a hard process crash, which would never run this catch
-    // block at all) and internal step failures (e.g. a broker write
-    // rejection) whose correct handling is "let the caller see the error and
-    // retry", not "leave a stale error record behind that masks a later,
-    // different failure for the same content".
+    // `integrity-check-failed` reason). Path/size/read rejections, unsupported
+    // formats, bad encodings and wikilink violations already wrote their own
+    // sidecar inline, above, closer to the actual cause. Deliberately NOT a
+    // catch-all "unexpected-failure" sidecar for every other thrown error:
+    // those include the regression suite's `crashAfter` injection (simulating
+    // a hard process crash, which would never run this catch block at all)
+    // and internal step failures (e.g. a broker write rejection) whose correct
+    // handling is "let the caller see the error and retry", not "leave a stale
+    // error record behind that masks a later, different failure".
     if (!sidecarWritten && typeof hash === 'string' && err instanceof OriginalIntegrityError) {
       await writeIngestError(
         vaultRoot,

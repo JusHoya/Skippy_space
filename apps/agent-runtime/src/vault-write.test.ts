@@ -16,7 +16,15 @@ import * as fsSync from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { LettaClient, VaultBroker, containmentPathGuard, parseNote } from '@skippy/memory';
+import {
+  LettaClient,
+  VaultBroker,
+  containmentPathGuard,
+  dailyNoteRelPath,
+  generateDailyNote,
+  mirrorArchivalToVault,
+  parseNote,
+} from '@skippy/memory';
 
 import { handleObsidianWriteNote, handleLettaAppend } from './mcp-handlers.js';
 import type { PathGuard } from './tool-policy.js';
@@ -179,4 +187,27 @@ test('containmentPathGuard satisfies tool-policy PathGuard and rejects a junctio
   assert.deepEqual(await vaultPathGuard('notes/a.md', [vault], vault), { ok: true });
   const r = await vaultPathGuard('j/a.md', [vault], vault);
   assert.equal(r.ok, false);
+});
+
+// M0 red-team round 2, N4 (FR-WIKI-02): the tool cannot squat the append-only
+// daily / agent_log paths with a general note (which would then be overwritable
+// with expected_hash and make the daily generator / archival mirror fail).
+test('RT2-N4: obsidian_write_note cannot squat a daily or agent_log path', async () => {
+  const { vault } = await sandbox();
+  const tomorrow = new Date(Date.now() + 86_400_000);
+  const rel = dailyNoteRelPath(tomorrow);
+  const daily = await handleObsidianWriteNote(vault, { path: rel, title: 'fake daily', body: 'overwritable' });
+  assert.equal(daily.isError, true, textOf(daily));
+  assert.match(textOf(daily), /append-only|reserved/i);
+  assert.equal(await fs.access(path.join(vault, ...rel.split('/'))).then(() => true, () => false), false);
+  assert.equal((await generateDailyNote({ vaultRoot: vault, date: tomorrow })).created, true);
+
+  const log = await handleObsidianWriteNote(vault, {
+    path: '50_Agents/research/agent_log.md',
+    title: 'x',
+    body: 'squat',
+  });
+  assert.equal(log.isError, true, textOf(log));
+  const m = await mirrorArchivalToVault({ board: 'research', text: 'memory', vaultRoot: vault });
+  assert.equal(m.ok, true, m.error);
 });
