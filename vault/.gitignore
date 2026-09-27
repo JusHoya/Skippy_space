@@ -10,3 +10,7 @@
 .skippy/
 *.tmp
 *.lock
+# Ingest freeze files (`.<hex>.<name>.ingest-tmp`, recovered at watcher start)
+# and the contained atomic writer's temp files: never commit either (M0 final #7).
+*.ingest-tmp
+.skippy-*.tmp

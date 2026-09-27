@@ -199,6 +199,7 @@ export default function ReplayScrubber() {
                 <span className="k">{a.agentId}</span>
                 <span className="v">
                   {a.state ?? '—'}
+                  {a.lastOutcome ? ` · order: ${a.lastOutcome}` : ''}
                   {a.model ? ` · ${a.model}` : ''}
                   {a.lastToken ? ` · "${a.lastToken.slice(0, 24)}"` : ''}
                 </span>

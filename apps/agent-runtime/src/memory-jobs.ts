@@ -26,6 +26,9 @@ import {
   runLint,
   mockDistill,
   watchInbox,
+  canonicalVaultRootSync,
+  recordUnsupported,
+  recordIngestRejection,
   type DistillFn,
   type JobEvent,
   type InboxWatcher,
@@ -177,7 +180,19 @@ export function startMemoryJobs(): MemoryJobsHandle {
     return { stop: async () => {} };
   }
 
-  const vaultRoot = resolveVaultRoot();
+  // M0 final #5: canonicalize the configured root ONCE (native realpath: an
+  // 8.3 alias or junction root becomes its long form) and use that one form
+  // for the watcher, runIngest and the scheduled jobs. A root that cannot be
+  // canonicalized is a loud error event, not a silently idle watcher.
+  const configuredRoot = resolveVaultRoot();
+  let vaultRoot: string;
+  try {
+    vaultRoot = canonicalVaultRootSync(configuredRoot);
+  } catch (err) {
+    logger.error({ msg: 'memory jobs disabled: vault root cannot be canonicalized', vaultRoot: configuredRoot, err: String(err) });
+    emitJob({ job: 'ingest', phase: 'error', detail: `vault root unusable, memory jobs not started: ${String(err)}` });
+    return { stop: async () => {} };
+  }
   const distill = selectDistiller();
   logger.info({
     msg: 'memory jobs starting',
@@ -185,10 +200,80 @@ export function startMemoryJobs(): MemoryJobsHandle {
     distillMode: process.env.SKIPPY_DISTILL_MODE === 'llm' ? 'llm' : 'mock',
   });
 
+  // E4-3: serialize drops through a single FIFO queue rather than firing an
+  // unawaited `processDrop` per watcher event — two concurrent identical
+  // drops must not both observe "not yet ingested" and both mint a note. (A
+  // per-content-hash lock inside `runIngest` itself is the deeper fix for
+  // multi-process/resumed-run correctness; this queue additionally keeps the
+  // sidecar's own event ordering sane for humans watching the log.)
+  let dropQueue: Promise<void> = Promise.resolve();
+  const enqueueDrop = (absPath: string): void => {
+    dropQueue = dropQueue
+      .then(() => processDrop(vaultRoot, absPath, distill))
+      .catch((err) => {
+        logger.warn({ msg: 'queued processDrop failed', err: String(err) });
+      });
+  };
+
   const watcher: InboxWatcher = watchInbox({
     vaultRoot,
     onFile: (absPath) => {
-      void processDrop(vaultRoot, absPath, distill);
+      enqueueDrop(absPath);
+    },
+    onUnsupported: (absPath, ext) => {
+      // E4-5: an unsupported drop must get the same explicit, on-disk error
+      // record + `memory_job` event as a `runIngest`-detected failure, not
+      // just a console warning.
+      void (async () => {
+        try {
+          await recordUnsupported(vaultRoot, absPath, ext);
+        } catch (err) {
+          logger.warn({ msg: 'failed to record unsupported-format sidecar', err: String(err) });
+        }
+        emitJob({
+          job: 'ingest',
+          phase: 'error',
+          sourcePath: absPath,
+          detail: `unsupported format "${ext}"; original left intact, see .ingest-error.json`,
+        });
+      })();
+    },
+    onRejected: (absPath, reason, detail) => {
+      // N6: an inbox entry ingest must not read (junction/symlink, hardlink,
+      // 8.3/reserved name, over the size cap, unreadable) gets an explicit
+      // sidecar (next to it, or under 00_Inbox/_ingest-errors/ when that is not
+      // safely writable) and a `memory_job` error event. The file is never
+      // read, modified or followed.
+      void (async () => {
+        try {
+          await recordIngestRejection(vaultRoot, absPath, reason, detail);
+        } catch (err) {
+          logger.warn({ msg: 'failed to record rejected-drop sidecar', err: String(err) });
+        }
+        emitJob({
+          job: 'ingest',
+          phase: 'error',
+          sourcePath: absPath,
+          detail: `rejected (${reason}); original left intact, see .ingest-error.json`,
+        });
+      })();
+    },
+    onError: (err) => {
+      // M0 final #5: a watcher that cannot run is an explicit error event.
+      logger.error({ msg: 'inbox watcher error', err: String(err) });
+      emitJob({ job: 'ingest', phase: 'error', detail: `inbox watcher: ${err.message}` });
+    },
+    onRecovered: (r) => {
+      // M0 final #7: leftover .ingest-tmp freeze files are surfaced, never hidden.
+      const entry = { msg: 'ingest-tmp recovery', tmpPath: r.tmpPath, action: r.action, detail: r.detail };
+      if (r.action === 'left') logger.error(entry);
+      else logger.warn(entry);
+      emitJob({
+        job: 'ingest',
+        phase: r.action === 'left' ? 'error' : 'progress',
+        sourcePath: r.restoredAs ?? r.tmpPath,
+        detail: `recovered interrupted ingest (${r.action}): ${r.detail}`,
+      });
     },
   });
 

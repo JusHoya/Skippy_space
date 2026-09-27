@@ -211,7 +211,7 @@ console.log(`\n${DIM}rust wiring${RESET}`);
 console.log(`\n${DIM}sdk adoption (gated)${RESET}`);
 {
   const board = readIf('apps/agent-runtime/src/board.ts') ?? '';
-  record('board.ts routes through the gated SDK path', /sdkBoardsEnabled\(\)/.test(board), null);
+  record('board.ts routes through the gated SDK path', /sdkBoardsEnabled\(\)|resolveExecutionGate\(/.test(board), null);
   const sdkBoard = readIf('apps/agent-runtime/src/sdk-board.ts') ?? '';
   record(
     'sdk-board.ts gates on PHASE3_AGENTS_ENABLED + dynamic-imports the SDK',

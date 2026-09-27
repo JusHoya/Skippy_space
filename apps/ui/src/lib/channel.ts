@@ -1,6 +1,10 @@
 import { useEffect } from 'react';
 import {
+  DelegationCompleteEnvelope,
   Envelope,
+  RecordedOutcomeSchema,
+  guardTerminalRecord,
+  type RecordedOutcome,
   type AgentId,
   type AgentState,
   type BoardState,
@@ -44,6 +48,45 @@ function boardStateToAgentState(s: BoardState): AgentState {
   }
 }
 
+/** `delegation_complete` as the shell may forward it: outcome widened to the
+ * reader-side set so a shell-downgraded `unverified` record still lands. */
+const ForwardedDelegationComplete = DelegationCompleteEnvelope.extend({ outcome: RecordedOutcomeSchema });
+type ForwardedDelegationComplete = Omit<DelegationCompleteEnvelope, 'outcome'> & { outcome: RecordedOutcome };
+
+/**
+ * Apply a terminal record (FR-RUN-01). The status IS the outcome — never
+ * inferred. Only a contract-conforming `succeeded` is success; a record that
+ * violates the outcome invariants (e.g. `succeeded` with `mode: "demo"`) is
+ * shown as `unverified` with a console warning (EC1 D3, G0 defense in depth);
+ * simulated/blocked/failed/interrupted stay visibly distinct.
+ */
+function applyDelegationComplete(env: ForwardedDelegationComplete): void {
+  const guarded = guardTerminalRecord(env);
+  if (guarded.violations.length > 0) {
+    console.warn(
+      `[skippy/ui] delegation ${env.delegationId} record violates the outcome contract; shown as unverified:`,
+      guarded.violations,
+      env,
+    );
+  }
+  useDelegationStore.getState().setStatus(env.delegationId, guarded.outcome, env.ts, {
+    summary: env.summary,
+    mode: guarded.mode,
+    validation: guarded.validation,
+    ...(guarded.reason !== undefined ? { reason: guarded.reason } : {}),
+  });
+  const targetAgentId = `board.${env.fromBoardId}` as AgentId;
+  useAgentStore.getState().setAgent(targetAgentId, {
+    state: 'idle',
+    updatedAt: env.ts,
+  });
+  const line = `[skippy/ui] delegation ${env.delegationId} ${guarded.outcome} (${guarded.mode}${
+    guarded.reason ? `, ${guarded.reason.code}` : ''
+  }): ${env.summary.slice(0, 80)}`;
+  if (guarded.outcome === 'succeeded') console.info(line);
+  else console.warn(line);
+}
+
 /**
  * Subscribe to the agent event stream (PRD §5.2, §9.2).
  *
@@ -65,6 +108,14 @@ export function useEventChannel(): void {
     ch.onmessage = (raw) => {
       const parsed = Envelope.safeParse(raw);
       if (!parsed.success) {
+        // The shell downgrades a contract-violating terminal record to
+        // `unverified` (EC1 D3); that is not a writer outcome, so it only
+        // parses against the reader-side schema.
+        const downgraded = ForwardedDelegationComplete.safeParse(raw);
+        if (downgraded.success) {
+          applyDelegationComplete(downgraded.data);
+          return;
+        }
         console.warn('[skippy/ui] bad envelope received:', parsed.error.message, raw);
         return;
       }
@@ -185,20 +236,15 @@ export function useEventChannel(): void {
           console.info(`[skippy/ui] delegation ${env.delegationId} ack: ${env.decision}`);
           break;
         }
+        case 'delegation_state': {
+          // Non-terminal lifecycle (FR-RUN-01): accepted -> running.
+          useDelegationStore
+            .getState()
+            .setStatus(env.delegationId, env.state, env.ts, { mode: env.mode });
+          break;
+        }
         case 'delegation_complete': {
-          const status = env.result === 'success' ? 'succeeded' : 'failed';
-          useDelegationStore.getState().setStatus(env.delegationId, status, env.ts, {
-            result: env.result,
-            summary: env.summary,
-          });
-          const targetAgentId = `board.${env.fromBoardId}` as AgentId;
-          useAgentStore.getState().setAgent(targetAgentId, {
-            state: 'idle',
-            updatedAt: env.ts,
-          });
-          console.info(
-            `[skippy/ui] delegation ${env.delegationId} complete (${env.result}): ${env.summary.slice(0, 80)}`,
-          );
+          applyDelegationComplete(env);
           break;
         }
         // ── Phase 3-prep variants — Zone 2 + Zone 5 own the real handlers,

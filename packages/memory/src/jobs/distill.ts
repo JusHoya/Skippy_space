@@ -16,17 +16,12 @@
 // ARCHITECTURE: do NOT import @anthropic-ai/sdk or anything from agent-runtime.
 // The LLM distiller injects itself by passing its own `DistillFn`.
 
-import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 
 import { ulid } from 'ulid';
 
-import { writeNote } from '../atomic.js';
-import {
-  makeFrontmatter,
-  parseNote,
-  validateFrontmatter,
-} from '../frontmatter.js';
+import { makeFrontmatter } from '../frontmatter.js';
+import { VaultBroker } from '../vault-broker.js';
 import type { JobEvent } from './types.js';
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -279,54 +274,54 @@ function renderTopicBody(name: string, atomicIds: string[]): string {
 }
 
 /**
- * Append new atomic [[id]] links to an EXISTING topic page without clobbering its
- * body (topics are by-name and accumulate facts across distills). Re-validates the
- * existing frontmatter and bumps `updated_at`. Returns the merged note pieces.
+ * Create a topic page, or append new atomic [[id]] links to an EXISTING one
+ * without clobbering it (topics are by-name and accumulate facts across
+ * distills). Existing pages go through the broker's compare-and-swap update, so
+ * `id`, `created_at`, unknown frontmatter keys and the authored body are
+ * preserved (FR-WIKI-02); an edit that lands between our read and write is a
+ * conflict, and we re-read and retry once. A page whose existing frontmatter is
+ * invalid is skipped rather than re-minted with a new identity. Returns true if
+ * the page exists with the links after this call.
  */
-async function mergeTopicPage(
-  topicPath: string,
+async function upsertTopicPage(
+  broker: VaultBroker,
+  rel: string,
   name: string,
   atomicIds: string[],
-): Promise<{ fm: ReturnType<typeof makeFrontmatter>; body: string }> {
-  const raw = await fs.readFile(topicPath, 'utf8');
-  const parsed = parseNote(raw);
-  const v = validateFrontmatter(parsed.frontmatter);
-
-  // Append only the ids not already present as [[id]] wikilinks.
-  const missing = atomicIds.filter((id) => !parsed.body.includes(`[[${id}]]`));
-  const additions = missing.map((id) => `- [[${id}]]`).join('\n');
-  const body =
-    missing.length > 0
-      ? `${parsed.body.replace(/\s+$/, '')}\n${additions}\n`
-      : parsed.body;
-
-  if (v.ok) {
-    // Re-stamp via makeFrontmatter to bump updated_at while preserving identity.
-    const fm = makeFrontmatter({
-      id: v.value.id,
-      title: v.value.title,
-      type: 'concept',
-      status: v.value.status,
-      authored_by: v.value.authored_by,
-      source: v.value.source,
-      tags: v.value.tags,
-      confidence: v.value.confidence,
-      distilled_from: v.value.distilled_from,
-      supersedes: v.value.supersedes,
-      contradicts: v.value.contradicts,
-    });
-    return { fm, body };
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const existing = await broker.readNote(rel);
+      if (!existing) {
+        const fm = makeFrontmatter({
+          title: name,
+          type: 'concept',
+          status: 'active',
+          authored_by: 'research.distiller',
+          source: 'gen://distill',
+        });
+        const res = await broker.createNote(rel, fm, renderTopicBody(name, atomicIds));
+        if (res.ok) return true;
+        if (res.reason === 'exists') continue; // lost a create race; merge instead
+        return false;
+      }
+      const res = await broker.updateNote(rel, existing.hash, (cur) => {
+        // Append only the ids not already present as [[id]] wikilinks.
+        const missing = atomicIds.filter((id) => !cur.body.includes(`[[${id}]]`));
+        if (missing.length === 0) return null;
+        const additions = missing.map((id) => `- [[${id}]]`).join('\n');
+        return { body: `${cur.body.replace(/\s+$/, '')}\n${additions}\n` };
+      });
+      if (res.ok) return true;
+      if (res.reason === 'conflict') continue;
+      return false;
+    } catch {
+      // Invalid existing frontmatter, append-only type, or a relative .md link in
+      // the human-authored body: leave the page untouched.
+      return false;
+    }
   }
-
-  // Existing frontmatter was invalid — rebuild a fresh valid one (best effort).
-  const fm = makeFrontmatter({
-    title: name,
-    type: 'concept',
-    status: 'active',
-    authored_by: 'research.distiller',
-    source: 'gen://distill',
-  });
-  return { fm, body };
+  return false;
 }
 
 /**
@@ -337,6 +332,7 @@ async function mergeTopicPage(
 export async function runDistill(opts: RunDistillOptions): Promise<DistillResult> {
   const { vaultRoot, source, onJob } = opts;
   const distill = opts.distill ?? mockDistill;
+  const broker = new VaultBroker(vaultRoot);
   onJob?.({ job: 'distill', phase: 'start', detail: source.title });
 
   try {
@@ -367,8 +363,8 @@ export async function runDistill(opts: RunDistillOptions): Promise<DistillResult
         confidence: draft.confidence ?? 0.6,
         ...(draft.tags ? { tags: draft.tags } : {}),
       });
-      const res = await writeNote(target, fm, draft.body);
-      if (res.written) {
+      const res = await broker.createNote(`10_Atomic/${id}.md`, fm, draft.body);
+      if (res.ok) {
         atomicPaths.push(target);
         atomicIds.push(id);
         written.push({
@@ -402,24 +398,9 @@ export async function runDistill(opts: RunDistillOptions): Promise<DistillResult
       const byName = written.filter((w) => w.text.includes(needle)).map((w) => w.id);
       const seedIds = byName.length > 0 ? byName : atomicIds;
 
-      let fm: ReturnType<typeof makeFrontmatter>;
-      let body: string;
-      const existing = await fileExists(topicPath);
-      if (existing) {
-        ({ fm, body } = await mergeTopicPage(topicPath, name, seedIds));
-      } else {
-        fm = makeFrontmatter({
-          title: name,
-          type: 'concept',
-          status: 'active',
-          authored_by: 'research.distiller',
-          source: 'gen://distill',
-        });
-        body = renderTopicBody(name, seedIds);
+      if (await upsertTopicPage(broker, `20_Topics/${slug}.md`, name, seedIds)) {
+        topicPaths.push(topicPath);
       }
-
-      const res = await writeNote(topicPath, fm, body);
-      if (res.written) topicPaths.push(topicPath);
     }
 
     onJob?.({
@@ -437,15 +418,5 @@ export async function runDistill(opts: RunDistillOptions): Promise<DistillResult
       detail: err instanceof Error ? err.message : String(err),
     });
     throw err;
-  }
-}
-
-/** True if a path exists. */
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
   }
 }

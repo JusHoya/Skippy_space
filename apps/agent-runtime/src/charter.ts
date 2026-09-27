@@ -5,24 +5,41 @@
 // is mirrored in `agent_space/CLAUDE.md`. The body is the system prompt the
 // charter's agent runs under.
 //
-// We deliberately avoid adding `gray-matter` / `js-yaml` as dependencies for
-// Phase 1 — neither is in `apps/agent-runtime/package.json` yet (only the
-// workspace has a transitive `js-yaml` via some other package, which we are
-// not supposed to rely on). The frontmatter shape we need is shallow enough
-// that a tiny hand-rolled parser is both safer (no surprise YAML edge cases on
-// untrusted text) and faster (no extra startup cost). If a future charter
-// needs nested structures we cannot handle, we can drop `gray-matter` in then.
+// Frontmatter is parsed with a real YAML parser (js-yaml 4, the version already
+// pinned by @skippy/memory) so that every key the author wrote reaches the
+// tool-policy layer (FR-BOARD-01 "never silently broaden authority"). The
+// previous hand-rolled parser only recognised `^[A-Za-z0-9_]+:` keys, so a
+// hyphenated, quoted or indented authority key (`disallowed-tools`,
+// `"disallowed_tools"`, `  disallowed_tools`) was dropped before
+// `derivePolicy` could refuse it (red-team N4), and a duplicated key silently
+// took the last value (N5). Now:
 //
-// Failure modes (per Agent F's tolerance contract):
+//   - duplicate keys are a parse error (js-yaml default);
+//   - a mis-indented top-level key is a parse error (js-yaml default);
+//   - YAML anchors, aliases, merge keys and explicit tags are refused anywhere
+//     in the frontmatter (they can rewrite or retype authority fields out of
+//     sight); anchor/alias names are matched as YAML defines them (any
+//     non-space, non-flow-indicator run), so non-ASCII names count too;
+//   - the document must be a mapping;
+//   - any parse error makes the charter *unloaded*: `loaded: false`, so
+//     `derivePolicy` fails closed (`charter_not_loaded`) while the markdown
+//     body is still preserved for diagnostics.
+//
+// Key spelling (case, `-` vs `_`, nesting) is judged by `derivePolicy` in
+// tool-policy.ts, which sees the exact keys this parser produced.
+//
+// Failure modes:
 //   - File missing -> return a placeholder Charter with a stub system prompt
 //     that names the board and points at PRD §6.1, plus a `log` envelope so
-//     the user sees that Agent A's charter is not yet on disk.
+//     the user sees that the charter is not yet on disk.
 //   - YAML parse failure -> same placeholder behavior, but the body of the
 //     markdown is preserved if any was readable.
 
 import { existsSync, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import yaml from 'js-yaml';
 
 import type { BoardId, StaffOfficerId } from '@skippy/shared';
 
@@ -39,14 +56,23 @@ export type CharterAgentId =
 export interface Charter {
   /** The agent id this charter was loaded for. */
   readonly agentId: CharterAgentId;
-  /** Parsed (shallow) YAML frontmatter. Unknown keys are kept as strings. */
+  /** Parsed YAML frontmatter, keys exactly as written. */
   readonly frontmatter: Record<string, unknown>;
   /** Markdown body, with frontmatter fence removed. Used as the system prompt. */
   readonly body: string;
-  /** True if the file was found on disk; false if we returned a placeholder. */
+  /** True if the file was found on disk AND its frontmatter parsed; false if
+   * we returned a placeholder (missing file or invalid frontmatter). */
   readonly loaded: boolean;
   /** Resolved file path (informational, even if `loaded` is false). */
   readonly path: string;
+}
+
+/** Thrown by `parseCharterText` when the frontmatter cannot be trusted. */
+export class CharterParseError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CharterParseError';
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -98,100 +124,107 @@ function resolveCharterPath(agentId: CharterAgentId): string {
 // Frontmatter parsing
 // ──────────────────────────────────────────────────────────────────────────────
 
+/** Frontmatter fence: `---` on its own line at the very top (after an optional
+ * BOM), closed by another `---` line. CRLF tolerant. */
+const FENCE = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n([\s\S]*))?$/;
+
 /**
- * Tiny YAML-ish frontmatter parser. Handles:
- *   key: scalar          -> string|number|bool|null
- *   key: [a, b, c]       -> string[]
- *   key:                 -> begins a nested mapping
- *     subkey: value
- *   key:                 -> begins a sequence
- *     - item
- *
- * We do NOT handle:
- *   - block scalars (>, |)
- *   - anchors / aliases
- *   - quoted multi-line strings
- *
- * Anything we cannot parse cleanly is kept as its raw string. The frontmatter
- * is informational at this layer; the *body* is what feeds the LLM, so loss-of-
- * fidelity in frontmatter never affects agent behavior — just metadata.
+ * Remove YAML quoted scalars and `#` comments so the anchor/alias/merge scan
+ * below only sees structural text. Quoted strings may legitimately contain
+ * `&`, `*` or `<<` (e.g. a core-memory fact); structural ones may not.
  */
-function parseFrontmatter(raw: string): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  const lines = raw.split(/\r?\n/);
+function stripQuotedAndComments(fm: string): string {
+  let out = '';
   let i = 0;
-  while (i < lines.length) {
-    const line = lines[i] ?? '';
-    if (line.trim() === '' || line.trim().startsWith('#')) {
-      i++;
-      continue;
-    }
-    const m = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(line);
-    if (!m) {
-      i++;
-      continue;
-    }
-    const key = m[1] as string;
-    const rest = (m[2] ?? '').trim();
-    if (rest === '') {
-      // Nested block — peek the next line's indent.
-      const block: Record<string, unknown> = {};
-      const list: string[] = [];
+  while (i < fm.length) {
+    const c = fm[i] as string;
+    if (c === '"' || c === "'") {
+      const q = c;
       let j = i + 1;
-      let mode: 'map' | 'list' | null = null;
-      while (j < lines.length) {
-        const sub = lines[j] ?? '';
-        if (sub.trim() === '') {
-          j++;
+      while (j < fm.length) {
+        const d = fm[j] as string;
+        if (q === '"' && d === '\\') {
+          j += 2;
           continue;
         }
-        const indent = /^(\s+)/.exec(sub);
-        if (!indent) break;
-        const trimmed = sub.trim();
-        if (trimmed.startsWith('- ')) {
-          mode ??= 'list';
-          if (mode !== 'list') break;
-          list.push(trimmed.slice(2).trim().replace(/^['"]|['"]$/g, ''));
-        } else if (/^[A-Za-z0-9_]+:/.test(trimmed)) {
-          mode ??= 'map';
-          if (mode !== 'map') break;
-          const sm = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(trimmed);
-          if (sm && sm[1] !== undefined) {
-            block[sm[1]] = coerceScalar(sm[2] ?? '');
+        if (d === q) {
+          // `''` inside a single-quoted scalar is an escaped quote.
+          if (q === "'" && fm[j + 1] === "'") {
+            j += 2;
+            continue;
           }
-        } else {
           break;
         }
+        if (d === '\n') break; // unterminated on this line; let js-yaml judge
         j++;
       }
-      out[key] = mode === 'list' ? list : block;
-      i = j;
+      out += ' ';
+      i = j + 1;
       continue;
     }
-    out[key] = coerceScalar(rest);
+    if (c === '#' && (i === 0 || /\s/.test(fm[i - 1] as string))) {
+      while (i < fm.length && fm[i] !== '\n') i++;
+      continue;
+    }
+    out += c;
     i++;
   }
   return out;
 }
 
-function coerceScalar(raw: string): unknown {
-  const s = raw.trim();
-  if (s === '' || s === 'null' || s === '~') return null;
-  if (s === 'true') return true;
-  if (s === 'false') return false;
-  // Inline list  [a, b, c]
-  if (s.startsWith('[') && s.endsWith(']')) {
-    const inner = s.slice(1, -1).trim();
-    if (inner === '') return [];
-    return inner.split(',').map((p) => coerceScalar(p));
+/** `&anchor`, `*alias` (as a value or list item) or a `<<` merge key. YAML
+ * anchor names are any run of non-space, non-flow-indicator characters, so
+ * the name class is the complement of those — not `[A-Za-z0-9_-]`, which let
+ * `tools: &é [Read]` / `disallowed_tools: *é` through (red-team F2 D6). */
+const ANCHOR_OR_ALIAS = /(?:^|[\s[{,:])[&*][^\s,[\]{}]+/m;
+const MERGE_KEY = /(?:^|[\s{,])<<\s*:/m;
+/** `!tag` / `!!type` (structural position): explicit tags can retype an
+ * authority value (`!!binary`, `!!set`); the schema needs none of them. */
+const YAML_TAG = /(?:^|[\s[{,:])![^\s,[\]{}]*/m;
+
+/**
+ * Parse a charter markdown document into frontmatter + body. Throws
+ * CharterParseError when the frontmatter cannot be trusted (duplicate keys,
+ * bad indentation, anchors/aliases/merge keys, non-mapping document, or any
+ * other YAML error). A document without a frontmatter fence yields an empty
+ * frontmatter and the whole text as body.
+ */
+export function parseCharterText(text: string): { frontmatter: Record<string, unknown>; body: string } {
+  const src = text.startsWith('﻿') ? text.slice(1) : text;
+  const m = FENCE.exec(src);
+  if (!m) {
+    return { frontmatter: {}, body: src };
   }
-  // Quoted string
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    return s.slice(1, -1);
+  const fmText = m[1] ?? '';
+  const body = m[2] ?? '';
+
+  const structural = stripQuotedAndComments(fmText);
+  if (ANCHOR_OR_ALIAS.test(structural)) {
+    throw new CharterParseError('YAML anchors/aliases are not permitted in charter frontmatter');
   }
-  // Number
-  if (/^-?\d+(\.\d+)?$/.test(s)) return Number(s);
-  return s;
+  if (MERGE_KEY.test(structural)) {
+    throw new CharterParseError('YAML merge keys (<<) are not permitted in charter frontmatter');
+  }
+  if (YAML_TAG.test(structural)) {
+    throw new CharterParseError('YAML tags (!tag, !!type) are not permitted in charter frontmatter');
+  }
+
+  let doc: unknown;
+  try {
+    // js-yaml 4 default schema: no custom/function types; duplicate mapping
+    // keys and bad indentation throw.
+    doc = yaml.load(fmText, { json: false });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message.split('\n')[0] : String(err);
+    throw new CharterParseError(`frontmatter is not valid YAML: ${msg}`);
+  }
+  if (doc === undefined || doc === null) {
+    return { frontmatter: {}, body };
+  }
+  if (typeof doc !== 'object' || Array.isArray(doc)) {
+    throw new CharterParseError('frontmatter must be a YAML mapping');
+  }
+  return { frontmatter: doc as Record<string, unknown>, body };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -204,24 +237,17 @@ const cache = new Map<CharterAgentId, Charter>();
  * Load a charter by agent id. Cached for the sidecar lifetime. Returns a
  * placeholder Charter (with a stub system prompt) if the file is missing —
  * this is intentional so Agent A can land their charters in parallel without
- * blocking the runtime.
+ * blocking the runtime. A file whose frontmatter fails to parse is also
+ * returned as `loaded: false` (its body preserved) so no authority is ever
+ * derived from a half-read charter.
  */
 export async function loadCharter(agentId: CharterAgentId): Promise<Charter> {
   const cached = cache.get(agentId);
   if (cached) return cached;
   const filePath = resolveCharterPath(agentId);
+  let text: string;
   try {
-    const text = await fs.readFile(filePath, 'utf8');
-    const parsed = splitFrontmatter(text);
-    const charter: Charter = {
-      agentId,
-      frontmatter: parsed.frontmatter,
-      body: parsed.body,
-      loaded: true,
-      path: filePath,
-    };
-    cache.set(agentId, charter);
-    return charter;
+    text = await fs.readFile(filePath, 'utf8');
   } catch (err) {
     logger.warn({
       msg: 'charter file missing, using placeholder',
@@ -236,27 +262,53 @@ export async function loadCharter(agentId: CharterAgentId): Promise<Charter> {
       message: `Charter file not yet present for ${agentId}; running on minimal stub. (PRD §6.1 — file expected at ${filePath})`,
       ts: new Date().toISOString(),
     });
-    const placeholder = makePlaceholder(agentId, filePath);
+    const placeholder = makePlaceholder(agentId, filePath, 'file_missing');
     cache.set(agentId, placeholder);
     return placeholder;
   }
-}
 
-function splitFrontmatter(text: string): {
-  frontmatter: Record<string, unknown>;
-  body: string;
-} {
-  // Frontmatter fence is `---` on its own line.
-  const m = /^---\s*\r?\n([\s\S]*?)\r?\n---\s*\r?\n([\s\S]*)$/.exec(text);
-  if (!m) {
-    return { frontmatter: {}, body: text };
+  try {
+    const parsed = parseCharterText(text);
+    const charter: Charter = {
+      agentId,
+      frontmatter: parsed.frontmatter,
+      body: parsed.body,
+      loaded: true,
+      path: filePath,
+    };
+    cache.set(agentId, charter);
+    return charter;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    logger.warn({ msg: 'charter frontmatter invalid; charter treated as not loaded', agentId, path: filePath, err: reason });
+    writeEnvelope({
+      type: 'log',
+      level: 'warn',
+      source: 'agent-runtime',
+      message: `Charter frontmatter for ${agentId} is invalid and grants no authority: ${reason} (${filePath})`,
+      ts: new Date().toISOString(),
+    });
+    // Preserve whatever body was readable (after the fence, if any) for
+    // diagnostics, but the charter is NOT loaded: no policy derives from it.
+    const bodyMatch = FENCE.exec(text.startsWith('﻿') ? text.slice(1) : text);
+    const body = bodyMatch?.[2] ?? '';
+    const invalid: Charter = {
+      agentId,
+      frontmatter: { placeholder: true, reason: 'frontmatter_invalid', error: reason },
+      body: body.trim() === '' ? makePlaceholder(agentId, filePath, 'frontmatter_invalid').body : body,
+      loaded: false,
+      path: filePath,
+    };
+    cache.set(agentId, invalid);
+    return invalid;
   }
-  const fmText = m[1] ?? '';
-  const body = m[2] ?? '';
-  return { frontmatter: parseFrontmatter(fmText), body };
 }
 
-function makePlaceholder(agentId: CharterAgentId, filePath: string): Charter {
+function makePlaceholder(
+  agentId: CharterAgentId,
+  filePath: string,
+  reason: 'file_missing' | 'frontmatter_invalid',
+): Charter {
   const niceName = friendlyName(agentId);
   const body = `# ${niceName} — Placeholder Charter
 
@@ -272,7 +324,7 @@ responses concise until your real charter lands.`;
     agentId,
     frontmatter: {
       placeholder: true,
-      reason: 'file_missing',
+      reason,
     },
     body,
     loaded: false,

@@ -2,20 +2,20 @@
 //
 // Writes `{vaultRoot}/40_Daily/YYYY-MM-DD.md` with the canonical daily template.
 // Idempotent: if the file already exists, returns `{ created: false }` and does
-// NOT touch the file (daily notes are append-only per PRD §8.5).
+// NOT touch the file (daily notes are append-only, FR-WIKI-02).
 //
-// Atomic-write pattern: write the body to `<final>.<pid>.<rand>.tmp`, then
-// `fs.rename()` into place. `rename` is atomic on the same filesystem on both
-// NTFS and POSIX. We additionally guard against the create-race by using
-// `O_CREAT | O_EXCL` for a lock sentinel (proper-lockfile equivalent) — only
-// one process can hold the lock at a time, others bail with `created: false`.
-//
-// Phase 3 will swap the in-house atomic + lock for `write-file-atomic` +
-// `proper-lockfile` per PRD §11.2; the public surface here will stay stable.
+// M0 WS-D: the in-house tmp+rename writer and O_EXCL lock sentinel are gone. The
+// note is created through the vault broker (`createNote`), which proves the path
+// is contained in the vault, holds a proper-lockfile lock across the existence
+// check and the atomic replace, and never overwrites an existing note. The daily
+// path is reserved for `daily` notes (N4): the broker refuses other types there,
+// and a note squatting on it (written outside the broker) is an explicit error.
+// Later additions to a daily note go through `VaultBroker.appendNote`.
 
-import { promises as fs, constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import { ulid } from 'ulid';
+
+import { VaultBroker } from './vault-broker.js';
 
 const BOARDS = [
   'engineering',
@@ -60,30 +60,39 @@ function isoForDate(date: Date): string {
   return utc.toISOString();
 }
 
+/** Vault-relative path of the daily note for `date`. */
+export function dailyNoteRelPath(date: Date): string {
+  return `40_Daily/${formatDate(date)}.md`;
+}
+
 export function dailyNotePath(vaultRoot: string, date: Date): string {
   return path.join(vaultRoot, '40_Daily', `${formatDate(date)}.md`);
 }
 
-function renderDailyBody(date: Date, id: string): string {
+function dailyFrontmatter(date: Date, id: string): Record<string, unknown> {
   const ymd = formatDate(date);
   const iso = isoForDate(date);
-  const boardList = BOARDS.map((b) => `- [[board-${b}]]`).join('\n');
-  return `---
-id: ${id}
-title: "Daily — ${ymd}"
-created_at: ${iso}
-updated_at: ${iso}
-type: daily
-status: active
-tags: [daily]
-source: gen://skippy.staff.memory_manager
-authored_by: skippy.staff.memory_manager
-confidence: 1.0
-distilled_from: []
-supersedes: null
-contradicts: []
----
+  return {
+    id,
+    title: `Daily — ${ymd}`,
+    created_at: iso,
+    updated_at: iso,
+    type: 'daily',
+    status: 'active',
+    tags: ['daily'],
+    source: 'gen://skippy.staff.memory_manager',
+    authored_by: 'skippy.staff.memory_manager',
+    confidence: 1.0,
+    distilled_from: [],
+    supersedes: null,
+    contradicts: [],
+  };
+}
 
+function renderDailyBody(date: Date): string {
+  const ymd = formatDate(date);
+  const boardList = BOARDS.map((b) => `- [[board-${b}]]`).join('\n');
+  return `
 # ${ymd}
 
 ## Active boards
@@ -101,115 +110,49 @@ ${boardList}
 }
 
 /**
- * Acquire an exclusive create-lock by opening `<final>.lock` with O_CREAT|O_EXCL.
- * Returns the file handle (caller must close + unlink) or null if another process
- * holds the lock. Stale locks (>30s old) are reclaimed per PRD §8.6 TTL guidance.
+ * A non-daily note (or a note without valid daily frontmatter) is squatting on
+ * the reserved daily path (N4). Reported explicitly instead of `created:false`,
+ * because agents would otherwise append to nothing and the day's log is lost.
  */
-async function acquireLock(finalPath: string): Promise<{ release: () => Promise<void> } | null> {
-  const lockPath = `${finalPath}.lock`;
-  const LOCK_TTL_MS = 30_000;
-
-  // Best-effort stale-lock reclaim.
-  try {
-    const st = await fs.stat(lockPath);
-    if (Date.now() - st.mtimeMs > LOCK_TTL_MS) {
-      await fs.unlink(lockPath).catch(() => {});
-    }
-  } catch {
-    // No existing lock — proceed.
+export class DailyNoteSquattedError extends Error {
+  readonly code = 'VAULT_DAILY_SQUATTED';
+  constructor(
+    readonly notePath: string,
+    readonly foundType: unknown,
+  ) {
+    super(
+      `Daily note path "${notePath}" is occupied by a note of type "${String(foundType ?? 'none')}"; ` +
+        'daily paths are reserved for append-only `daily` notes. Move or rename that note.',
+    );
+    this.name = 'DailyNoteSquattedError';
   }
-
-  let handle;
-  try {
-    // 'wx' = O_CREAT | O_EXCL | O_WRONLY: fails with EEXIST if file exists.
-    handle = await fs.open(lockPath, 'wx');
-    await handle.writeFile(String(process.pid));
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST') return null;
-    throw err;
-  }
-
-  return {
-    release: async () => {
-      try {
-        await handle.close();
-      } catch {
-        /* ignore */
-      }
-      await fs.unlink(lockPath).catch(() => {});
-    },
-  };
-}
-
-/** Atomic write with EPERM retry-with-backoff (Windows). */
-async function atomicWrite(finalPath: string, body: string): Promise<void> {
-  const dir = path.dirname(finalPath);
-  const base = path.basename(finalPath);
-  const tmpPath = path.join(
-    dir,
-    `.${base}.${process.pid}.${Math.random().toString(36).slice(2, 10)}.tmp`,
-  );
-  await fs.writeFile(tmpPath, body, { encoding: 'utf8' });
-  const maxAttempts = 5;
-  let lastErr: unknown;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      await fs.rename(tmpPath, finalPath);
-      return;
-    } catch (err) {
-      lastErr = err;
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') break;
-      // Windows transient lock — back off and retry.
-      await new Promise((r) => setTimeout(r, 50 * 2 ** attempt));
-    }
-  }
-  // Cleanup the orphan tmp.
-  await fs.unlink(tmpPath).catch(() => {});
-  throw lastErr;
 }
 
 /**
  * Generate the daily auto-note for `date` under `{vaultRoot}/40_Daily/`.
- * Idempotent: returns `{ created: false }` if the note already exists.
+ * Idempotent: returns `{ created: false }` if a valid `daily` note already
+ * exists or another writer holds its lock (it is creating the same note).
+ * Throws `DailyNoteSquattedError` if something other than a `daily` note sits
+ * at the path (N4), and propagates containment errors (e.g. a hardlinked note).
  */
 export async function generateDailyNote(
   opts: GenerateDailyNoteOptions,
 ): Promise<GenerateDailyNoteResult> {
   const finalPath = dailyNotePath(opts.vaultRoot, opts.date);
-  const dailyDir = path.dirname(finalPath);
-
-  // Ensure parent exists.
-  await fs.mkdir(dailyDir, { recursive: true });
-
-  // Fast path: file already exists, skip without locking.
-  try {
-    await fs.access(finalPath, fsConstants.F_OK);
-    return { path: finalPath, created: false };
-  } catch {
-    // Doesn't exist — proceed to locked create.
+  const rel = dailyNoteRelPath(opts.date);
+  const broker = new VaultBroker(opts.vaultRoot);
+  const res = await broker.createNote(
+    rel,
+    dailyFrontmatter(opts.date, ulid()),
+    renderDailyBody(opts.date),
+  );
+  if (res.ok) return { path: finalPath, created: true };
+  if (res.reason === 'exists') {
+    const existing = await broker.readNote(rel);
+    const type = existing?.frontmatter['type'];
+    if (type !== 'daily') throw new DailyNoteSquattedError(rel, type);
   }
-
-  const lock = await acquireLock(finalPath);
-  if (!lock) {
-    // Another process holds the lock; assume it's creating the same file.
-    return { path: finalPath, created: false };
-  }
-
-  try {
-    // Re-check inside the lock to handle the lost-race case.
-    try {
-      await fs.access(finalPath, fsConstants.F_OK);
-      return { path: finalPath, created: false };
-    } catch {
-      /* still missing — write it */
-    }
-
-    const body = renderDailyBody(opts.date, ulid());
-    await atomicWrite(finalPath, body);
-    return { path: finalPath, created: true };
-  } finally {
-    await lock.release();
-  }
+  // 'exists' (a genuine daily note) or 'locked': someone already has (or is
+  // creating) today's note.
+  return { path: finalPath, created: false };
 }

@@ -77,6 +77,19 @@ const SKIPPY_RING_RADIUS = 62;
 const PEDESTAL_INNER_RADIUS = 290;
 const PEDESTAL_OUTER_RADIUS = 540;
 
+/** Terminal outcomes (PRD v0.2 FR-RUN-01) that must despawn their walker
+ * rather than let it idle/weld forever (D5, G0: no non-success outcome may
+ * keep animating as if the work were still live). `succeeded` is excluded —
+ * it finishes its walk and idles at the pedestal normally. */
+const TERMINAL_NON_SUCCESS_STATUSES = new Set<string>([
+  'failed',
+  'cancelled',
+  'interrupted',
+  'blocked',
+  'simulated',
+  'unverified',
+]);
+
 function agentStateToGlow(state: AgentState | undefined): HexPadGlow {
   if (!state || state === 'idle' || state === 'completed' || state === 'despawning') return 0;
   if (state === 'error') return 2;
@@ -136,6 +149,11 @@ export default function SceneRoot() {
     let detachTick: (() => void) | null = null;
     let detachWheel: (() => void) | null = null;
     const disposers: (() => void)[] = [];
+    // Declared outside the async IIFE (rather than as a local `const` inside
+    // it) so the effect's cleanup below can despawn any still-live walkers on
+    // unmount instead of only relying on `app.destroy` (D5).
+    const walkerSpecs = new Map<string, TaskAgentSpec>();
+    const walkerByDelegation = new Map<string, string>();
 
     (async () => {
       try {
@@ -262,12 +280,11 @@ export default function SceneRoot() {
       const walkersStage = new Container();
       walkersStage.label = 'walkersStage';
       world.addChild(walkersStage);
-      // Per-walker spec map. Mirrors WALKER_REF_STORE 1:1 but holds the
-      // discrete progress/path state the renderer iterates each frame.
-      const walkerSpecs = new Map<string, TaskAgentSpec>();
-      // Track which delegation ids have already spawned a walker so we don't
-      // double-spawn on a re-emitted envelope.
-      const walkerByDelegation = new Map<string, string>();
+      // `walkerSpecs` (mirrors WALKER_REF_STORE 1:1, holding the discrete
+      // progress/path state the renderer iterates each frame) and
+      // `walkerByDelegation` (which delegation ids have already spawned a
+      // walker, so a re-emitted envelope doesn't double-spawn) are declared
+      // above the async IIFE — see the comment there.
 
       // ── Drag-box overlay (screen-space, NOT inside world) ─────────────────
       // Lives on app.stage so it doesn't scale with the camera.
@@ -461,15 +478,28 @@ export default function SceneRoot() {
       });
       disposers.push(offHotkey);
 
-      // ── Delegation → walker spawn glue ────────────────────────────────────
+      // ── Delegation → walker spawn/despawn glue ─────────────────────────────
       const onDelegationDelta = (
         delegations: Record<string, { delegationId: string; toBoardId: BoardId; status: string }>,
       ): void => {
         if (pedestalLayouts.length === 0) return;
         for (const [id, rec] of Object.entries(delegations)) {
-          // Spawn a walker once the delegation is accepted; skip pending/declined.
-          if (walkerByDelegation.has(id)) continue;
-          if (rec.status !== 'accepted' && rec.status !== 'succeeded') continue;
+          const existingSpecId = walkerByDelegation.get(id);
+          if (existingSpecId && TERMINAL_NON_SUCCESS_STATUSES.has(rec.status)) {
+            // D5: a walker whose delegation ended non-successfully must not
+            // keep animating forever as if the work were still in flight —
+            // despawn it outright. `succeeded` is left alone: it finishes its
+            // walk and idles at the pedestal normally (see walkers.ts).
+            despawnWalker(existingSpecId);
+            walkerSpecs.delete(existingSpecId);
+            walkerByDelegation.delete(id);
+            continue;
+          }
+          // Spawn a walker once the delegation is accepted/running (or truly
+          // succeeded); skip pending/declined and every non-success outcome —
+          // simulated/blocked/failed work must not animate as done (G0).
+          if (existingSpecId) continue;
+          if (rec.status !== 'accepted' && rec.status !== 'running' && rec.status !== 'succeeded') continue;
           const target = pickPedestalForBoard(pedestalLayouts, rec.toBoardId, id);
           if (!target) continue;
           const fromPos = BOARD_CLOCK_POSITIONS[rec.toBoardId];
@@ -578,9 +608,11 @@ export default function SceneRoot() {
       // explicit despawn keeps WALKER_REF_STORE consistent across HMR reloads.
       // (`despawnWalker` is idempotent for unknown ids — safe even if the map
       // is already empty.)
+      for (const specId of walkerSpecs.keys()) despawnWalker(specId);
+      walkerSpecs.clear();
+      walkerByDelegation.clear();
       // We intentionally don't call `useQueueStore` from cleanup; the queue is
       // session-scoped and outlives this Pixi instance.
-      void despawnWalker;
       if (initialized) {
         app.destroy(true, { children: true, texture: true });
       }

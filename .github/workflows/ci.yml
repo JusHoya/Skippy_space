@@ -1,23 +1,50 @@
 name: ci
 on:
-  push: { branches: [main] }
+  # m0/foundation is the trunk for the PRD v0.2 pivot until it is confirmed and merged into main.
+  push: { branches: [main, m0/foundation] }
   pull_request:
+
+# Mocked vs. live tests: every suite run by this workflow is mocked/offline
+# (no network calls to real providers, no live Letta/Obsidian/OTel backends).
+# Live provider qualification tests are opt-in only and are never run in CI —
+# see docs/M0-BASELINE.md "Unrun checks" for what that covers.
+
 jobs:
   ts:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with: { version: 9 }
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm }
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -r typecheck
-      - run: pnpm -r lint
-  rust:
-    runs-on: ubuntu-latest
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm -r test
+      - run: pnpm run --if-present test:scripts
+      - run: pnpm build:runtime
+      - run: pnpm --filter @skippy/ui build
+
+  windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm -r test
+      - run: pnpm run --if-present test:scripts
+      # apps/shell/src-tauri's tauri.conf.json bundles the agent-runtime
+      # sidecar via a resources glob; build it before cargo touches the
+      # shell crate or `cargo check`/`cargo test` fail on a missing glob match.
+      - run: pnpm build:runtime
+      - run: pnpm --filter @skippy/ui build
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/shell/src-tauri
       - run: cargo check --manifest-path apps/shell/src-tauri/Cargo.toml
-        if: false   # disabled until Tauri 2 + native deps install in CI
+      - run: cargo test --manifest-path apps/shell/src-tauri/Cargo.toml

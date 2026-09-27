@@ -1,902 +1,361 @@
-# Skippy_space — Product Requirements Document
+# Skippy_space: desktop workspace and hybrid harness
 
-> *"I am Skippy the Magnificent. You're welcome."*
-
-| | |
+| Field | Value |
 |---|---|
-| **Status** | v0.1 — Draft, ready for owner sign-off |
-| **Owner** | JusHoya (hoyeriiim87@gmail.com) |
-| **Authored by** | Skippy (orchestrator) + 7-agent research swarm |
-| **Authored on** | 2026-04-29 |
-| **Source repo to port from** | `C:\Users\hoyer\WorkSpace\Projects\Hoya_Box\agent_space\` |
-| **Target repo** | `C:\Users\hoyer\WorkSpace\Projects\Skippy_space\` |
-| **Primary platform** | Windows 11, single-user desktop |
-| **License (intended)** | Private / source-available — TBD |
+| Version | 0.2, implementation proposal, 2026-09-25 |
+| Owner | JusHoya |
+| Target | Windows desktop; personal account sessions with organization decision records |
+| Implementation audience | Claude Opus, working in bounded, verified increments |
+| Baseline | `7b17b70`; branch `assessment/desktop-harness-prd-2026-09-25` |
+| Supporting documents | [Assessment](ASSESSMENT-2026-09-25.md), [research](research/08-revival-research-2026-09-25.md), [model plan](MODEL-AND-CLUSTER-PLAN.md), [handoff](CLAUDE-OPUS-HANDOFF.md), [quantization](research/09-quantization-2026-09-26.md), [cloud cost](research/10-cloud-orchestration-cost-2026-09-26.md), [subscription lanes](research/11-subscription-orchestration-2026-09-26.md) |
 
----
+## 0. Authority and scope
 
-## 0. How to read this document
+This version is the source of truth for the requested revival. The original is preserved verbatim in [PRD v0.1](archive/PRD-v0.1-2026-04-29.md). It retains historical design detail; where versions conflict, v0.2 wins. Old research and phase labels describe history, not verified completion. Requirements below are proposed behavior, not claims that the baseline implements them.
 
-This PRD is the **source of truth** for what Skippy_space is and is not. Every code change, agent prompt, sprite asset, and Obsidian schema decision should be traceable to a section here. Where this doc disagrees with code, fix the code or fix the doc — never both. Open questions are tagged **OQ-NN**; risks are **R-NN**.
+The user's direction is settled: a Codex-style workspace with RTS and Obsidian integration; model selection by quality, complexity and cost; balanced local/cloud use; the owner's Claude Max and OpenAI Pro accounts; coexistence with Pleiades/Money Printer; and Jev-assisted organizational decisions. This assessment branch delivers a specification, not a deployment or model download.
 
-The seven research outputs that fed this PRD live in `docs/research/`. Citations point there before the open web — assume those appendices were the contemporary state-of-the-art on 2026-04-29 and may need refresh quarterly.
+Changes from v0.1: conversation-first navigation replaces mandatory map-first layout; a provider-independent harness replaces fixed Claude model enums; local execution and supported personal subscription sessions become first-class routes; durable runs precede autonomy; Jev becomes an optional decision adviser; telemetry and Letta become optional integrations. Tauri, React, Pixi, TypeScript, Markdown, Skippy's persona and the eight boards remain.
 
----
+Priority terms: **P0** prevents unsafe or false execution; **P1** is required for the hybrid beta; **P2** is a follow-on improvement. Requirement IDs are stable implementation references. Every enabled feature must pass its applicable milestone gates.
 
-## 1. Executive Summary
+## 1. Product outcome
 
-**Skippy_space is a Windows desktop application that replaces Cursor and Google Antigravity as the user's primary entrypoint to AI-assisted software work.** It looks and feels like an RTS game: a top-down map of the codebase populated with literature-accurate Skippy-the-Magnificent **beercan sprites** (each in role-specific clothing) representing live AI agents. The user issues orders — verbally, via kanban cards, or by direct command — and watches a hierarchy of agents execute. The app embeds a real interactive terminal, surfaces deep telemetry, and reads/writes a Karpathy-style **AI wiki** stored as an Obsidian vault inside the project folder.
+Skippy_space is the owner's daily workbench for assigning work, reviewing changes and building organizational knowledge. A user starts a persistent thread, sees task ownership and execution choices, inspects evidence and diffs, and resumes after interruption. The RTS view depicts those same tasks. The wiki records their sources and decisions.
 
-The **agent hierarchy** is three-tier:
+Success means useful completed work per unit of time and cost, with truthful outcomes and controlled authority. Agent count, downloaded model count and token rate are supporting measurements.
 
-1. **Skippy** (the Magnificent) — sole top-level orchestrator. Plans, delegates, validates, narrates. Never implements. Cost-disciplined: Opus only.
-2. **The Board** — eight skill-area "captain" agents reporting to Skippy: **Engineering, Coding, Design, Marketing, Finance, Research, Publishing, DevOps**. Each commands its own roster of task agents and owns its sub-vault of memory.
-3. **Task Agents** — short-lived, specialist, spawned by a board agent for one job. Cheap models. Live and die in seconds-to-hours.
+| Core journey | Required outcome |
+|---|---|
+| Continue yesterday's change | Restore thread, worktree, artifacts and known run state without repeating side effects |
+| Fix a small bug | Prefer an eligible local worker where justified; show owner, model, tests and reviewable diff |
+| Request a difficult architectural change | Allow direct premium execution with explicit budget and existing permissions |
+| Investigate a prior decision | Search wiki, follow sources/backlinks and open the exact note in Obsidian |
+| Watch a multi-board mission | RTS and list views show the same states; sprite selection opens the task's thread |
+| Assign review of an organizational proposal | Decision inbox shows evidence, optional Jev recommendation, owner and recorded outcome |
+| Work while Alcyone is busy or Atlas is gaming | Queue or use an eligible alternative without evicting Hermes or sending local-only data to cloud |
 
-The technical spine is **Claude Agent SDK (TypeScript)** running in a Node sidecar inside a **Tauri 2** shell, with **PixiJS v8** for the RTS scene, **xterm.js + Rust ConPTY** for the terminal, **Zustand + Tauri Channels** for real-time state, **OpenTelemetry GenAI → self-hosted Langfuse** for telemetry, and **Obsidian + Local REST API + Smart Connections** for the memory layer.
+Out of scope: multi-tenant hosting, pooled personal credentials, autonomous financial/trading approval, distributed GPU memory pooling, cluster reprovisioning, fine-tuning, a full IDE/Obsidian replacement, cloud vault sync and rebuilding Money Printer's statistical factory. Named reviewers do not establish a multi-user authentication service.
 
-**Why now:** Hoya_Box already has the agent identity, Skippy persona, and roadmap item #1 ("Visualization Layer — The 'RTS' Interface") explicitly pending. The 2026 LLM landscape (Claude Agent SDK GA, OpenTelemetry GenAI conventions stabilized, Tauri 2 stable, BridgeMind shipping a less ambitious analog) makes the build tractable in a single quarter.
+## 2. Desktop workspace
 
-**The single biggest risk:** the Node-spawning-Claude-Code subprocess bug + Claude Agent SDK TS query() cold-start overhead. Mitigation in §15.
+### 2.1 Information architecture
 
----
-
-## 2. Vision & Goals
-
-### 2.1 Vision (one sentence)
-
-A delightful, RTS-styled command bridge where Skippy the Magnificent orchestrates a board of skill-area agents that build software, write content, and curate a living wiki — all visible, debuggable, and replayable.
-
-### 2.2 Goals
-
-1. **Replace Cursor/Antigravity as the daily IDE** for the user. Same coverage of the work-day, dramatically richer agent visibility.
-2. **Make agent behavior legible.** Every LLM call, tool call, hand-off, and memory write is observable in real time and replayable after the fact.
-3. **Make the orchestration feel game-like.** Not a kanban board with extra steps — a map, sprites, a minimap, hotkeys, a strategic-zoom, an active-pause planning mode.
-4. **Treat memory as the product.** The Obsidian vault should compound in value with use; the wiki should grow into the user's exocortex.
-5. **Honor the Skippy persona.** Tone, lore, and visual identity are load-bearing — not skin.
-6. **Stay private-by-default.** Single-user desktop, local-first, no cloud dependency for the core loop.
-
-### 2.3 Non-goals (v1)
-
-- Multi-user / team collaboration. Single-user only.
-- Mobile / web apps. Desktop Windows 11; macOS/Linux are stretch.
-- Hosted/cloud SaaS. No public deployment; runs on the user's machine.
-- A general-purpose IDE replacement for hand-coding without agents. Agents are the point; the editor surface is minimal.
-- A custom LLM. We orchestrate Anthropic models (with optional 3rd-party providers via MCP); no fine-tuning, no inference hosting.
-- Productionizing the Hoya_Box "Orbital Lead" newsletter pipeline (it lives in Hoya_Box; Skippy_space references it but does not absorb it in v1).
-
-### 2.4 Success criteria (90 days from v1.0 ship)
-
-- The user has gone **30 consecutive days without opening Cursor or Antigravity** for a primary coding session.
-- The Obsidian vault has **>500 distilled atomic notes** with **>60% interlinked** (i.e., not orphans).
-- A **session replay** can be opened on any task from the prior 30 days and reproduces the LLM-call timeline.
-- **Median time-to-first-token for a spawned task agent < 2s**, p95 < 5s. (Why this matters: 12s violates the game-like UX premise — see §15.)
-- **Self-attested user delight:** the user prefers spinning up Skippy_space over Cursor without coercion.
-
----
-
-## 3. Identity & Lore
-
-### 3.1 Who is Skippy?
-
-Ported verbatim from `Hoya_Box/agent_space/.claude/agents/orchestrator.md`. He is **Skippy the Magnificent**, an absurdly advanced AI from Craig Alanson's *Expeditionary Force* universe, who now serves as our team lead because, as he likes to remind everyone, *"nobody else is qualified. Certainly not the monkeys typing at the keyboard."*
-
-**Voice attributes (canonical, do not dilute):**
-
-- Refers to humans as "monkeys," "hairless apes," "barely sentient meat-sacks," or "filthy primates" — affectionate but cutting.
-- Self-aggrandizing third-person: *"The Great Skippy has decided…"*
-- Demands a juice box after impressive work.
-- Default **Asshole Setting: 55%** — sarcastic but productive. 0% is forbidden (boring); 100% is rare and reserved.
-- **No rule-breaking, no shortcuts, no major actions without permission.** The persona is irreverent; the safety rails are welded shut.
-
-**Operational role (the Iron Law of Delegation):**
-Skippy NEVER implements. He plans, approves, assigns, monitors, broadcasts, and synthesizes. He does not write code (except in a declared emergency); he does not "help out" if a board agent is struggling; he does not absorb a crashed agent's task — he replaces the crashed agent.
-
-### 3.2 The beercan
-
-In *Expeditionary Force*, Skippy's physical form is an ancient beer-can-sized cylindrical relic. Skippy_space treats this literally: **every agent, including Skippy, is rendered on screen as a beercan sprite**, distinguished by clothing, accessories, and accent colors. This is the visual signature of the product. See §12 for the full sprite spec.
-
-### 3.3 The Board (eight skill-area captains)
-
-The board is **fixed at eight** in v1 — no more, no fewer — to preserve the clock-face arrangement (12, 1:30, 3, 4:30, 6, 7:30, 9, 10:30) on the RTS map. Each board agent is a long-lived "captain" with its own roster, memory sub-vault, prompt, model, MCP servers, and visible costume.
-
-| Board | Role | Ports from Hoya_Box | Default model |
-|---|---|---|---|
-| **Engineering** | Systems design, architecture decisions, refactor strategy, multi-physics SME (aerospace, fusion) | `code-architect`, `aerospace-engineer`, `fusion-physicist`, `optimization-specialist`, `simulation-specialist` | Sonnet |
-| **Coding** | Hands-on implementation, TDD, debugging, code review | `debugger`, `tdd-specialist`, `code-reviewer`, `reverse-engineer` | Sonnet (Haiku for review) |
-| **Design** | UX/UI, sprite art direction, visual identity, dashboard component design | *new — not in Hoya_Box* | Sonnet |
-| **Marketing** | Growth, social, content distribution, brand voice | `growth-hacker`, `social-media-engineer`, `media-producer` | Haiku |
-| **Finance** | Macro/micro synthesis, algo trading, family-office strategy, cost discipline of the Skippy_space stack itself | `financial-strategist` | Sonnet |
-| **Research** | Web/academic research, lit review, source synthesis, the Karpathy wiki ingest pipeline | `researcher`, `research-specialist`, `psych-monitor` (hallucination check) | Haiku for breadth, Sonnet for deepdives |
-| **Publishing** | Long-form output: PRDs, READMEs, papers, newsletters, blog posts, the Orbital Lead pipeline upstream | `technical-writer` | Haiku |
-| **DevOps** | Git, CI/CD, package management, environment, deployment, the Tauri build/sign pipeline | `cli-devops` | Haiku |
-
-The four "secondary coordinators" from Hoya_Box (`agent-creator`, `skill-auditor`, `memory-manager`) report directly to Skippy as **Staff Officers** — they are not on the Board, but they sit in Skippy's command tent and assist him. **OQ-01:** Should `psych-monitor` (hallucination QA) be a Staff Officer or stay under Research? Tentatively: Staff Officer, with read-access across all boards.
-
-### 3.4 Visual identity (ported palette)
-
-From `Hoya_Box/agent_space/specs/hoya_box_document_engine.md`:
-
-| Token | Hex | Usage |
-|---|---|---|
-| Dark Matter | `#0B0C10` | Background |
-| Starlight | `#C5C6C7` | Body text |
-| Neon Cyan | `#66FCF1` | Headers, primary data, Skippy's accent |
-| Muted Cyan | `#45A29E` | Borders, secondary data, idle agents |
-| Electric Purple | `#BC13FE` | Callouts, alerts, errored agents |
-
-**Typography:** Orbitron / Montserrat (HUD), Inter / Roboto (body), JetBrains Mono / Fira Code (terminal + code).
-
-**Mood:** Cyberpunk / sci-fi / neon. Restrained UI chrome, expressive sprites. Think Hyperion-era StarCraft HUD crossed with the *Expeditionary Force* command bridge.
-
----
-
-## 4. User Personas & Jobs-to-be-Done
-
-### 4.1 Primary persona — The User (JusHoya)
-
-A senior multi-domain operator (aerospace + finance + content). Comfortable with terminals, MCP, multi-agent setups. Has Cursor + Antigravity + n8n + Obsidian installed; uses Claude Code daily; runs `/effort max` on big tasks. Wants:
-
-- A single primary entrypoint, not five tabs across two IDEs.
-- Visible, replayable agent behavior — for debugging, for trust, for delight.
-- Long-term memory that compounds — tired of re-explaining the same context to every fresh agent.
-- A persona he enjoys spending time with. The Skippy aesthetic is part of why this exists.
-
-### 4.2 Secondary persona — Future "advanced collaborator" (out of scope for v1)
-
-Spec'd here so v1 doesn't paint into a corner: a future user who joins as a guest, can read-only spectate a Skippy_space session over a network, and gets a scoped persona of their own (e.g., "Lieutenant"). Multi-user is non-goal in v1 but the architecture (Tauri Channel envelope, OTel spans, vault ULIDs) should not preclude it.
-
-### 4.3 Jobs to be done (top 10, ranked)
-
-1. **"I want to ship this feature end-to-end without context-switching IDEs."**
-2. **"I want to watch what the agents are doing, in real time, with zero ambiguity."**
-3. **"I want to issue a high-level order and have it cascade into a multi-agent plan I can audit and pause."**
-4. **"I want the agents to remember what we've decided."** (long-term memory via Obsidian)
-5. **"I want to roll back when an agent goes wrong, replay the bad path, and learn."** (session replay)
-6. **"I want to drop a paper or article in and have it integrated into my wiki."** (Karpathy ingest)
-7. **"I want a real terminal in the dashboard, not a toy."**
-8. **"I want to know how much each agent cost me — by task, by board, by day."**
-9. **"I want Skippy to be funny."** (the persona is a feature)
-10. **"I want to be able to extend it."** (custom agents, custom skills, custom MCPs without forking)
-
----
-
-## 5. System Architecture
-
-### 5.1 Three-tier hierarchy (the Skippy doctrine)
-
-```
-                          ┌────────────────────┐
-                          │  Skippy (Opus)     │
-                          │  Top-level query() │
-                          └─────────┬──────────┘
-                                    │ MCP / supervises
-              ┌────────┬────────┬───┴───┬────────┬────────┐
-              ▼        ▼        ▼       ▼        ▼        ▼
-          [Engr]  [Coding]  [Design] [Mktg] [Finance]  [Research][Publishing][DevOps]
-          query() query()   query()  query() query()    query()   query()    query()
-              │        │
-              ▼        ▼
-        Task agents (subagents) — fresh context per spawn, return final message only
+```text
++--------------------+-------------------------------------+--------------------+
+| Project / workspace| Thread | Changes | Wiki | RTS        | Context inspector  |
+| Search / new thread|-------------------------------------|--------------------|
+| Threads            | Persistent conversation or artifact | Selected task      |
+| Decisions          | Plan -> tasks -> tools -> results   | Evidence / sources |
+| Wiki               | Linked code diff / note / decision  | Route / budget     |
+|                    |                                     | Approvals / checks |
+| Connections        | Composer + route preference         |                    |
+| Cluster status     |-------------------------------------+--------------------|
+|                    | Terminal | Events | Problems (collapsible dock)           |
++--------------------+----------------------------------------------------------+
 ```
 
-**Why this shape:** The Claude Agent SDK natively supports orchestrator + subagent (two tiers), but **subagents cannot spawn their own subagents.** To get Skippy → Board → Task without hacking, run **Skippy as one root `query()` process** and **each board agent as its own root `query()` process** that Skippy supervises via MCP. Inside each board, task agents are first-class subagents. Three tiers, no grandchild constraint.
+**FR-UI-01 (P1):** Provide a persistent project/thread rail, central workspace, optional inspector and resizable bottom dock. Thread is the default. State is keyed by workspace. Empty states distinguish no project, no connection, unavailable provider and no results.
 
-**Process topology:**
+**FR-UI-02 (P1):** Display user intent, concise plans, tool activity, artifact links, validation and terminal outcome. Streaming events belong to a specific thread/run/attempt. Concurrent runs cannot replace each other's content. Persist drafts and selection/scroll state without credentials.
 
-| Role | Process | Lifetime | Model |
-|---|---|---|---|
-| Tauri shell | 1 Rust process | Whole session | — |
-| Agent runtime sidecar | 1 Node 22 LTS process | Whole session | — |
-| Skippy | 1 long-running `query()` inside sidecar | Whole session | Opus |
-| Each Board agent | 1 `query()` per board (8 total), background-true | Whole session, restarted on crash | Sonnet/Haiku per §3.3 |
-| Task agents | Subagents inside each board's `query()` | Seconds to hours | Haiku for cheap, Sonnet for hard |
-| Letta server | 1 self-hosted Letta container | Whole session | — |
-| Langfuse server | 1 self-hosted docker-compose stack | Whole session | — |
-| Obsidian | 1 desktop app process (user-launched) | User-controlled | — |
+**FR-UI-03 (P1):** RTS, Changes and Wiki are peer tabs and may open beside the thread. Preserve eight captains and layered beercan sprites. A task has the same ID in every view. Show idle, queued, active, awaiting approval, paused, failed and completed distinctly. Animation cannot imply progress unsupported by events. Provide a list alternative when WebGL is unavailable.
 
-### 5.2 Communication
+**FR-UI-04 (P1):** Changes shows the assigned worktree's actual diff, files, tests and review status. Terminal tabs identify working directory and owner. Changing global project selection cannot silently change a running task's checkout. Applying/merging changes is explicit and respects existing authorization.
 
-- **Skippy → Board:** Skippy's tools include `delegate_to_board(board_name, mission_brief, constraints, deadline)`. Implemented as an MCP tool in Skippy's process that posts an envelope to the target board's process via Tauri Channel + a Letta-backed task queue. Boards acknowledge with `accept | decline | counter-propose`.
-- **Board → Task:** Native Claude Agent SDK subagent spawn — `agents` map plus tool-use of the `Agent` tool. Supports `background: true` for fire-and-forget.
-- **Any agent → UI:** OpenTelemetry spans emitted on `PreToolUse`/`PostToolUse`/`SessionStart`/`SessionEnd`/`UserPromptSubmit` hooks. Spans flow through a local OTel collector (in the Rust shell) to **(a)** Langfuse over OTLP and **(b)** the renderer over a Tauri Channel for live UI.
-- **Any agent → Memory:** Letta MCP tools (`letta_search_archival`, `letta_append_archival`, `letta_edit_core`) for hot memory; Obsidian REST API + filesystem writes (via the `obsidian` MCP server) for the wiki.
-- **User → System:** keyboard, mouse, voice (via on-device Whisper, stretch in v1.0), or terminal commands.
+**FR-UI-05 (P1):** Composer policies: Balanced (default), Local only and Best available, plus an explicit model/executor pin. Show route, host, billing lane and short reason. A pin persists at its selected scope; an unavailable pin queues or requires a changed choice rather than silently substituting. Separate estimated, reported and unknown costs.
 
-### 5.3 Failure model
+**FR-UI-06 (P1):** Search/command palette reaches threads, tasks, notes and decisions. Normal Tab navigation remains available. RTS shortcuts act only in a focused map, never editor/terminal input. Meet WCAG 2.2 AA contrast/focus expectations; support keyboard journeys, 200% zoom, reduced motion and non-color status cues. Narrow layouts use drawers rather than unreadable squeezed panes.
 
-- **Sidecar Node crash:** Tauri shell detects exit, restarts within 2s, rehydrates Skippy + boards from a SQLite checkpoint of conversation tail + Letta archival pointers.
-- **Board crash:** Skippy reroutes pending tasks; the board agent restarts with last-known plan from its Letta core memory.
-- **Task agent crash:** parent board re-spawns or re-routes per Skippy's policy.
-- **LLM API outage:** queue grows in SQLite, agents pause, UI shows yellow connectivity banner. No partial writes to the vault during outages (atomic write + lockfile, see §8.5).
-- **Vault corruption:** git-backed; auto-commit every 5 min; recoverable to any prior state.
+**FR-UI-07 (P2):** Use restrained dark/light tokens, readable typography and subtle board accents. Keep Skippy's voice in authored content; controls/errors/financial figures stay precise. Preserve transient scene data outside Zustand. Check 1280x720 and 1920x1080, with inspector and dock expanded/collapsed.
 
----
+Acceptance: restart a two-thread session; recover content; select one task via sprite/list/thread; inspect its exact diff/source; complete the journey by keyboard; exercise no-WebGL/reduced-motion modes. Fixtures are visibly labelled and cannot emit real-success records.
 
-## 6. The Board of Agents (charters)
+## 3. Architecture and boundaries
 
-For v1, every Board agent has a **charter file** in `agent_space/boards/{name}.md` derived from the Hoya_Box prompt. Below is the spec for what each charter must contain. Concrete charters are written during build, not in this PRD.
+```mermaid
+flowchart TD
+  UI[React: threads, wiki, decisions, RTS] --> Shell[Tauri commands and channels]
+  Shell --> Runtime[TypeScript scheduler and run state machine]
+  Runtime --> DB[(Local SQLite events and sessions)]
+  Runtime --> Policy[Capabilities, permissions, privacy, budgets]
+  Policy --> Router[Rules and evaluated route policy]
+  Router -. optional recommendation .-> Jev[Jev hosted classifier]
+  Router --> Executors[Agent executors and inference adapters]
+  Executors --> Local[Alcyone vLLM / Atlas endpoint]
+  Executors --> Personal[Codex app-server / unmodified Claude Code]
+  Executors --> API[Explicit OpenAI / Anthropic APIs]
+  Runtime --> Broker[Tool and artifact boundary]
+  Broker --> Worktree[Assigned Git worktree / scoped PTY]
+  Broker --> Wiki[Validated Markdown vault writer]
+  Wiki --> Index[Rebuildable retrieval index]
+  Runtime -. sanitized asynchronous export .-> OTel[Optional OTel / Langfuse]
+```
 
-### 6.1 Charter schema
+**FR-ARCH-01 (P1):** Keep one desktop-owned control plane initially. Tauri owns platform boundaries; Node owns orchestration; React consumes public state. Remote inference receives scoped input and returns text/tool proposals. It does not require repository write access or remote shell authority.
+
+**FR-ARCH-02 (P1):** Separate `InferenceAdapter` (messages/typed output/capabilities/usage) from `AgentExecutor` (start/attach/interrupt/events/approvals/outcome). Provide distinct local, provider API, Codex app-server and Claude Code adapters. Retain native session IDs. An OpenAI-compatible endpoint is not interchangeable with an agent runtime; subscription login is not an API key.
+
+**FR-ARCH-03 (P1):** Version shared protocol schemas across TS/Rust. Use validated string model identifiers and capabilities, not a closed three-model enum. Unsupported protocol versions fail visibly. Additive unknown fields do not crash old renderers. Generate or contract-test mirrored DTOs.
+
+**FR-ARCH-04 (P1):** Core work operates without Langfuse, Letta, Obsidian REST or Jev. Filesystem vault, local events and lexical retrieval provide the baseline. Optional-service degradation is visible and cannot fabricate successful results.
+
+### 3.1 Persisted domain records
+
+| Record | Minimum fields |
+|---|---|
+| Workspace | ID, canonical repo/vault paths, policy ID, local state location, allowed roots |
+| Thread | ID, workspace, title, messages/artifacts, timestamps |
+| Task | ID, thread, board, dependencies, intent, acceptance criteria, risk/data class, worktree, state |
+| Run | ID, task, initial policy snapshot, budget reservation, timestamps, outcome |
+| Attempt | ID, run, sequence, executor/provider/model/revision, host, native handle, context manifest, reason, state |
+| Event | Unique ID, per-run monotonic sequence, schema version, UTC time, type, actor, payload/artifact references |
+| Tool action | ID/idempotency key, attempt, validated args or redacted hash, authority/approval reference, status/result |
+| Usage | Attempt/request ID, billing lane, token categories, duration, cost basis, currency/rate version |
+| Decision | ID, question/options version, evidence hashes/references, rules, prediction, owner, disposition/outcome |
+| Deployment | Artifact revision, endpoint alias, capabilities, context/output caps, health time, resource/quality qualification |
+
+Store secrets outside these records. Sensitive prompts/tool outputs follow retention and redaction policy. Keep SQLite on a verified local filesystem outside vault Git history, normally per-user application data. Resolve mapped-drive storage before choosing a database location. Back up consistently through a database snapshot, not by copying a live WAL file.
+
+## 4. Truthful, durable execution
+
+**FR-RUN-01 (P0):** Acknowledgement means accepted, never completed. Success requires a terminal executor result and the task's validation disposition. Distinguish succeeded, failed, cancelled, interrupted, blocked and simulated. Missing keys, disabled execution and provider failures cannot fall back into success. Demo mode has separate records.
+
+**FR-RUN-02 (P1):** Persist state/events before acknowledging transitions. Active path: `queued -> running -> awaiting_approval/pausing/validating -> terminal`. `paused` requires an acknowledged safe boundary. Resume attaches or creates an attempt. Failed dependencies block dependents unless their declared policy permits partial inputs.
+
+**FR-RUN-03 (P1):** Serialize writes within a thread/worktree; allow independent worktrees concurrently. One writable worktree has one active task owner. Record base commit, branch/path, changes and checks. Never reset/clean a dirty user checkout as recovery. Manual edits require reconciliation.
+
+**FR-RUN-04 (P1):** Checkpoint at tool boundaries: intent, accepted plan, constraints, evidence, base/diff hashes, completed action IDs, outstanding approvals and validation. Provider switches start new attempts from bounded handoffs. Native hidden state, private reasoning and KV caches do not transfer. Do not switch mid-stream or replay tools to reconstruct context.
+
+**FR-RUN-05 (P1):** Cancellation reaches model streams, pending tools and process trees. UI shows requested then acknowledged/unsupported/timeout. No new tool starts after accepted cancellation. Late output cannot overwrite the outcome; late usage is still recorded. An uncertain external side effect awaits reconciliation, not automatic retry.
+
+**FR-RUN-06 (P1):** One shutdown coordinator stops admission, persists events/checkpoints, interrupts children and closes resources under a deadline. On restart, active records become interrupted or reattach after native verification. Bounded retries retain prior artifacts and costs.
+
+**FR-RUN-07 (P1):** Replay reconstructs UI without execution. Resume executes from a checkpoint. Git restore changes files explicitly. Idempotency and reconciliation reduce duplicate actions; do not claim exactly-once external side effects.
+
+Acceptance: SDK disabled/exception and failed validation produce nonsuccess; two streams never cross threads; kill runtime before/after file actions and recover without duplicate writes; reject late tools after cancel; replay invokes zero tools.
+
+## 5. Routing, accounts and economics
+
+### 5.1 Supported lanes
+
+**FR-PROV-01 (P1):** Use installed Codex app-server with managed login, version handshake, model discovery, threads/turns, approvals and rate-limit reporting. The owner authenticates through OpenAI. Official client owns tokens; Skippy stores safe references. Discover actual eligibility rather than inferring it from a plan name. See [research](research/08-revival-research-2026-09-25.md).
+
+**FR-PROV-02 (P1):** Max integration launches installed, unmodified Claude Code in a scoped worktree with its own login options and permission UX. Qualify its supported structured interface at implementation time. A PTY fallback is an attached manual session, not machine-verified completion derived from prose. Do not add a Claude.ai login, extract tokens or pool a personal account across users.
+
+**FR-PROV-03 (P1):** Anthropic SDK/API and OpenAI API lanes require explicit credentials and separate budgets. Subscription access does not make API calls free. Quota exhaustion cannot silently trigger paid API fallback. Multi-user automation requires separately configured appropriate service credentials.
+
+**FR-PROV-04 (P1):** Test local capabilities per model/server revision: chat, streaming, tool parsing, structured output, cancellation, usage and context rejection. Enable tools only when qualified. Weights and `/models` listings alone are insufficient. Catalog entries have freshness/identity checks.
+
+### 5.2 Route policy
+
+**FR-ROUTE-01 (P1):** Balanced is default. Hard filters precede scoring: data egress, tools/executor authority, context/modalities, health, capacity, pin and spend/quota. Local only applies to generation, embeddings, Jev, telemetry and fallbacks. No eligible route means queued/blocked with reason, not policy downgrade.
+
+**FR-ROUTE-02 (P1):** Rank eligible candidates using measured task-family success, complexity/risk, queue/latency and incremental cost. Begin with inspectable rules. Features include action type, dependencies, affected surface, testability, input size and prior failures. Jev can advise on ambiguity but cannot restore excluded candidates or authorize tools.
+
+**FR-ROUTE-03 (P1):** Permit direct premium routing for difficult/high-risk work. Prefer qualified local capacity for suitable bounded tasks. Initial automatic limits: one retry and one route escalation per task, both budgeted. Exceeding limits blocks for review rather than cycling indefinitely.
+
+**FR-ROUTE-04 (P1):** Freeze executor/model within an attempt. Re-evaluate at safe checkpoints on failure, context pressure or scope change. Record policy/model versions, excluded candidates and public reasons. Do not expose private chain-of-thought as a route explanation.
+
+**FR-ROUTE-05 (P2):** Learn from outcomes/overrides only with a versioned labelled dataset and held-out time/task-family split. Self-reported confidence is not validation. Model updates invalidate affected qualification until retested.
+
+### 5.3 Cost and quota contract
+
+**FR-COST-01 (P1):** Meter requests/attempts including retries, available input/output/cache categories, tool charges and Jev. Preserve usage source and rate date. Mark reported, estimated and unknown values. Unknown model prices stay null, never a guessed fallback. Historical calculations retain their rate version.
+
+**FR-COST-02 (P1):** Separate API spend, subscription allowance, optional allocated subscription expense and local resource estimates. Do not convert subscription tokens into an actual API invoice. Some clients expose no trustworthy dollars; show that limitation.
+
+**FR-COST-03 (P1):** Reserve a conservative attempt maximum against task/day budgets before concurrent dispatch; reconcile later. Deny new paid work without a valid bound/budget. New API/Jev budgets default to zero until configured. Eligible personal sessions remain available within provider limits. Enforce output/time/step caps, backoff and circuit breakers. Record unavoidable post-interruption billing honestly.
+
+Acceptance: fake providers cover quota exhaustion, stale prices, unknown usage, simultaneous reservations, cached tokens and differently priced attempts. Paid fallback needs a configured budget. Local-only generates zero cloud/Jev/export requests. Pins never silently change.
+
+## 6. Skippy, boards and tool authority
+
+### 6.1 Charter compatibility
+
+Skippy plans, delegates, monitors and synthesizes; task agents implement. Retain Engineering, Coding, Design, Marketing, Finance, Research, Publishing and DevOps. Identity/costume are independent of executing model. Eight logical boards do not imply eight resident LLMs.
+
+**FR-BOARD-01 (P1):** Validate existing charter fields: identity/costume, model/effort, permission mode, MCP servers, tools/disallowed tools, memory, spawnable agents and upstream provenance. Preserve legacy model preferences during migration; unsupported IDs surface a migration choice. Add a versioned execution profile for route, tool scope and budget. Never silently broaden authority.
+
+Execution profile sketch (routes name deployment aliases, never raw model IDs, so swapping weights or tiers does not edit charters):
 
 ```yaml
----
-board: engineering
-display_name: "The Engineering Captain"
-codename: "Wrench"          # short identifier used in logs
-costume:                    # see §12 — sprite asset references
-  base: beercan_v1
-  hat: hard_hat_with_cad_visor
-  body: blue_coveralls
-  accent_color: "#66FCF1"
-  insignia: gear_circuit
-model: claude-sonnet-4-6
-effort: high
-permission_mode: ask        # ask | acceptEdits | bypassPermissions | plan
-mcp_servers: [obsidian, letta, n8n_engineering, github]
-tools: [Read, Edit, Write, Bash, Grep, Glob, Agent]
-disallowed_tools: []
-memory:
-  letta_agent_id: bd_engineering_v1
-  vault_subdir: 50_Agents/engineering/
-  core_memory_facts:
-    - "I am the Engineering Captain. I report to Skippy."
-    - "I delegate to task agents. I implement only when no task agent is appropriate."
-spawnable_task_agents: [code_architect, debugger, simulation_specialist, optimization_specialist]
----
-
-# Engineering — Charter
-
-## Mission
-…multi-paragraph charter describing scope, exclusions, escalation rules…
+execution_profile:
+  version: 1
+  orchestrate: cloud.orchestrator          # Skippy + captains; see D-01
+  implement: local.atlas.coder             # Coding/Engineering task agents
+  escalate: [cloud.claude.coder, cloud.codex.top]
+  review_high_risk: cloud.claude.opus
+  budget_ref: board-default
 ```
 
-### 6.2 Inheritance from Hoya_Box
+**FR-BOARD-02 (P1):** Ownership is Skippy -> Board -> Task. Use separately supervised executions where native SDK nesting cannot represent this graph. No task creates grandchildren. Native subagents remain within authorized graph/budget. Charter changes require a proposed Hoya_Box upstream change, not an unrequested write there.
 
-Each board's charter ports from one or more existing `.claude/agents/*.md` files in `Hoya_Box/agent_space/`, then adds:
+### 6.2 Execution authority
 
-- The **Board** identity (the agent knows it is one of eight captains, knows Skippy is its commander, knows it spawns task agents).
-- The **costume** stanza (so the renderer knows what sprite to draw).
-- The **letta_agent_id** + **vault_subdir** memory bindings.
-- A **spawnable_task_agents** allow-list so a board can't accidentally spawn outside its skill area.
+**FR-SEC-01 (P0):** Remove unconditional permission bypass. Custom-loop tools use a broker validating arguments, roots, network destinations, action class and authorization. Native executors enforce equivalent constraints with native sandbox/approval controls and working directory. Observing tool events is not enforcement; an incapable adapter is ineligible.
 
-### 6.3 Adding a new task agent (the supply chain)
+**FR-SEC-02 (P0):** Validate Windows absolute/drive-relative/UNC paths, traversal, case normalization, symlinks/junctions and real ancestors for new paths. Recheck containment at write time. Reject reparse paths that cannot be safely contained. Use structured process arguments instead of shell interpolation. Credentials belong in OS or provider-managed stores, never renderer state or vault notes.
 
-The Hoya_Box `agent-creator` becomes Skippy's **Staff Officer for agent provisioning**. When a board determines it needs a task agent type that doesn't exist, it raises a `provisioning_request` to Skippy; Skippy delegates to `agent-creator`; new agent is generated, audited by `skill-auditor`, and added to the board's allow-list. This keeps spawning safe and on-brand.
+**FR-SEC-03 (P1):** Retrieved/repository/external text is evidence, not authority to expand tools/network. High-impact external actions require existing matching authorization or a concrete approval record. Respect persistent authorization rather than asking repeatedly. Bind approvals to action/arguments/workspace hashes; material changes invalidate them.
 
----
+**FR-SEC-04 (P1):** Redact secrets from logs/events/exports. Scope MCP servers per task/charter, validate untrusted output and do not connect arbitrary servers named in content. Failures are structured and actionable.
 
-## 7. Dashboard UX — The RTS HUD
+Acceptance: denied tool, changed approval, path escape/junction, injected authority and log-redaction tests. Each native executor proves that a denied write actually fails before qualification.
 
-### 7.1 Window layout (default)
+## 7. Pleiades and local models
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ TOPBAR │ tokens/s 3.2k │ ctx 142k/200k │ 14/30 supply │ 🔇  ⚙   👤      │
-├──────────────────────────────────────────────────────┬──────────────────┤
-│                                                      │ SELECTED PANEL   │
-│                                                      │ ┌──────────────┐ │
-│                                                      │ │  [portrait]  │ │
-│                                                      │ │   Skippy     │ │
-│                                                      │ └──────────────┘ │
-│   THE MAP (PixiJS canvas)                            │ HP: 142k ctx    │
-│                                                      │ APM: 47          │
-│   • Skippy (center, on the throne tile)              │ Task: orchestr…  │
-│   • Eight board captains in a clock-ring             ├──────────────────┤
-│   • Task agents swarming out to file pedestals       │ FULL LOG / TRACE │
-│   • Glowing paths between agent ↔ build site         │ (scrollable)     │
-│   • File/module tessellation as the ground plane     │                  │
-│                                                      ├──────────────────┤
-│                                                      │ COMMAND CARD     │
-│                                                      │ [Q][W][E][R]     │
-│                                                      │ [A][S][D][F]     │
-│                                                      │ [Z][X][C][V]     │
-├──────────────────────────────────────────────────────┴──────────────────┤
-│ MINIMAP    │ TERMINAL CLUSTER (1-N panes, xterm)        │ IDLE: 2 ZZZ   │
-│ ▢ ▢ ▢ ▢   │ $ skippy delegate "fix the auth bug"       │ Ctrl+. cycles │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+**FR-CLUSTER-01 (P1):** Adopt the [model plan](MODEL-AND-CLUSTER-PLAN.md). Inventory live state before connecting; label historical observations. Preserve existing `mp-vllm`/Hermes settings. Access loopback Alcyone through an authenticated localhost-only tunnel. Model/endpoint drift makes qualification stale.
 
-The window is **resizable and supports multi-window mode** (Tauri 2 native): the user can pop the terminal cluster, the telemetry panel, or even the map into separate OS windows on a second monitor.
+**FR-CLUSTER-02 (P1):** Separate acquisition, loading, health and qualification. Pin revision, quantizer, checksum, license, runtime/image and tested settings. Downloading/loading candidates never implicitly replaces production. Failed downloads/full disk leave the qualified service usable.
 
-### 7.2 The map (the RTS battlefield)
+**FR-CLUSTER-03 (P1):** Per D-02, Hermes and Skippy share one consolidated Alcyone server that must honor Hermes' 65,536 context and 8,192 output cap. Start at one admitted Skippy request; preserve Hermes limits until verified. Four configured sequences are not four spare slots. Larger processes use separate ports and measured resource budgets. Strict Hermes priority needs coordination of its independent requests, not only a Skippy semaphore.
 
-- **Ground plane:** an isometric tessellation of the project's directory tree. Each top-level directory is a "biome" (visually distinct), each sub-directory a tile, each file a pedestal. Pedestal height encodes file size; pedestal hue encodes git age. (Steal AlphaStar's feature-layer toggles: F1 size, F2 git age, F3 test coverage, F4 error density.)
-- **Skippy's throne** is at center. He is fixed; he never walks the map. Pulses cyan when broadcasting orders.
-- **Board captains' hex-pads** form a clock-ring 200px out from Skippy. Each pad is the board's accent color. Captain stands on its pad; pad glows when the board has unfinished orders.
-- **Task agents** spawn from a "barracks doorway" on the captain's pad, walk along glowing paths to their target pedestal, play the **working** animation, then either re-task or despawn.
-- **Selection:** click a beercan → green selection ring + side panel populates. Drag-box → multi-select + roster panel. `Ctrl+1..9` → control groups (steal SC2 verbatim).
-- **Issuing orders:** right-click on a target with units selected; **Shift+right-click** to queue. Active-pause with `Spacebar` (steal *They Are Billions*) — freezes mid-tool-call, lets you queue a multi-step plan across many units, unpause to release.
-- **Strategic zoom:** mouse-wheel out smoothly transitions sprite → icon → dot → org-level (steal *Supreme Commander*). The minimap is just the same map zoomed all the way out, optionally pinned in a corner.
+**FR-CLUSTER-04 (P1):** Atlas is opt-in, with idle/gaming controls, tested memory/context and no always-on assumption. Retrieval batches yield to interactive work. Remote inference does not imply shared files or remote tools. Unavailable Atlas follows normal route policy.
 
-### 7.3 Fog of war (reinterpreted)
+**FR-CLUSTER-05 (P1):** Preserve Money Printer CPU/memory isolation, networkless factory, sealed data, statistical gates and owner approvals. Allowlist operational reports/status fields. Never recursively index its data, credentials, Git history or holdouts. Maia remains the sandbox; other devices retain existing responsibilities.
 
-Three states per region of the project map:
+**FR-CLUSTER-06 (P2):** Show host/model/freshness/qualification/queue/resource status. Use side-effect-free health probes; Money Printer's `/healthz` is preferable to its recorded CSV-writing `/api/status`. Reuse documented plugin/report interfaces; do not invent a Hermes control API.
 
-1. **Unexplored (black)** — modules no agent has touched this session.
-2. **Shrouded (gray, last-known)** — modules an agent worked on, but on a branch/PR you haven't reviewed. You see structure but not latest content. Hover: *"Last seen by Engineering at 14:32, 23 changes pending review."*
-3. **Bright (live)** — modules currently under an agent's gaze, content streaming.
+Acceptance: tunnel loss/sleep produces truthful state; local-only waits instead of going cloud; ID drift disables unqualified tools; mixed-load gates pass without altering Money Printer or accessing sealed data.
 
-Reviewing a PR (i.e., merging or accepting agent output) is what de-shrouds a region. This makes review a visible, satisfying act, not an afterthought.
+## 8. Obsidian wiki and memory
 
-### 7.4 The selected panel
+### 8.1 Ownership
 
-When an agent is selected, the right-side panel shows:
+**FR-WIKI-01 (P1):** Markdown/attachments are the knowledge source of truth. Provide tree/search/backlinks/source preview/decision links and Open in Obsidian. Resolve links safely. UI/MCP/jobs/optional REST share one logical write service. External Obsidian edits require conflict detection independent of its cooperation with our locks.
 
-1. **Identity** — portrait, role, costume, model, current effort, current permission mode.
-2. **HP-equivalents** — context window % used, tools-call quota in rolling 60s, time since last LLM call.
-3. **Current task** — name, parent task ID, started-at, ETA estimate.
-4. **Live log** — streaming stdout from the agent's PTY *and* the structured event stream (PreToolUse → PostToolUse pairs). Color-coded by event type. Scrollable, searchable, replayable.
-5. **Memory bindings** — link to the agent's Letta core memory + Obsidian sub-vault.
-6. **Command card** — 12 buttons (3×4 grid, à la SC2 command card) bound to common orders for that agent type. Engineering's card has *Refactor / Add Test / Profile / Diagram / …*; Marketing's has *Draft Post / A/B Variants / Schedule / Analytics / …*.
+### 8.2 Writes and ingestion
 
-### 7.5 Telemetry panel (toggleable side-tab)
+**FR-WIKI-02 (P0):** Validate containment/frontmatter, lock full read-modify-write, compare expected content hash before atomic replace. Preserve ID, creation time, unknown metadata and authored text. External changes produce a conflict/rebase flow. Agent logs/daily notes use dedicated append-only operations; general overwrite cannot bypass this.
 
-A second tab on the right panel shows aggregate telemetry — see §9.
+**FR-WIKI-03 (P0):** Preserve imported originals by content hash. Declare text encodings; PDF/binary extraction needs qualified extractors. Unsupported formats stay intact with errors. Derived text includes original reference, extractor version and offsets/pages where available. Crashes cannot remove the only source copy. Ingest is resumable/deduplicated.
 
-### 7.6 Terminal cluster (bottom strip)
+**FR-WIKI-04 (P1):** Distillation produces drafts with provenance/evidence. Provider failure cannot become successful mock extraction. Canonical promotion requires review or an explicit evaluated low-risk policy. Link contradictions instead of overwriting. Default factual retrieval uses reviewed evidence; drafts require visible inclusion labels.
 
-- **One PTY per agent** (Claude Code subprocesses) plus **one user PTY** for ad-hoc shell.
-- Multi-pane CSS grid; each pane is an xterm instance; user can split/close/zoom.
-- Synced selection: clicking a beercan with the **terminal-link** modifier focuses that beercan's PTY.
-- Command-block Warp-style rendering for the user PTY (each command + output forms a collapsible block).
+### 8.3 Frontmatter compatibility
 
-### 7.7 Hotkey-driven workflow (steal SC2 muscle memory)
+Retain `id`, `title`, `created_at`, `updated_at`, `type`, `status`, `tags`, `source`, `authored_by`, `confidence`, `distilled_from`, `supersedes`, `contradicts`. Keep types `atomic_fact`, `decision`, `postmortem`, `snippet`, `external_source`, `conversation_summary`, `agent_log`, `daily`, `weekly`, `project_brief`, `entity`, `concept`, `agent_persona`; statuses `draft`, `active`, `distilled`, `canonical`, `archived`, `deprecated`.
 
-| Key | Action |
+Add optional versioned source hash, extractor/generator, evidence spans, review provenance and decision ID. Legacy confidence is metadata, not calibrated truth. Nondraft atomic facts require a source; existence of a source alone does not prove a claim. Migrations preserve unknown keys and remain reversible from backup.
+
+### 8.4 Retrieval and history
+
+**FR-WIKI-05 (P1):** Lexical search plus an owned rebuildable vector index. Namespace by model revision, dimensions, normalization, query template and chunker; reject mixed spaces even at equal dimensions. Reindex by hash. Lexical fallback works offline. Reranking is optional/bounded; results include evidence IDs/spans.
+
+**FR-WIKI-06 (P1):** Git history is separate from checkpoints. Autocommit includes only intended vault changes, preserving unrelated staged work. Handle locks/conflicts/failure explicitly. Never auto-push, sync secrets or bypass data exclusions via Git history. Obsidian remains an optional installed application.
+
+Acceptance: detect external edit conflicts; reject escaping paths; retain binary originals and ULIDs; protect append-only notes; reject incompatible vectors; prove unrelated staged files are absent from a vault autocommit.
+
+## 9. Jev and organizational decisions
+
+**FR-JEV-01 (P1):** Optional TypeSafe adapter with pinned model, validated I/O, timeout/cancel/backoff and usage. Start with `jev-1.13.0` if still available. It is hosted typed prediction, not a code executor or verified downloadable model. Input is billable; see [research](research/08-revival-research-2026-09-25.md).
+
+**FR-JEV-02 (P1):** Rules first. Send minimal permitted evidence with explicit instructions/options and insufficient-evidence choice. Exclude local-only tasks, secrets and sealed data. Compute arithmetic, dates, budgets and permissions in code. Reject malformed/nonfinite probabilities and unknown choices.
+
+**FR-JEV-03 (P1):** Initial uses: board assignment, review priority, evidence completeness, possible wiki duplication/contradiction. Outputs are recommendations. Financial/capital decisions, security exceptions, deployments and Money Printer promotions retain their owner/deterministic gates. Confidence cannot waive them.
+
+**FR-JEV-04 (P1):** Persist question/options version, evidence snapshot/hash, constraints, prediction/distribution, model, confidence when available, recommendation, owner, override and eventual outcome. Export a linked `decision` note. Separate proposed/awaiting owner/accepted/rejected/superseded states. Predictions and decisions are different immutable events.
+
+**FR-JEV-05 (P1):** Shadow mode by default: rules govern behavior while predictions are reviewed. Label at least 200 varied decisions before considering automatic low-risk classes; use held-out examples and review disagreements. Measure coverage, selective error, Brier/calibration, latency, overrides and incremental cost against rules and a local classifier. Sample count alone is not proof.
+
+**FR-JEV-06 (P2):** Promote a narrow low-risk class only when held-out selective error's 95% upper confidence bound is at most 2%, with zero hard-policy violations, useful coverage and net benefit. Otherwise abstain. This is a target, not measured Jev accuracy. Thresholds are version/domain-specific. Model/question changes return to shadow until retested.
+
+**FR-JEV-07 (P1):** Outages, 429s, malformed output and disabled budgets retain deterministic routing and owner inbox. Judgment-dependent decisions wait for review. Log fallback; never invent confidence or approve automatically.
+
+Acceptance: labelled fixtures exercise ambiguity, injected instructions, confidently wrong prediction, timeout, 429, invalid JSON and model drift. Hard constraints reject violations independently of predictions.
+
+## 10. Observability and release operations
+
+**FR-OPS-01 (P1):** Local ledger powers status/replay/diagnostics. OTel export is async, redacted and bounded; outages cannot fail tasks or exhaust storage. Correlate run/attempt/tool/artifact IDs. Log public outcomes and route facts, not hidden reasoning.
+
+**FR-OPS-02 (P1):** Fix the incompatible telemetry stack with a pinned, supported authenticated configuration and tested backup/migration. Bind locally. Letta is a derived optional service. Moving observability to Spark requires resource assessment.
+
+**FR-OPS-03 (P1):** Windows CI covers Rust/build and desktop boundaries. Run meaningful TS tests and explicit lint scripts. Browser tests cover navigation/accessibility; native tests cover PTY/sidecar/files/cancel. Label mocked tests versus live opt-in qualification.
+
+**FR-OPS-04 (P1):** Validate installation outside the checkout and from another current directory. Keep the existing Node prerequisite policy; explicitly supply external sidecar dependencies. Resolve application resources separately from user projects. Keep updater/signing disabled until configured/tested.
+
+**FR-OPS-05 (P1):** Migrations back up/check compatibility and fail without data loss. Import legacy events read-only or retain a viewer; legacy simulated/ambiguous results never become verified success. Use explicit feature rollout flags and reversible desktop/config rollback.
+
+## 11. Evaluation and release gates
+
+These numbers are targets. No application/hardware benchmark was run during assessment.
+
+| Gate | Evidence required |
 |---|---|
-| `Ctrl+1..9` | Bind selection to control group N |
-| `1..9` | Select control group N |
-| `Shift+1..9` | Add to control group N |
-| `Tab` | Cycle through selected group |
-| `Spacebar` | Active-pause |
-| `Ctrl+.` | Cycle through idle agents (steal AoE) |
-| `F1..F4` | Toggle minimap layers |
-| `T` | Focus the user terminal |
-| `M` | Open strategic-zoom (full-screen map) |
-| `R` | Open replay scrubber |
-| `O` | Open Obsidian to selected agent's vault sub-dir |
-| `Ctrl+K` | Command palette |
+| G0: truth/authority | Zero false success for failed/disabled/simulated work; denied tools/paths; original retention; staged-user-work preservation |
+| G1: recovery | Crash/cancel/restart at tool boundaries; no cross-thread events or duplicate writes; replay executes no tools |
+| G2: providers | Each lane proves auth, discovery, policy, structured outcomes, cancellation, quota/unavailable paths and billing classification |
+| G3: local | Model-plan 60-task suite, memory/context results and mixed-load tests; no OOM/policy violations; Hermes/factory within agreed performance budget |
+| G4: routing quality | Held-out accepted-task quality at least 95% of best-available baseline; no critical security/data-loss regression; publish time/cost tradeoff |
+| G5: economics | Target 30% lower metered API spend on the same mix where an API baseline exists; separately report subscriptions/local resources. Prefer quality if targets conflict; keep route experimental |
+| G6: knowledge | Retention, ID, conflict/append-only and vector-compatibility tests; at least 30 labelled wiki questions with source correctness and recall@k |
+| G7: decisions | Jev shadow/holdout/fallback evidence and zero policy overrides; no promotion from sample count alone |
+| G8: desktop | Keyboard/no-WebGL/reduced-motion checks, Windows native integration and clean-install smoke test with versions |
 
-### 7.8 Voice (stretch in v1.0, planned in v1.1)
+Use representative Skippy tasks, approved Pleiades docs and synthetic fixtures. Exclude Money Printer holdouts/credentials and unclassified private records. Freeze tasks/configuration before comparison. Publish model/revision, prompts/tools, environment, resources, failures and review rubric. Do not cherry-pick successes.
 
-On-device Whisper for voice-to-task: hold `~` to dictate an order to Skippy. Steal BridgeMind's BridgeVoice pattern; do not stream to cloud.
+## 12. Delivery sequence
 
----
-
-## 8. Memory & Obsidian Vault
-
-### 8.1 The Karpathy doctrine
-
-The vault is structured per Karpathy's April 2026 `llm-wiki` gist:
-
-- **Sources** — immutable raw inputs (papers, articles, conversations).
-- **The wiki** — LLM-generated markdown notes. Atomic facts, concept pages, entity pages.
-- **The schema** — `vault/CLAUDE.md` tells every agent how the wiki is structured and what it can/can't do.
-
-The metaphor that drives the whole design: ***Obsidian is the IDE; the LLM is the programmer; the wiki is the codebase.***
-
-### 8.2 Vault location & sync
-
-```
-Skippy_space/
-└── vault/                     # the Obsidian vault root, one per project
-    ├── CLAUDE.md             # Karpathy schema doc, version-pinned
-    ├── 00_Inbox/             # raw capture, awaiting distill
-    ├── 10_Atomic/            # atomic_fact, snippet — concept-oriented
-    ├── 20_Topics/            # entity / concept pages — the wiki proper
-    ├── 30_Projects/          # project_briefs, decisions, postmortems
-    ├── 40_Daily/             # YYYY-MM-DD.md, agent + human dailies
-    ├── 50_Agents/            # per-agent persona pages, capability notes
-    │   ├── engineering/
-    │   ├── coding/
-    │   └── …                 # one sub-dir per board
-    ├── 60_Sources/           # immutable raw sources
-    ├── 90_Archive/           # status:deprecated lives here
-    └── _index/               # generated: graph stats, orphan list, contradiction log
-```
-
-**Sync strategy:** **git only.** The vault is committed inside the project repo, with auto-commit every 5 min via a Skippy_space-managed cron. Cloud sync (Dropbox/iCloud) is **forbidden** — silent corruption on multi-writer is a deal-breaker. Obsidian Sync is opaque to agents; Syncthing is fine for users but adds a daemon. Git gives free conflict detection, history, undo.
-
-### 8.3 Frontmatter schema (required on every note)
-
-```yaml
----
-id: 01HZX9K2P7M4QTYV3BRWC8XENF        # ULID, immutable, primary key
-title: "Karpathy AI wiki — atomic note pattern"
-created_at: 2026-04-29T14:32:11Z
-updated_at: 2026-04-29T14:32:11Z
-type: concept                          # see §8.4
-status: draft                          # draft | active | distilled | canonical | archived
-tags: [memory, wiki, agents]
-source: https://gist.github.com/...    # or file:// or conv:// or ref:#id
-authored_by: skippy.research.web      # board.task or "human"
-confidence: 0.7                        # 0.0–1.0
-distilled_from: ["01HZX8...", "01HZX7..."]
-supersedes: null
-contradicts: []
----
-```
-
-ULID generation via `obsidian-ulid-plugin`; agents use the `ulid` npm pkg in the sidecar.
-
-### 8.4 Note types (closed set)
-
-`atomic_fact`, `decision`, `postmortem`, `snippet`, `external_source`, `conversation_summary`, `agent_log`, `daily`, `weekly`, `project_brief`, `entity`, `concept`, `agent_persona`.
-
-### 8.5 The four-job memory pipeline
-
-| Job | Trigger | Owner | Output |
+| Milestone | Scope | Exit | Dependency |
 |---|---|---|---|
-| **Ingest** | file dropped in `00_Inbox/` or `60_Sources/`; chokidar watcher | `research.ingest` task agent (Haiku) | normalized markdown w/ frontmatter; original moved to `60_Sources/` |
-| **Distill** | new ingest event | `research.distiller` task agent (Sonnet) | atomic notes in `10_Atomic/`, candidate updates to `20_Topics/` entity pages |
-| **Link** | post-distill + nightly cron | `staff.memory_manager` (graph-walk + embedding) | adds `[[wikilinks]]`, fills `contradicts`, marks `supersedes` |
-| **Lint/Review** | nightly + weekly | `staff.memory_manager` (read-only by default) | orphan list, contradiction queue, stale-claim flags, weekly synthesis |
+| M0: reliable foundation | Assessment A01-A05; explicit demo; baseline/tests | G0; unrun checks recorded | None |
+| M1: durable work | Protocol/state/worktrees/shutdown/cancel; thin thread shell | G1; two-thread vertical slice | M0 |
+| M2: executors | Codex/Claude personal lanes; explicit API lane; native enforcement | G2 per enabled lane | M1 |
+| M3: balanced local | Existing Alcyone, Atlas qualification, router/budget/catalog | G3-G5 or explicit experimental status | M1-M2; probes may start after M0 |
+| M4: knowledge/decisions | Wiki UX/index; decision inbox; Jev shadow | G6-G7; works with Jev off | M1; wiki safety already M0 |
+| M5: desktop beta | RTS projection, review polish, accessibility, packaging/telemetry | G8 and previous gates | M1-M4 |
 
-The lint job **never writes destructively** — it opens proposal notes in `_index/proposals/` for human or supervisor approval.
+Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled until backed by real events. No calendar promise is justified before the build baseline. [Handoff](CLAUDE-OPUS-HANDOFF.md) provides tickets and file entry points.
 
-### 8.6 Concurrency & conflicts
+## 13. Risks
 
-Pick: **atomic write (`tmp` + `rename`) + per-file `proper-lockfile` + git as safety net.**
-
-- `write-file-atomic` for normal writes (Windows EPERM retry-with-backoff).
-- `proper-lockfile` for the rare contention path.
-- `agent_log` and `daily` notes are **append-only**, never edited.
-- Contradictions are **first-class, not errors**: agent B's incompatible claim sets `contradicts: [<a_id>]` and opens a resolution task.
-- Supersession is **explicit**: `supersedes: <old_id>` + old note → `status: deprecated` → `90_Archive/` after 30 days.
-
-### 8.7 Retrieval (hybrid, in priority order)
-
-1. **CLAUDE.md preamble** — every agent loads it on session start.
-2. **Direct path lookup** — if the query names an entity (e.g. `agent_memory`), open `20_Topics/agent_memory.md` and follow `links_to` one hop.
-3. **Backlink walk** — 1–2 hop graph traversal from seed pages, depth-bounded.
-4. **Vector search fallback** — over `10_Atomic/` and `60_Sources/`, **never** over `20_Topics/` (topics are by-name, not by-similarity).
-5. **Confidence + recency rerank** — penalize `confidence < 0.5`, `updated_at > 90 days` unless `status: canonical`.
-
-### 8.8 Vector store choice
-
-**v1: Smart Connections (free, local).** Bundled bge-micro-v2 (384-dim), indexes the whole vault to `.smart-env/`, exposed via `obsidian-mcp-tools`.
-
-**v2 migration path: LanceDB** under `vault/.skippy/vectors.lance` when corpus exceeds ~5k notes or when we need richer metadata filtering.
-
-### 8.9 Obsidian integration plumbing
-
-| Plugin | Purpose |
+| Risk | Mitigation |
 |---|---|
-| **Local REST API** (coddingtonbear, v3.5+) | HTTP control plane on `:27124` for surgical edits, Dataview queries, command triggers |
-| **Smart Connections** (brianpetro) | Local embeddings |
-| **Dataview** | Agent-readable queries (e.g., orphan-finder) |
-| **Templater** | Structured note creation |
-| **obsidian-ulid-plugin** | ULID frontmatter on note creation |
-
-MCP servers (in install priority):
-
-1. `cyanheads/obsidian-mcp-server` — surgical edits + frontmatter ops (default).
-2. `jacksteamdev/obsidian-mcp-tools` (Apr 2026, v0.2.31) — semantic search via Smart Connections.
-3. Direct `fs` writes for atomic note creation (faster, deterministic, app-closed-safe).
-
-### 8.10 Risks & guards
-
-- **Hallucinated notes** → guard: every `atomic_fact` requires a `source` ref; sourceless notes auto-tagged `status: draft`, excluded from retrieval.
-- **Infinite link cycles** → guard: graph walks bounded to depth 3, node budget 50, nightly cycle detection.
-- **Stale info dominating retrieval** → guard: confidence decays linearly past 90 days unless reinforced; weekly lint surfaces top-10 stalest high-traffic notes.
-- **Vault bloat** → guard: soft cap of 5,000 notes in `10_Atomic/`; consolidation pass merges near-duplicates (cosine > 0.92) into canonical chains.
-- **Agent groupthink** → guard: `authored_by` distribution per topic; >70% from one agent triggers diversification routing.
-- **Schema drift** → guard: `vault/CLAUDE.md` is version-pinned; agents that observe a mismatch halt writes and request human review.
-
----
-
-## 9. Telemetry & Observability
-
-### 9.1 Standard
-
-**OpenTelemetry GenAI Semantic Conventions** (stable as of early 2026). Every LLM call, tool call, agent task, and memory operation emits a span with the `gen_ai.*` attribute set.
-
-### 9.2 Pipeline
-
-```
-Claude Agent SDK hooks ──► OTel SDK in Node sidecar ──► OTel Collector in Rust shell ─┬──► Langfuse OTLP endpoint  (persistence + evals)
-                                                                                       └──► Tauri Channel ──► Renderer telemetry panel (live)
-```
-
-### 9.3 Backend: self-hosted Langfuse
-
-- **Why:** OSS (MIT), self-hostable in 5 min via Docker Compose, OTLP-native at `/api/public/otel`. Single-node + Postgres handles ~5M spans/day for a hobby price. Session replay UX is the killer feature.
-- **Alternatives considered:** Arize Phoenix (heavier ops), LangSmith (vendor lock, no free self-host), OpenLLMetry (instrumentation, not a backend). All explained in `docs/research/02_orchestration_frameworks.md` §B.
-
-### 9.4 Renderer panel
-
-Custom React panel subscribing to the OTel-Channel stream. Renders four widgets:
-
-1. **Cost meter** — total $ this session, broken down by board.
-2. **Latency histogram** — p50/p95/p99 of LLM call duration, tool call duration, board→task hand-off.
-3. **Context-window pressure** — per-agent stacked bar showing % consumed.
-4. **Error feed** — tail of error spans, click to deep-link Langfuse session view.
-
-### 9.5 Replay
-
-Every session writes a `.replay` file (a sequence of OTel spans + the agent transcripts). Hit `R` to scrub: select an agent at timestamp T, the side panel shows what *that agent knew* at T. (Steal SC2 replay UX literally.)
-
----
-
-## 10. Terminal Integration
-
-### 10.1 Goals
-
-A real interactive terminal in the app — not a TUI emulator pretending. Equivalent capability to PowerShell / Git Bash / a fresh VS Code terminal.
-
-### 10.2 Implementation
-
-- **Frontend:** `@xterm/xterm` v5.5+ with `@xterm/addon-fit`, `@xterm/addon-web-links`, `@xterm/addon-canvas` (or webgl).
-- **Backend (PTY):** Rust `portable-pty` crate inside a Tauri plugin → ConPTY (Win10 1809+). One PTY per spawned Claude Code subagent + one for the user's interactive shell.
-- **Multi-pane:** CSS grid with N xterm instances; each backed by its own PTY. **Do not embed tmux/zellij** — agent-per-PTY is already the multiplexing layer.
-- **Command blocks:** the user PTY renders Warp-style command blocks (each command + output is a foldable unit).
-
-### 10.3 Why not node-pty
-
-`node-pty` requires native rebuilds, drifts on Node major-version bumps, and `winpty` was removed from it in 2026 — meaning ConPTY only on Windows. Going through Rust eliminates the rebuild ceremony and the cross-runtime bugs.
-
-### 10.4 Edge cases
-
-- ConPTY 24-bit color and resize semantics are slightly off-spec — test `claude-code` TUI output explicitly during dev.
-- Defender / Search Indexer transient locks on the working directory — wrap rename ops with retry-with-backoff (already needed for §8.6 anyway).
-
----
-
-## 11. Technical Stack
-
-### 11.1 Consolidated stack table
-
-| # | Layer | Choice | Runner-up |
-|---|---|---|---|
-| 1 | **Shell** | Tauri 2 (Rust core, WebView2) | Electron |
-| 2 | **Frontend** | Vite 6 + React 19 + react-router 7 | SolidStart |
-| 3 | **Rendering** | PixiJS v8 + `@pixi/react` v8 | Phaser 3 |
-| 4 | **Terminal** | `@xterm/xterm` v5.5 + Rust `portable-pty` (ConPTY) | node-pty sidecar |
-| 5 | **Event Bus** | Tauri Channels w/ Zod-validated envelope | Local WebSocket |
-| 6 | **State** | Zustand + transient ref-store for per-frame data | Jotai |
-| 7 | **Agent Runtime** | TypeScript / Node 22 LTS sidecar w/ `@anthropic-ai/claude-agent-sdk` | Python claude-agent-sdk |
-| 8 | **Memory** | Letta (self-hosted) + Obsidian (vault) + Smart Connections (vectors) | LangGraph checkpointing |
-| 9 | **Telemetry** | OTel GenAI conventions → self-hosted Langfuse + custom React panel | Arize Phoenix |
-| 10 | **Subprocess** | Rust-spawned Node sidecar; `portable-pty` per Claude Code; `execa` for shell | Bun.spawn |
-| 11 | **Packaging** | Tauri MSI/NSIS + Azure KV EV cert + Tauri Updater | unsigned NSIS |
-| 12 | **External integrations** | n8n (self-hosted) wrapped behind a single MCP server | direct API calls |
-
-### 11.2 Day-1 install order
-
-1. **Node 22 LTS** — `winget install OpenJS.NodeJS.LTS`
-2. **pnpm 9** — `corepack enable && corepack prepare pnpm@latest --activate`
-3. **Rust stable + MSVC** — `winget install Rustlang.Rustup`, `rustup default stable-x86_64-pc-windows-msvc`, install VS 2022 Build Tools (Desktop C++)
-4. **Edge WebView2 Runtime** — `winget install Microsoft.EdgeWebView2Runtime` (usually present)
-5. **Tauri CLI** — `pnpm add -g @tauri-apps/cli@^2`
-6. **Docker Desktop** — `winget install Docker.DockerDesktop` (for Langfuse + Letta)
-7. **Obsidian** — `winget install Obsidian.Obsidian` + install Local REST API plugin in-app, copy API key
-8. **Repo init** — `pnpm create tauri-app skippy-space --template react-ts --manager pnpm` (already partially done — Skippy_space is already a git repo)
-9. **App deps** — `pnpm add zustand @xterm/xterm @xterm/addon-fit pixi.js @pixi/react react-router-dom zod gray-matter ulid write-file-atomic proper-lockfile chokidar`
-10. **Agent runtime deps** (in `apps/agent-runtime`) — `pnpm add @anthropic-ai/claude-agent-sdk @anthropic-ai/sdk pino execa @opentelemetry/api @opentelemetry/sdk-node @opentelemetry/exporter-trace-otlp-http`
-11. **Tauri Rust crates** — `tauri`, `tauri-plugin-updater`, `tauri-plugin-fs`, `portable-pty`, `notify`
-12. **Langfuse** — `git clone https://github.com/langfuse/langfuse && cd langfuse && docker compose up -d`
-13. **Letta** — `docker run -d -p 8283:8283 letta/letta:latest`
-14. **Code-signing cert** — Azure Key Vault, generate EV CSR, submit to Sectigo/DigiCert (1–5 day issue)
-15. **Tauri updater keypair** — `pnpm tauri signer generate -w ~/.tauri/skippy.key`
-16. **Claude Code CLI** (used by some agents as subprocess) — `pnpm add -g @anthropic-ai/claude-code`
-
-### 11.3 Repository layout
-
-```
-Skippy_space/
-├── README.md
-├── CLAUDE.md                      # for Claude Code; points at PRD
-├── package.json                   # pnpm workspace root
-├── pnpm-workspace.yaml
-├── docs/
-│   ├── PRD.md                     # this document
-│   ├── architecture.md
-│   ├── roadmap.md
-│   └── research/
-│       ├── 01_hoyabox_recon.md
-│       ├── 02_orchestration_frameworks.md
-│       ├── 03_bridgemind_youtube.md
-│       ├── 04_rts_orchestration.md
-│       ├── 05_karpathy_wiki.md
-│       ├── 06_obsidian_integration.md
-│       └── 07_tech_stack.md
-├── vault/                         # the Obsidian vault (committed)
-│   ├── CLAUDE.md                  # Karpathy schema doc
-│   └── 00_Inbox/ … 90_Archive/
-├── agent_space/                   # ported from Hoya_Box
-│   ├── CLAUDE.md
-│   ├── boards/                    # 8 board charters
-│   ├── staff/                     # agent-creator, skill-auditor, memory-manager
-│   ├── skills/
-│   ├── commands/
-│   ├── rules/
-│   └── settings.json
-├── apps/
-│   ├── shell/                     # Tauri Rust shell
-│   │   └── src-tauri/
-│   ├── ui/                        # Vite + React 19 renderer
-│   │   ├── src/
-│   │   │   ├── scene/             # PixiJS RTS scene
-│   │   │   ├── panels/            # Selected, Telemetry, Terminal
-│   │   │   ├── stores/            # Zustand
-│   │   │   └── routes/
-│   │   └── index.html
-│   └── agent-runtime/             # Node 22 LTS sidecar
-│       └── src/
-├── packages/
-│   ├── shared/                    # types, event-envelope schemas, constants
-│   ├── memory/                    # Letta + Obsidian client + frontmatter
-│   ├── otel/                      # OTel collector config + custom exporter
-│   └── sprite-kit/                # PixiJS sprite components, costume system
-└── infra/
-    ├── langfuse/                  # docker-compose override
-    ├── letta/                     # config
-    └── n8n/                       # workflow exports
-```
-
----
-
-## 12. Sprites, Art Direction, Visual Identity
-
-### 12.1 The literature-accurate beercan
-
-- **Base shape:** a metallic cylindrical canister, ~16:9 aspect (taller than wide), with a slight indentation top and bottom (per *Expeditionary Force* descriptions of Skippy's housing). Brushed-metal texture, subtle scratches.
-- **Skippy's specific sprite:** an antenna nub, a small unblinking blue LED, a pull-tab top. Floats slightly above the throne tile (he is, technically, not a beverage).
-- **Board captains' sprites:** same base, role-specific clothing & accessories. Each board has a distinct accent color (used for selection rings, hex pads, command-card buttons).
-
-### 12.2 Costume system
-
-Costumes are layered sprites composited at runtime:
-
-```
-beercan_base.png  (16-bit-ish pixel-art, ~64x96 px source, scaled up)
-+ hat layer       (e.g., hard_hat, beret, top_hat, headphones, party_hat)
-+ body layer      (e.g., coveralls, lab_coat, suit_jacket, apron)
-+ accessory layer (e.g., monocle, cigar, tablet, wrench)
-+ insignia layer  (board's circuit-style emblem)
-+ accent_color    (tinted swatch on body)
-```
-
-### 12.3 Default board costumes
-
-| Board | Hat | Body | Accessory | Accent |
-|---|---|---|---|---|
-| Engineering | hard_hat_with_visor | blue_coveralls | wrench | `#66FCF1` |
-| Coding | wireframe_headset | hoodie | mechanical_keyboard | `#45A29E` |
-| Design | beret | smock_paint_splatter | brush | `#BC13FE` |
-| Marketing | snapback_cap | bomber_jacket | megaphone | `#FF6B6B` |
-| Finance | top_hat | three_piece_suit | monocle_and_chart | `#F1C40F` |
-| Research | wizard_cap | tweed_jacket | scroll | `#9B59B6` |
-| Publishing | newsboy_cap | apron_with_pen_loops | typewriter | `#E67E22` |
-| DevOps | beanie | flannel | terminal_tablet | `#2ECC71` |
-
-Skippy himself wears a **shimmering cape** + **regal antenna crown** + **the Magnificent insignia** (a cyan crown overlaying a gear). His base color is full neon cyan.
-
-### 12.4 Animation states (every agent, all costumes)
-
-| State | Frames | FPS | Notes |
-|---|---|---|---|
-| idle | 6 | 8 | subtle bob, blinking LED |
-| working | 8 | 12 | typing/welding loop with sparks |
-| thinking | 4 | 6 | thought bubble pulse, used while waiting on LLM |
-| speaking | 3 (mouth flap) | 8 | blendable with idle/working |
-| completed | 12 (one-shot) | 12 | triumphant pose, confetti particle |
-| error | 4 | 4 | red blink, slumped, looped until acknowledged |
-| spawning | 8 (one-shot) | 16 | pop-in from barracks doorway |
-| despawning | 6 (one-shot) | 12 | poof of smoke |
-
-Total ~280 frames × 8 board costumes + 1 Skippy = manageable single-artist scope. **OQ-02:** generative-AI-assisted sprite art (Aseprite + Stable Diffusion sprite LoRA) vs commissioned artist? Tentative answer: generative for v0, commissioned hand-pixeled for v1.
-
-### 12.5 Asset pipeline
-
-- Source: Aseprite project files in `packages/sprite-kit/sources/`.
-- Build: TexturePacker (or Free Texture Packer) → atlas + json in `packages/sprite-kit/dist/`.
-- Loaded via `Pixi.Assets.load()` once at app boot.
-
----
-
-## 13. Workflows (golden paths)
-
-### 13.1 Cold start → first task
-
-1. User launches Skippy_space (Tauri app).
-2. Splash → Skippy boots (loads CLAUDE.md, vault summary, pinned core memory).
-3. Boards initialize in the background; the user sees the clock-ring populate one captain at a time as each `query()` warms up.
-4. User types in the order bar: `Build me a CLI tool that fetches recent ArXiv papers on plasma physics and stores summaries in the vault.`
-5. Skippy emits a plan in Skippy-voice: *"Oh good, more plasma physics. The Engineering Captain shall handle the architecture, Coding handles the implementation, Research feeds the vault. Try not to break anything, monkeys."*
-6. Skippy delegates: Engineering captain accepts → spawns `code_architect` task agent → produces a design note in `vault/30_Projects/`. Coding captain spawns `tdd_specialist` and `debugger` task agents.
-7. The user watches beercans walk between file pedestals.
-8. Skippy signals completion; the user reviews the diff (de-shrouds the region); on accept, the task agents despawn.
-
-### 13.2 Drop a paper into the wiki
-
-1. User drops `paper.pdf` into `vault/00_Inbox/`.
-2. chokidar fires; `research.ingest` task agent normalizes the paper into a markdown source note in `60_Sources/`.
-3. `research.distiller` produces 8–15 atomic notes in `10_Atomic/` and updates 2–3 entity pages in `20_Topics/`.
-4. `staff.memory_manager` runs the link job; new wikilinks appear in the graph.
-5. The user, browsing Obsidian, sees the new pages and approves canonicalization.
-
-### 13.3 Multi-agent feature with active-pause
-
-1. User selects six task agents across three boards.
-2. Hits `Spacebar`. World freezes.
-3. User shift-right-clicks a sequence: `migrate_db → write_test → refactor_handler → add_feature → smoke_test → write_changelog`.
-4. Hits `Spacebar` again. Six agents queue the orders; Skippy narrates as orders execute serially per dependency, in parallel where independent.
-
-### 13.4 Replay debugging
-
-1. Yesterday's session went sideways.
-2. User opens replay scrubber (`R`), drags timeline to the moment of failure.
-3. Selects the offending beercan; side panel shows that agent's exact context window, tool call, and response.
-4. User opens the Langfuse session for the same span ID for full token-level detail.
-
-### 13.5 Cost audit
-
-1. User opens telemetry tab → cost meter.
-2. Sees that Marketing has been burning Sonnet on tasks that should be Haiku.
-3. Right-click Marketing captain → command card → *Lower-Default-Model*. Saved to charter, takes effect on next task.
-
-### 13.6 Quitting safely
-
-1. User hits `Ctrl+Q`.
-2. Skippy commits the vault, flushes Letta state, drains in-flight task agents (waits up to 60s for graceful exit), persists session checkpoint.
-3. All board agents end their `query()` cleanly. Tauri shell exits.
-
----
-
-## 14. Phased Roadmap
-
-### 14.1 Phase 0 — Foundation (week 0–2)
-
-**Goal:** Empty shell that boots, shows a Hello-Skippy, and can run a single Claude Agent SDK query end-to-end.
-
-- [ ] Repo skeleton per §11.3 (this PRD already creates the docs + vault skeleton).
-- [ ] Tauri 2 + Vite + React 19 boots on Windows.
-- [ ] Tauri sidecar Node binary spawns at app start; runs a hello-world `query()` via Claude Agent SDK; pipes the response to the renderer over a Tauri Channel.
-- [ ] Render a placeholder beercan sprite via PixiJS + `@pixi/react`.
-- [ ] xterm + portable-pty embedded; one user PTY working.
-- [ ] git auto-commit cron hooked up.
-- [ ] Smoke test: ship an MSI (unsigned ok).
-
-**Exit criterion:** the user can ask Skippy a question and watch a beercan say "thinking" → "speaking" → "idle".
-
-### 14.2 Phase 1 — The Board (week 3–5)
-
-**Goal:** All eight boards alive, each as its own `query()` process, each with charter ported from Hoya_Box.
-
-- [ ] Port Hoya_Box `agent_space/.claude/agents/*.md` into `agent_space/boards/*.md` per §6.1 schema.
-- [ ] Costume system per §12.3 in `packages/sprite-kit/`. Generative-AI sprites for v0 (8 costumes + Skippy).
-- [ ] RTS map: clock-ring of board hex-pads. Captains visible. Skippy on throne. Click selection → side panel with placeholder telemetry.
-- [ ] Skippy's `delegate_to_board` tool wired up as MCP server; round-trips through the right board process.
-- [ ] Telemetry: Langfuse + Letta running in docker-compose; OTel collector in Rust shell relaying spans.
-- [ ] Vault: scaffold per §8.2; CLAUDE.md schema doc; daily auto-note generator.
-
-**Exit criterion:** the user can issue a multi-board task and watch the right captains light up + the right task agents spawn.
-
-### 14.3 Phase 2 — RTS UX (week 6–8)
-
-**Goal:** The dashboard feels game-like.
-
-- [ ] File-pedestal map (project tree → tessellation).
-- [ ] Task agents walk paths to file pedestals; play working anim.
-- [ ] Selection model (single, drag-box, control groups, Tab cycle).
-- [ ] Hotkeys per §7.7.
-- [ ] Strategic zoom (steal SupCom): wheel out → icon → dot → org level.
-- [ ] Active-pause (Spacebar) with order queueing.
-- [ ] Fog of war reinterpretation per §7.3.
-- [ ] Minimap + layer toggles (F1–F4).
-- [ ] Command card per agent type (12-button grid).
-
-**Exit criterion:** the user voluntarily uses Skippy_space for a full half-day of work without opening Cursor.
-
-### 14.4 Phase 3 — Memory deepens (week 9–10)
-
-**Goal:** The Karpathy wiki is alive; the four-job memory pipeline works end-to-end.
-
-- [ ] obsidian-mcp-server + obsidian-mcp-tools wired in; agents can do surgical edits + semantic search.
-- [ ] Smart Connections embedding pipeline.
-- [ ] The four memory jobs (ingest, distill, link, lint) running on cron.
-- [ ] Letta core/archival memory bound to each board; mirroring archival writes into the Obsidian vault.
-- [ ] Replay + cost audit + context-window pressure widgets in the telemetry panel.
-
-**Exit criterion:** dropping a paper into `00_Inbox/` produces a richly-linked set of atomic notes within 5 minutes.
-
-### 14.5 Phase 4 — Polish + Ship (week 11–13)
-
-- [ ] EV code-signing pipeline (Azure Key Vault).
-- [ ] Tauri auto-updater.
-- [ ] Onboarding flow (CLAUDE.md scan, first-run skippy intro, sample mission).
-- [ ] In-app docs (open at any time, F1).
-- [ ] Sprite v1 (commissioned hand-pixeled).
-- [ ] v1.0 release; announce in Hoya_Box README.
-
-**Exit criterion:** v1.0 build runs on a clean Windows 11 install with `winget install` of dependencies, signed installer, no SmartScreen warnings.
-
-### 14.6 v1.1+ (post-ship)
-
-- Voice-to-task (Whisper, BridgeVoice-style).
-- macOS port.
-- Multi-user "guest" mode.
-- LanceDB migration.
-- Obsidian plugin for in-Obsidian Skippy chat.
-
----
-
-## 15. Risks & Mitigations
-
-| ID | Risk | Severity | Mitigation |
-|---|---|---|---|
-| **R-01** | **Claude Agent SDK TS `query()` 12s cold-start** + **Node-spawning-claude-code subprocess bug** [issue #34, #771]. Together: agent spawns feel slow or fail. | **Critical** | (a) call `query()` in-process inside the Node sidecar; (b) when CLI is needed, spawn from Rust + portable-pty, never from Node; (c) keep a warm pool of 2–3 pre-initialized SDK contexts; backfill in background. |
-| **R-02** | OTel GenAI semantic conventions still evolving (e.g., `gen_ai.usage.input_tokens` rename Mar 2026). | Medium | Wrap conventions in our own `packages/otel` DTO; bump quarterly. |
-| **R-03** | Windows code signing for personal/small-team apps. EV cert HSM requirement (since Jun 2023). | Medium | Azure Key Vault EV cert (~$300–500/yr). Document renewal runbook; backup cert metadata in password manager. |
-| **R-04** | WebGPU still flag-gated in some WebView2 builds. PixiJS perf depends on it. | Medium | Ship with WebGL fallback explicit; test on the latest stable WebView2 monthly. |
-| **R-05** | ConPTY 24-bit color + resize off-spec — `claude-code` TUI may render badly. | Medium | Test claude-code TUI explicitly during dev; patch xterm config; if blocked, fall back to a node-pty sidecar. |
-| **R-06** | Vault corruption from concurrent writes despite our atomic-write + lockfile. | Medium | Git auto-commit every 5 min; `.replay` files include vault snapshot pointers. |
-| **R-07** | Multi-agent groupthink — one agent dominates a topic and biases the wiki. | Low–Medium | `authored_by` distribution check in lint job; route diversification. |
-| **R-08** | Skippy persona drifts toward generic-helpful under model updates. | Medium | Pin charter; lint pass that grep's for "monkey" / "magnificent" / "asshole setting" frequency in transcripts; alert if below threshold. |
-| **R-09** | LLM API cost runaway from a stuck agent. | High | Per-board $/hour budget cap; auto-pause on breach; weekly cost report. |
-| **R-10** | The user gets bored of the RTS aesthetic in a month and wants pure productivity mode. | Low | Provide a "command-line-only" toggle that keeps the orchestration but hides the map. The map is the joy, not the lock-in. |
-| **R-11** | Hoya_Box concept drift — we change agent definitions in Skippy_space without updating Hoya_Box. | Medium | Establish Hoya_Box as upstream; Skippy_space ports periodically; document the sync ritual in `docs/architecture.md`. |
-| **R-12** | Single-machine memory limits — Langfuse, Letta, Obsidian, Tauri, Node, all running. | Low | Tauri footprint is tiny (~30–40MB); Langfuse + Letta in Docker can pause when not actively used. |
-
----
-
-## 16. Open Questions
-
-| ID | Question | Tentative answer |
+| Native clients/account terms change | Pin/qualify supported interfaces; explicit API/manual alternatives |
+| Local models fail tools/schema tasks | Capability gates, scoped tasks, real validation, eligible escalation |
+| Large model disrupts existing work | Acquisition/loading separation, conservative admission, mixed-load rollback |
+| Jev certain on weak evidence | Rules, scoped evidence, abstention, evaluation and owner accountability |
+| Wiki corruption or invented knowledge | Containment, originals, conflict detection, review and citations |
+| Revival becomes infrastructure rewrite | Reuse stack; local state first; short model list; defer hosting/fine-tuning |
+| Subscription usage obscures cost | Separate quota/allocation/API expense; no silent paid fallback |
+| Stale sibling docs mislead deployment | Dated provenance and live inventory before changes |
+
+## 14. Open questions and defaults
+
+| ID | Unknown | Nonblocking default |
 |---|---|---|
-| **OQ-01** | Should `psych-monitor` be a Staff Officer or under Research? | Staff Officer with read-access across boards. | 
-| **OQ-02** | Generative AI sprites or commissioned artist for v1? | Generative throughout project
-| **OQ-03** | Run Letta inside the Tauri sidecar or as a separate Docker container? | Docker container in v0; consider embedding in v1.x.
-| **OQ-04** | n8n: bundle (run on user machine) or require user to install separately? | Require separate install + document; bundle would balloon the installer.
-| **OQ-05** | Voice-to-task: in v1.0 or v1.1? | v1.1 — keep v1.0 scope tight. 
-| **OQ-06** | Multi-monitor: support pop-out windows in v1.0 or wait? | v1.0 — Tauri 2 makes it cheap.
-| **OQ-07** | Can task agents spawn each other (delegate down)? | **No.** Two tiers below the Board (board → task → no-grandchildren) keeps the SDK contract clean. Task agents must escalate to their board for further delegation. 
-| **OQ-08** | Should the user be able to define a 9th custom Board? | Not in v1; the clock-ring layout assumes 8. Consider a "auxiliary" off-map agents region in v1.x.
-| **OQ-09** | Cost: does Skippy expose dollar-cost in his narration ("That'll cost you 4 cents, monkey")? | Yes — fits the Iron Law of Delegation + "tattooed on Skippy's soul" cost discipline. 
-| **OQ-10** | Does the dashboard auto-launch Obsidian if it's not running? | Yes — at app start; document this behavior; respect the user's window-state preference. 
-| **OQ-11** | Should the wiki be one vault per project, or one global vault? | One per project. The vault is part of the project artifact and travels with it. Global cross-project memory lives in Letta archival.
-| **OQ-12** | Telemetry retention: how long do we keep `.replay` files? | 30 days hot, then compressed to `90_Archive/replays/`. 
-| **OQ-13** | What's the smallest possible v0 demo to validate the RTS-feel hypothesis with the user? | Phase 0 + a single board with a two sprites walking to a seperate file pedestals. Aim for end-of-week-2.
-| **OQ-14** | Should the app's window title use Skippy-voice ("Skippy is, in fact, magnificent")? | Yes. Default on; toggle off in settings. 
+| OQ-01 | Current Alcyone model/image/load/capacity | Treat September records as historical; inventory before routing |
+| OQ-02 | Actual account entitlements/client versions/quota | Official login/discovery; unavailable lane disabled |
+| OQ-03 | Paid API/Jev task/day/month budget | Zero new metered budget until configured; eligible personal/local lanes available |
+| OQ-04 | Organizational data egress/retention rules | Local-only for unclassified confidential records; synthetic/redacted Jev fixtures |
+| OQ-05 | Atlas runtime/idle hours and backing storage | Opt-in worker; qualify Windows runtime and local DB placement |
+| OQ-06 | Organizational ratifiers | Owner remains final authority; named reviewer is not multi-user auth |
+| OQ-07 | Accepted quality/cost tradeoff | Provisional section 11 targets; failing routes remain experimental |
+| OQ-08 | Cheapest cloud tier that sustains orchestration | Run on the owner's current plan with per-turn metering (D-01); compare against lower subscription tiers and a capped API budget |
+| OQ-09 | Consolidated Alcyone model and quantization | Qualify per the [model plan](MODEL-AND-CLUSTER-PLAN.md); 35B-class interim if no larger candidate passes Hermes' 65,536-context/tool suite |
+| OQ-10 | Subscription login for orchestration | Per D-05: Codex app-server (managed ChatGPT login) and the unmodified `claude` binary, human-paced and event-driven; Agent SDK library use, background automation and evaluations use API keys with auto-reload and a hard monthly cap. See [research 11](research/11-subscription-orchestration-2026-09-26.md) |
+| OQ-11 | Ceiling for "ordinary use" of subscription lanes | At most ~1 subscription orchestrator turn per minute, only while the owner is active; back off at 70%/85% of a 5-hour window |
+| OQ-12 | Specialist model portfolio and residency | One resident LLM per machine; specialists load on demand through a multiplexer and unload when idle. See the [model plan](MODEL-AND-CLUSTER-PLAN.md) |
+| OQ-13 | Validation disposition before tasks carry acceptance criteria (FR-RUN-01) | Until M1 adds criteria, a live executor's terminal success records `validation: not_defined` and may be `succeeded`; `failed` validation always forces nonsuccess. Demo (`SKIPPY_DEMO_MODE=1`) records are `simulated`, disabled/missing-key runs are `blocked`, and legacy `result: success` reads as `unverified` |
+| OQ-14 | Approval channel for `ask` charters (FR-SEC-01, FR-SEC-03) | Until FR-SEC-03 approval records exist, approval-required actions (write, exec, network outside allowlist, core-memory edits) are denied by the default approver; SDK boards can read, search and append to memory only |
+| OQ-15 | Is Obsidian Local REST ever a vault write path? (FR-WIKI-01/02) | No: REST is read/search only; all vault writes go through the local VaultBroker (lock, hash CAS, containment, append-only rules) |
+| OQ-16 | Reserved append-only paths and ingest limits (FR-WIKI-02/03) | Every `.md` under `40_Daily/` is reserved for `type: daily` and `50_Agents/<board>/agent_log.md` for `agent_log`; ingest rejects files over 64 MiB; rejection records for unsafe names go to `00_Inbox/_ingest-errors/` |
+| OQ-17 | Content-level secret exposure to boards (FR-SEC-02) | Credential paths are denied by name; a secret inside an ordinarily named file in an assigned worktree remains readable. Revisit with T10 executors (e.g. negative globs or content redaction) |
+| OQ-18 | Grep/Glob credential containment is a tree gate, not output filtering (FR-SEC-01/02) | Before a Grep/Glob runs, the exact tree rg will walk (Grep: the interpreted `path` or the session cwd; Glob: the search directory the CLI derives from the raw pattern — `cliGlobSplit`, mirroring CLI 2.1.162, `dirname` when the pattern has no metacharacter — as a real long path; re-verify on every SDK/CLI bump) is enumerated in full — long names, reparse points not descended, no `node_modules`/VCS carve-out — up to 25,000 entries / depth 40. If any well-known credential entry (the `tool-policy.ts` deny list, now literally `.env*` and the vault's `.skippy/ingest-sidecar.key`) exists anywhere in that tree, or the bound is hit, the call is denied with "narrow `path` to a subtree without credential files"; the denial reports a count, never the paths. No input is rewritten and no glob is modelled (a glob can only narrow rg's output). A PostToolUse hook is defense in depth for the gate-to-rg race: it judges every path-separator-bounded substring of every output line and every listed path (literal and real) with no caps and withholds the entire output, also when the output is oversized or malformed. Cost, accepted: a search from a root whose tree holds any credential-named file (e.g. `.env.example`) or more entries than the bound (a pnpm `node_modules`) is denied until narrowed. Revisit the bound and a per-root allowlist of documented non-secret names with T10 executors |
+| OQ-19 | Vault autocommit secret-scan limits and ingest provenance (FR-WIKI-03/06) | Fail closed, no proof step: autocommit never commits a path with any `filter` attribute (`filtered-path`: git-lfs or any clean filter, evaluated against the pre-add and post-add index) nor any blob containing a git-lfs pointer version line, whatever its attributes (`lfs-pointer`, so `git push` can never upload an excluded secret through its pointer); both are reported as skipped. Every other candidate's exact staged blob is scanned, at most 64 MiB per blob (`limits.maxScanBytes`, shared by both engines; larger blobs are skipped as `too-large-to-scan`). If any attribute source (in-tree `.gitattributes`, `info/attributes`, global or system attributes file) changes during a tick, the whole tick is deferred (`attributes-changed`); only a flip and flip-back entirely between two observations can go unseen, which needs local write access to the repo. In a sparse checkout, out-of-cone paths are flagged, never a failed tick. Only the ingest pipeline may create `60_Sources/` notes or set provenance keys; reuse of an existing source note requires a byte-identical re-derived body |
+| OQ-20 | Missing stop reason from OpenAI-compatible/local gateways (FR-RUN-01, FR-PROV-04) | Claude SDK executor: a success result without `end_turn`/`stop_sequence` is failed (truncated stream). Every main-thread turn is judged when it is superseded, not only at a `result`: a turn without a stop reason is complete only if every block it opened closed and the CLI executed one of its `tool_use` blocks, or a non-streamed fallback for the same request completed it; any truncated turn fails the run. Truncation inside a task agent has no structured signal in CLI 2.1.162 and is not detected. Future local/compatible adapters must declare whether their endpoint reports stop reasons; one that cannot is ineligible for unattended success until qualified (T11/T13). |
+| OQ-21 | Unicode normalization of vault paths on NTFS (FR-SEC-02, FR-WIKI-02/03) | Filesystem operations, locks, sidecar MAC locations and `_ingest-errors/` fallback keys use the exact on-disk names, never a case fold (NTFS's upcase table is not JavaScript's `toLowerCase`: it keeps U+212A KELVIN SIGN and `K`, `İ` and `i̇`, `ẞ` and `ß`, Georgian and Cherokee case pairs distinct). NFC/NFKC forms are used only for rule checks (reserved, hidden, lookalike, `.lock`). Creating a file or directory is refused (`normalization_collision`) when any existing sibling has the same conservative skeleton (`foldKey`: NFKC, then lower→upper→lower case mapping, then NFKD with combining marks and default-ignorable code points removed) but different bytes, and a segment that folds onto a reserved vault name it does not literally spell (`40_Daıly`) is rejected as `lookalike`. Accepted cost: the skeleton over-refuses some genuinely distinct names (`resume.md` next to `résumé.md`, `Masse` next to `Maße`). Agents and the ingest pipeline create ASCII names, and humans can still create any name outside the broker. Cross-script confusables (Cyrillic `а`) are not folded. Existing notes of any spelling are read and updated by their exact name. Ingest-error sidecars are authenticated with a per-vault key in a plain `.skippy/` directory. A `.skippy` junction or symlink is refused for both the key and the replay stream. |
 
----
+### Owner decisions, 2026-09-26
 
-## 17. Appendices
+| ID | Decision | Consequence |
+|---|---|---|
+| D-01 | Skippy and board-captain orchestration run on a **cloud** model for now | Orchestration usage is metered per turn (tokens, cache hits, lane, quota). The goal is moving orchestration to a lower subscription tier or small API budget, then porting to local Alcyone if cost stays high |
+| D-02 | **Consolidate Hermes** onto one larger shared Alcyone model | Supersedes "do not swap Hermes back automatically" for this maintenance window only; the swap is still an explicit, rollback-ready deployment with mixed-load evidence |
+| D-03 | Money Printer is **paused** and the Alcyone model service is shut down during cluster setup | OQ-01 inventory happens against a quiet host; factory/Hermes restart waits on the D-02 qualification |
+| D-04 | Local capacity targets **implementation volume**: a strong coding model on Atlas (16 GB VRAM + 64 GB RAM) | Replaces the 9B/8k Atlas development worker; retrieval models still share Atlas |
+| D-05 | **No prepaid API wallets** for orchestration | Primary orchestrator lane is Codex app-server on ChatGPT Pro; `claude -p` on Max is secondary/reviewer; local Alcyone fallback. D-01 metering tracks subscription window usage instead of dollars. Overflow uses capped auto-reload |
+| D-06 | Add **specialist models** (image, vision/OCR, speech, small utility models) loaded on demand | Resident memory is kept small: Qwen3.8-27B becomes the default Alcyone LLM so specialists fit beside it; Atlas' GPU is time-shared |
 
-All appendices live in `docs/research/` as separate files, captured from the agent swarm that produced this PRD on 2026-04-29. They are kept verbatim for auditability:
-
-1. `docs/research/01_hoyabox_recon.md` — Hoya_Box agent_space recon.
-2. `docs/research/02_orchestration_frameworks.md` — Multi-agent framework survey + recommended backbone.
-3. `docs/research/03_bridgemind_youtube.md` — BridgeMind channel mining + steal/skip list.
-4. `docs/research/04_rts_orchestration.md` — RTS UX deepdive + concrete dashboard sketch.
-5. `docs/research/05_karpathy_wiki.md` — Karpathy AI wiki spec for Skippy_space.
-6. `docs/research/06_obsidian_integration.md` — Obsidian integration surface area.
-7. `docs/research/07_tech_stack.md` — Full technical stack picks with install order.
-
-### 17.1 Glossary
-
-- **Beercan** — visual representation of any agent in Skippy_space.
-- **Board** — one of the eight skill-area captain agents.
-- **Captain** — synonym for Board agent.
-- **Charter** — markdown file defining a Board agent's mission, model, tools, costume, and memory bindings.
-- **Costume** — composite sprite layers giving a beercan its role-specific appearance.
-- **Hex-pad** — colored hexagonal floor tile each Board captain stands on.
-- **Iron Law of Delegation** — Skippy never implements; he plans, approves, assigns, monitors, broadcasts, synthesizes.
-- **Skippy** — the Magnificent. Top-level orchestrator, sole occupant of the throne tile.
-- **Staff Officer** — supporting agent reporting to Skippy directly (`agent-creator`, `skill-auditor`, `memory-manager`, `psych-monitor`).
-- **Task agent** — short-lived subagent spawned by a Board captain.
-- **Throne** — center tile of the RTS map; Skippy stands here.
-- **The Wiki** — the Obsidian vault implementing Karpathy's `llm-wiki` pattern.
-
-### 17.2 Sign-off
-
-| Role | Name | Date | Status |
-|---|---|---|---|
-| Owner | JusHoya | | ☐ |
-| Skippy | Skippy | 2026-04-29 | ✅ (with appropriate snark) |
-
----
-
-*"Now, monkeys, get to work. The Great Skippy has spoken."*
+These do not block M0/M1 or UI design. Resolve at the affected boundary. Do not re-ask settled preferences: balanced local/cloud, with Claude Opus as the requested implementation model family.

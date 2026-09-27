@@ -1,22 +1,30 @@
 // obsidian-rest.ts — graceful client for the Obsidian Local REST API (PRD §8.9).
 //
 // Phase 3 (WS2). The Local REST API plugin (coddingtonbear, v3.5+) exposes an
-// HTTP control plane over the running Obsidian app: surgical note edits, frontmatter
-// PATCHes, Dataview/simple search, command triggers. We use it for the things the
-// filesystem path (atomic.ts) is bad at — in-place edits + search of the *live*
-// index — and for nothing the filesystem can't already do safely.
+// HTTP control plane over the running Obsidian app: note edits, frontmatter
+// PATCHes, Dataview/simple search, command triggers. We use it ONLY to read and to
+// search the *live* index.
+//
+// READ-ONLY (M0 red-team E3-3; FR-WIKI-02, FR-SEC-02): this client exposes no write
+// methods. REST writes happen in the Obsidian process, so they cannot take our
+// proper-lockfile lock, compare an expected hash atomically, enforce the append-only
+// note types, prove real-path containment (the plugin resolves 8.3 short names such
+// as `OBSIDI~1`), or validate §8.3 frontmatter — and the plugin URL-decodes the
+// PATCH `Target` header, so a key filter on our side is bypassable (`%69d` -> `id`).
+// Every vault write goes through the local VaultBroker instead (vault-broker.ts),
+// which works with the Obsidian app closed; Obsidian picks up the change from disk.
 //
 // THE CONTRACT (PRD §8.9 line 3): the vault's source of truth is the filesystem.
 // REST is an optional accelerator. So every method here is non-throwing and returns
 // a discriminated result; if Obsidian isn't running, the key is unset, or the call
-// fails, the caller degrades to the `fs` path. We NEVER let a write be "successful"
-// only because REST accepted it — REST writes are surgical edits on notes the fs
-// layer already owns.
+// fails, the caller degrades to the `fs` path.
 //
 // Ports: the plugin serves HTTPS on :27124 (self-signed cert) and, when enabled,
 // plain HTTP on :27123. We default to the non-TLS port to dodge the self-signed-cert
 // rejection that Node's fetch would otherwise throw; an https:// URL is still honored
 // if the caller sets one (and has the cert trusted / NODE_TLS_REJECT_UNAUTHORIZED).
+
+import { normalizeVaultRelPath } from './vault-path.js';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Result type — mirrors the {ok}-discriminated style used across @skippy/memory.
@@ -94,7 +102,9 @@ export class ObsidianRestClient {
    * `vaultRelPath` is POSIX-style relative to the vault root, e.g. `10_Atomic/x.md`.
    */
   async readFile(vaultRelPath: string): Promise<RestResult<string>> {
-    const res = await this.request('GET', `/vault/${encodePath(vaultRelPath)}`, {
+    const safe = safeRestPath(vaultRelPath);
+    if (!safe.ok) return safe;
+    const res = await this.request('GET', `/vault/${encodePath(safe.data)}`, {
       // Ask for the raw markdown rather than the JSON note-wrapper.
       accept: 'text/markdown',
     });
@@ -102,44 +112,8 @@ export class ObsidianRestClient {
     return { ok: true, data: res.body };
   }
 
-  /**
-   * Surgically PATCH a single frontmatter field on a note. Uses the plugin's
-   * PATCH contract: target the `frontmatter` content-type with the field name in
-   * the `Target` header (Operation: replace). The value is JSON-encoded so arrays
-   * / numbers / strings all round-trip. This edits the live note in place without
-   * us re-serializing the whole file.
-   */
-  async patchFrontmatter(
-    vaultRelPath: string,
-    key: string,
-    value: unknown,
-  ): Promise<RestResult<true>> {
-    const res = await this.request('PATCH', `/vault/${encodePath(vaultRelPath)}`, {
-      contentType: 'application/json',
-      headers: {
-        Operation: 'replace',
-        'Target-Type': 'frontmatter',
-        Target: key,
-      },
-      // The Local REST API expects the JSON value as the body for a frontmatter PATCH.
-      body: JSON.stringify(value),
-    });
-    if (!res.ok) return { ok: false, error: res.error };
-    return { ok: true, data: true };
-  }
-
-  /**
-   * Append a markdown block to the end of a note (creates the note if missing).
-   * Append-only — matches the §8.5 agent_log/daily semantics without re-reading.
-   */
-  async appendBlock(vaultRelPath: string, markdown: string): Promise<RestResult<true>> {
-    const res = await this.request('POST', `/vault/${encodePath(vaultRelPath)}`, {
-      contentType: 'text/markdown',
-      body: markdown,
-    });
-    if (!res.ok) return { ok: false, error: res.error };
-    return { ok: true, data: true };
-  }
+  // No write methods (see the header): frontmatter edits and appends go through
+  // VaultBroker.patchFrontmatter / VaultBroker.appendNote on the local vault.
 
   /**
    * Simple full-text search via the plugin's `/search/simple/` endpoint. Returns
@@ -233,6 +207,21 @@ export interface SearchHit {
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Lexically validate a vault-relative path before it is put on the wire
+ * (FR-SEC-02). Without this, `../x` would be normalized by URL parsing into a
+ * different REST endpoint, absolute/UNC/ADS forms would reach the plugin, and an
+ * 8.3 short name (`OBSIDI~1/...`) or dot-directory would read control files.
+ * Returns the canonical POSIX path.
+ */
+function safeRestPath(vaultRelPath: string): RestResult<string> {
+  try {
+    return { ok: true, data: normalizeVaultRelPath(vaultRelPath) };
+  } catch (err) {
+    return { ok: false, error: errMsg(err) };
+  }
+}
 
 /** Percent-encode a vault-relative path segment-wise (keep the `/` separators). */
 function encodePath(vaultRelPath: string): string {

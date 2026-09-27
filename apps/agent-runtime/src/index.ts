@@ -137,9 +137,14 @@ async function main(): Promise<void> {
     }
   }
 
-  // stdin EOF -> graceful drain.
-  // Emit the `replay_session: ended` boundary *before* closing the writer so the
-  // boundary lands inside the replay file itself, then flush + close it.
+  // stdin EOF -> graceful drain. Stop background jobs and let the supervisor
+  // interrupt any still-inflight delegations (writeEnvelope tees those
+  // `interrupted` records to the replay sink) *before* the replay writer is
+  // closed, so they land inside the replay file instead of being dropped
+  // (D3). The `replay_session: ended` boundary is then the true last line,
+  // written immediately before the flush + close.
+  await memoryJobs.stop();
+  await supervisor.shutdown();
   if (replaySessionId !== null) {
     writeEnvelope({
       type: 'replay_session',
@@ -149,8 +154,6 @@ async function main(): Promise<void> {
     });
     await closeReplayWriter();
   }
-  await memoryJobs.stop();
-  await supervisor.shutdown();
   await shutdownOtel();
 }
 

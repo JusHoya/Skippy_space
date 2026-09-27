@@ -8,6 +8,7 @@
 //! filesystem trust, and credential handling live here.
 
 mod channel;
+mod claude_spawn;
 mod cmd_set_model;
 mod envelope;
 mod git_autocommit;
@@ -140,18 +141,38 @@ fn resolve_project_root() -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// Availability of the PTY claude lane for the renderer's "R" slot. See
+/// `claude_spawn` for the gate. Cheap; no side effects.
+#[tauri::command]
+fn claude_code_spawn_availability() -> claude_spawn::SpawnAvailability {
+    claude_spawn::availability(std::env::var(claude_spawn::OPT_IN_ENV).ok().as_deref())
+}
+
 /// Spawn a `claude` CLI subprocess in a PTY on behalf of an agent (Skippy or
 /// a Board captain). PRD §5.1 + R-01 require this to be Rust-spawned via
 /// `portable-pty`, never from the Node sidecar — `Node-spawning-claude-code`
 /// is a known-broken combination (issues #34 + #771).
 ///
+/// INELIGIBLE BY DEFAULT (FR-SEC-01, red-team N3): this lane has no enforced
+/// charter policy — the shell cannot broker the CLI's tool calls, so the
+/// user's own `~/.claude` permissions/hooks/MCP would apply instead of the
+/// charter. It refuses with a structured `ineligible` error unless the
+/// developer opt-in `SKIPPY_ALLOW_UNGATED_CLAUDE_SPAWN=1` is set, in which
+/// case it logs loudly and still passes the strongest native restriction
+/// flags (`--permission-mode default`, `--setting-sources=`,
+/// `--strict-mcp-config`; never a bypass). The enforced adapter is T10.
+///
 /// Returns the spawn metadata so the renderer can attach a TerminalCluster
 /// tab to the PTY via the existing `pty_subscribe` channel.
 ///
 /// Failure modes:
+/// * ineligible (no opt-in) — structured `{code: "ineligible", message}`.
+/// * cwd rejected (drive root, home/ancestor, profile or credential
+///   directory, UNC/8.3/`..` forms, missing, or resolving to any of those) or
+///   an empty brief / flag-shaped model — structured `{code: "spawn_failed"}`.
 /// * `claude` not on PATH — surfaced as `executable claude not found on PATH`.
 /// * cwd unreadable / PTY open failure — surfaced verbatim from portable-pty.
-/// In both cases we *do not* publish a `claude_code_spawned` envelope; the
+/// In all cases we *do not* publish a `claude_code_spawned` envelope; the
 /// renderer learns about the failure via the rejected promise.
 #[tauri::command]
 async fn claude_code_spawn(
@@ -160,36 +181,46 @@ async fn claude_code_spawn(
     model: Option<String>,
     cwd: Option<String>,
     state: State<'_, AppState>,
-) -> Result<ClaudeCodeSpawnResultDto, String> {
-    let resolved_model = model.unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string());
-    let resolved_cwd_path = match cwd {
-        Some(p) => std::path::PathBuf::from(p),
-        None => resolve_project_root()?,
+) -> Result<ClaudeCodeSpawnResultDto, claude_spawn::SpawnRefusal> {
+    let refusal = |message: String| claude_spawn::SpawnRefusal {
+        code: "spawn_failed",
+        message,
     };
+
+    // Gate first: nothing below runs for an ineligible lane.
+    claude_spawn::gate(std::env::var(claude_spawn::OPT_IN_ENV).ok().as_deref()).inspect_err(|r| {
+        warn!("claude_code_spawn refused for parent={parent_agent_id}: {}", r.message);
+    })?;
+    warn!(
+        "claude_code_spawn: UNGATED developer lane active ({}=1) for parent={parent_agent_id}; \
+         the charter policy is NOT enforced, only native CLI flags apply",
+        claude_spawn::OPT_IN_ENV
+    );
+
+    let resolved_model = model.unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string());
+    // The cwd — explicit or the `.git` walk-up default — must be a validated
+    // project root / worktree: never a drive root, the home directory or an
+    // ancestor of it, a profile or credential directory, nor a path that
+    // resolves to one (F2 D4; same rules as the runtime's `rootRejection`).
+    let requested_cwd = match cwd {
+        Some(p) => std::path::PathBuf::from(p),
+        None => resolve_project_root().map_err(refusal)?,
+    };
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    let resolved_cwd_path = claude_spawn::validate_cwd(&requested_cwd, home.as_deref()).map_err(refusal)?;
     let resolved_cwd_str = resolved_cwd_path
         .to_str()
-        .ok_or_else(|| "cwd contains non-utf8 bytes".to_string())?
+        .ok_or_else(|| refusal("cwd contains non-utf8 bytes".to_string()))?
         .to_string();
     let spawn_id = Uuid::new_v4().to_string();
 
-    // `claude -p <brief> --model <id> --output-format stream-json --verbose`
-    //
-    // * `-p` / `--print` puts the CLI in non-interactive one-shot mode; the
-    //   prompt is supplied as the trailing positional argument.
-    // * `--output-format stream-json` produces line-delimited JSON suitable
-    //   for the renderer to parse later if/when we wire a structured-output
-    //   subscriber; until then, xterm just renders the raw lines.
-    // * `--verbose` is required by `claude` when `--output-format stream-json`
-    //   is combined with `--print`. The CLI errors out without it.
-    let args: Vec<&str> = vec![
-        "-p",
-        task_brief.as_str(),
-        "--model",
-        resolved_model.as_str(),
-        "--output-format",
-        "stream-json",
-        "--verbose",
-    ];
+    // Structured argv (never a shell string); see `claude_spawn::build_args`
+    // for the flag-by-flag rationale and the `--help` evidence. The brief is
+    // the positional prompt after `--`, never an option (F2 D4).
+    let owned_args = claude_spawn::build_args(&task_brief, &resolved_model)?;
+    let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     // ANTHROPIC_API_KEY is the only env var the CLI strictly needs; we forward
     // it from the shell's env if set. (claude also reads ~/.claude credentials
     // if the user has run `claude auth`, so this is best-effort.)
@@ -211,7 +242,7 @@ async fn claude_code_spawn(
             spawn_id.clone(),
             state.bus.clone(),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| refusal(e.to_string()))?;
 
     let ts = chrono::Utc::now().to_rfc3339();
     state.bus.publish(Envelope::ClaudeCodeSpawned {
@@ -314,6 +345,7 @@ pub fn run() {
             events_subscribe,
             vault_autocommit_now,
             claude_code_spawn,
+            claude_code_spawn_availability,
             cmd_set_model::dispatch_set_model,
             project_tree::project_tree_scan,
             replay::replay_list_sessions,

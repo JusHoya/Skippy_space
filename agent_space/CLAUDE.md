@@ -77,7 +77,7 @@ costume:
   insignia: gear_circuit
 model: claude-sonnet-4-6
 effort: high
-permission_mode: ask           # ask | acceptEdits | bypassPermissions | plan
+permission_mode: ask           # ask | default | acceptEdits | plan | dontAsk — bypassPermissions is REJECTED by the runtime (FR-SEC-01)
 mcp_servers: [obsidian, letta, github]
 tools: [Read, Edit, Write, Bash, Grep, Glob, Agent]
 disallowed_tools: []

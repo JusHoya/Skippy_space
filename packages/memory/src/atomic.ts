@@ -7,10 +7,17 @@
 //   - `agent_log` + `daily` notes are append-only (separate code path);
 //   - wikilinks only ([[note]]), never relative markdown links.
 //
-// Every job (ingest, distill, link, lint, Letta-mirror, replay) writes through
-// here so no caller reinvents atomicity, locking, or the wikilink guard. The
-// pre-existing `daily.ts` keeps its own (equivalent, already-shipped) in-house
-// helpers; new code should use this module.
+// M0 WS-D (FR-SEC-02, FR-WIKI-02, assessment A03): these writers take an
+// ABSOLUTE target and do not prove it lies inside the vault, and `writeNote`
+// overwrites without an expected-hash check or identity preservation. New code
+// MUST write through `VaultBroker` (vault-broker.ts), which layers containment,
+// compare-and-swap and append-only enforcement over the same write-file-atomic +
+// proper-lockfile primitives. No production code calls these legacy writers any
+// more and the package index no longer exports them (atomic.test.ts still covers
+// them); the wikilink guard below is shared with the broker. Do not revive them:
+// write-file-atomic's temp name is predictable and opened with 'w', so a planted
+// hardlink redirects the write (M0 red-team round 2, N3). Vault writes use
+// `atomicWriteContained` (safe-write.ts).
 
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
@@ -113,6 +120,9 @@ export type WriteResult =
  * §8.3 frontmatter and enforces the wikilink-only rule before any disk I/O.
  * Returns `{ written: false, reason: 'locked' }` on contention rather than
  * throwing, so a job can skip and retry on the next pass.
+ *
+ * @deprecated No containment or expected-hash check. Use `VaultBroker.createNote`
+ * or `VaultBroker.updateNote`.
  */
 export async function writeNote(
   target: string,
@@ -134,6 +144,8 @@ export async function writeNote(
  * Write a note only if it does not already exist (idempotent create). Used for
  * notes that must never be clobbered (append-only types created once). Re-checks
  * existence inside the lock to close the create-race.
+ *
+ * @deprecated No containment check. Use `VaultBroker.createNote`.
  */
 export async function writeNoteIfAbsent(
   target: string,
@@ -161,6 +173,9 @@ export async function writeNoteIfAbsent(
  * Append a section to an append-only note (agent_log / daily). Never edits
  * existing content (PRD §8.5). Creates the file if absent. The appended text is
  * wikilink-guarded and a single trailing newline is normalized.
+ *
+ * @deprecated No containment, note-type or hardlink check. Use
+ * `VaultBroker.appendNote`.
  */
 export async function appendSection(target: string, text: string): Promise<WriteResult> {
   assertNoRelativeMdLinks(text, target);

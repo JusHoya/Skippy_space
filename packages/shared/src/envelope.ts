@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { AgentStateSchema, BoardStateSchema } from './states.js';
 import { AgentIdSchema, BoardIdSchema } from './agents.js';
+import { ExecutionModeSchema, LifecycleStateSchema, TerminalRecordShape } from './outcome.js';
 
 const Iso = z.string().datetime({ offset: true });
 
@@ -112,15 +113,34 @@ export const DelegationAckEnvelope = z.object({
 });
 
 /**
- * Board → Skippy delegation completion. `summary` is plain text suitable for
- * display in the SelectedPanel briefing pane.
+ * Board → Skippy non-terminal lifecycle pulse for accepted work (FR-RUN-01).
+ * The `delegation_ack` (decision=accept) already means `accepted`; the board
+ * emits `state: 'running'` only when a live executor actually starts.
+ */
+export const DelegationStateEnvelope = z.object({
+  type: z.literal('delegation_state'),
+  delegationId: z.string(),
+  fromBoardId: BoardIdSchema,
+  state: LifecycleStateSchema,
+  mode: ExecutionModeSchema,
+  ts: Iso,
+});
+
+/**
+ * Board → Skippy terminal delegation record (FR-RUN-01). Emitted exactly once
+ * per accepted delegation, only after the executor's terminal result has been
+ * awaited. `outcome` is one of succeeded | failed | cancelled | interrupted |
+ * blocked | simulated; only a live executor's terminal success yields
+ * `succeeded` (see `deriveTaskOutcome` in ./outcome.ts). `summary` is plain
+ * text for the SelectedPanel briefing pane. Legacy records that carried
+ * `result: 'success' | 'failure'` must be read via `readDelegationCompleteRecord`
+ * so they never become verified success (FR-OPS-05).
  */
 export const DelegationCompleteEnvelope = z.object({
   type: z.literal('delegation_complete'),
   delegationId: z.string(),
   fromBoardId: BoardIdSchema,
-  result: z.enum(['success', 'failure']),
-  summary: z.string(),
+  ...TerminalRecordShape,
   ts: Iso,
 });
 
@@ -155,6 +175,7 @@ export const Envelope = z.discriminatedUnion('type', [
   BoardStateEnvelope,
   DelegationEnvelope,
   DelegationAckEnvelope,
+  DelegationStateEnvelope,
   DelegationCompleteEnvelope,
   SetModelEnvelope,
   ClaudeCodeSpawnedEnvelope,
@@ -176,6 +197,7 @@ export type BoardReadyEnvelope = z.infer<typeof BoardReadyEnvelope>;
 export type BoardStateEnvelope = z.infer<typeof BoardStateEnvelope>;
 export type DelegationEnvelope = z.infer<typeof DelegationEnvelope>;
 export type DelegationAckEnvelope = z.infer<typeof DelegationAckEnvelope>;
+export type DelegationStateEnvelope = z.infer<typeof DelegationStateEnvelope>;
 export type DelegationCompleteEnvelope = z.infer<typeof DelegationCompleteEnvelope>;
 export type Envelope = z.infer<typeof Envelope>;
 /** Alias used by agent-runtime to avoid value/type identifier collision on `Envelope`. */

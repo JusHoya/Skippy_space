@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { readDelegationCompleteRecord } from '@skippy/shared';
 import { safeInvoke } from '../lib/tauri';
 
 /**
@@ -39,6 +40,8 @@ export interface AgentReconstruction {
   model?: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** Latest delegation outcome for a board (legacy `success` reads as `unverified`). */
+  lastOutcome?: string;
   /** Index of the most recent record that touched this agent. */
   lastTouchedIndex: number;
 }
@@ -60,12 +63,32 @@ export interface ReplayStore {
   setSelectedIndex: (i: number) => void;
 }
 
-/** Extract a permissive `agentId` from a raw envelope, if it carries one. */
+/** Extract a permissive `agentId` from a raw envelope, if it carries one.
+ * Board delegation records carry `fromBoardId` instead. */
 function recordAgentId(rec: ReplayRecord): string | null {
   if (rec && typeof rec === 'object' && typeof rec.agentId === 'string') {
     return rec.agentId;
   }
+  if (
+    rec &&
+    typeof rec === 'object' &&
+    (rec.type === 'delegation_complete' || rec.type === 'delegation_state') &&
+    typeof rec.fromBoardId === 'string'
+  ) {
+    return `board.${rec.fromBoardId}`;
+  }
   return null;
+}
+
+/**
+ * Normalize one parsed replay line. `delegation_complete` records go through
+ * the shared tolerant reader so legacy `result: 'success'` (written by stub and
+ * fallback paths before PRD v0.2) is shown as `unverified`, never as verified
+ * success (FR-OPS-05).
+ */
+export function normalizeReplayRecord(raw: ReplayRecord): ReplayRecord {
+  const delegation = readDelegationCompleteRecord(raw);
+  return delegation ?? raw;
 }
 
 export const useReplayStore = create<ReplayStore>((set, get) => ({
@@ -108,7 +131,7 @@ export const useReplayStore = create<ReplayStore>((set, get) => ({
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
-        records.push(JSON.parse(trimmed));
+        records.push(normalizeReplayRecord(JSON.parse(trimmed)));
       } catch {
         // Skip a torn/partial line (the file may have been mid-write).
       }
@@ -167,6 +190,13 @@ export function reconstructAt(
       case 'context_window':
         if (typeof rec.model === 'string') cur.model = rec.model;
         if (typeof rec.usedTokens === 'number') cur.inputTokens = rec.usedTokens;
+        break;
+      case 'delegation_state':
+        if (typeof rec.state === 'string') cur.lastOutcome = rec.state;
+        break;
+      case 'delegation_complete':
+        // Already normalized by `normalizeReplayRecord` at load time.
+        if (typeof rec.outcome === 'string') cur.lastOutcome = rec.outcome;
         break;
       default:
         break;

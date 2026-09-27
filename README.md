@@ -2,92 +2,50 @@
 
 > *"I am Skippy the Magnificent. You're welcome."*
 
-Skippy_space is a Windows desktop dashboard that replaces Cursor and Google Antigravity as the primary entrypoint to AI-assisted software work. It looks and feels like an RTS game: a top-down map of the codebase populated with literature-accurate Skippy-the-Magnificent **beercan sprites** (each in role-specific clothing) representing live AI agents.
+Skippy_space is a Windows desktop AI workbench with Skippy as orchestrator, eight board captains, an RTS view of agent work, a terminal and an Obsidian-backed wiki.
 
-**Skippy** sits at the center, the sole top-level orchestrator. Below him, a **Board of eight skill-area captains** — Engineering, Coding, Design, Marketing, Finance, Research, Publishing, DevOps — command rosters of short-lived task agents that build code, ingest knowledge, and execute work. The dashboard embeds an interactive terminal, surfaces deep telemetry, and reads/writes a Karpathy-style **AI wiki** stored as an Obsidian vault inside the project folder.
+The revival direction is a conversation-centered workspace with integrated changes, wiki and RTS views, persistent execution, and balanced local/cloud model routing.
 
 ## Status
 
-**Phase: 0 (Foundation)** — PRD shipped 2026-04-29; scaffolding laid. No app code yet.
+**Implemented prototype; revival specification prepared 2026-09-25.** The repository contains Tauri, React/Pixi, a Node runtime, memory jobs and telemetry. It is beyond Phase 0, but execution, permissions, persistence, costs and packaging need repairs and validation.
 
-See [`docs/PRD.md`](docs/PRD.md) for the source of truth on what this is and is not.
+The assessment found simulated/failed delegation paths that can report success, permission bypass in SDK execution, unsafe vault paths and loss of ingestion originals. These are the first implementation priorities. No runtime fixes, model downloads or cluster changes are included in this assessment branch.
 
-## Quick map
+## Start here
 
-| Path | What lives here |
+| Document | Purpose |
 |---|---|
-| [`docs/PRD.md`](docs/PRD.md) | The Product Requirements Document — start here. |
-| [`docs/research/`](docs/research/) | Verbatim outputs from the 7-agent research swarm that produced the PRD. |
-| `vault/` | The Obsidian vault — Karpathy-style AI wiki. Open in Obsidian. |
-| `agent_space/` | Skippy + Board charters, ported from `Hoya_Box/agent_space/`. |
-| `apps/shell/` | Tauri 2 Rust shell (planned). |
-| `apps/ui/` | Vite + React 19 renderer (planned). |
-| `apps/agent-runtime/` | Node 22 sidecar with Claude Agent SDK (planned). |
-| `packages/` | Shared TS packages: `shared`, `memory`, `otel`, `sprite-kit`. |
-| `infra/` | docker-compose for Langfuse + Letta + n8n. |
+| [PRD v0.2](docs/PRD.md) | Current requirements, architecture, acceptance gates and delivery sequence |
+| [Project assessment](docs/ASSESSMENT-2026-09-25.md) | Source-backed findings, reusable foundations and validation limits |
+| [Models and cluster plan](docs/MODEL-AND-CLUSTER-PLAN.md) | Download shortlist, placement, task assignments and Pleiades coexistence |
+| [Research](docs/research/08-revival-research-2026-09-25.md) | Primary sources for accounts, routing, local serving and Jev |
+| [Claude Opus handoff](docs/CLAUDE-OPUS-HANDOFF.md) | Ordered tickets, checks and a kickoff prompt |
+| [Original PRD](docs/archive/PRD-v0.1-2026-04-29.md) | Preserved historical specification |
 
-## Origin
+The proposal preserves Alcyone's documented 9B/Hermes service, qualifies a larger local candidate and an Atlas 5070 Ti worker, and keeps personal Codex/Claude Code sessions distinct from separately billed APIs. Jev begins in shadow mode as an optional decision adviser.
 
-Skippy_space ports the agent identity from the private [Hoya_Box](file:///C:/Users/hoyer/WorkSpace/Projects/Hoya_Box) repo (`agent_space/`), which already defines Skippy's persona, the 23 specialist agents, and 31 skills. Hoya_Box's roadmap has long listed *"Visualization Layer (The 'RTS' Interface)"* as pending — Skippy_space is that layer made real.
+## Repository map
 
-## Why bother
+| Path | Contents |
+|---|---|
+| `apps/shell/` | Tauri 2 shell, Rust commands, PTY and sidecar management |
+| `apps/ui/` | React 19, PixiJS scene, HUD and stores |
+| `apps/agent-runtime/` | TypeScript orchestration, model calls, MCP and memory jobs |
+| `packages/` | Shared contracts, memory, OTel and sprite assets |
+| `vault/` | Markdown/Obsidian knowledge and decisions |
+| `agent_space/` | Charters, skills and commands derived from Hoya_Box |
+| `infra/` | Existing telemetry/memory compose files; assess before booting |
+| `docs/research/` | Historical research 01-07 and the revival appendix |
 
-- **One entrypoint, end-to-end.** The full work-day fits in one window: agents, terminal, code, memory, observability.
-- **Game-like over kanban-like.** Sprites walking to file pedestals beats yet another Trello clone.
-- **Memory that compounds.** The Obsidian vault is the product as much as the dashboard is.
-- **Skippy is funny.** The persona is a feature.
+## Development and validation
 
----
+Read [CLAUDE.md](CLAUDE.md) before editing. Manifests require Node 22 or later and pin pnpm 9.15.0; native development also needs Rust/Tauri Windows prerequisites.
 
-## Phase 1 — Infra prerequisites
+See the [handoff](docs/CLAUDE-OPUS-HANDOFF.md) for baseline commands and [Playwright guide](docs/PLAYWRIGHT.md) for browser checks. The assessment environment lacked Node, pnpm and Cargo, so application tests/builds and installer validation were not run. Static document checks do not establish runtime readiness.
 
-Phase 1 brings the telemetry plane online (Langfuse + OTel Collector + Letta).
-All three run as Docker containers managed via `docker compose`.
+Existing infrastructure instructions remain in [infra/README.md](infra/README.md), but the assessment found a Langfuse/OTLP version mismatch. Core work should not depend on starting that stack before it is corrected.
 
-### Install Docker
+## Identity
 
-```powershell
-winget install Docker.DockerDesktop
-```
-
-Then start Docker Desktop and wait for the whale icon to settle. The
-scripts below assume `docker` is on PATH and the daemon is running.
-
-### Boot order
-
-```powershell
-pwsh scripts/phase1-up.ps1       # boot all three stacks in dependency order
-pwsh scripts/phase1-status.ps1   # what's up right now
-pwsh scripts/phase1-down.ps1     # graceful teardown (preserves volumes)
-pwsh scripts/phase1-down.ps1 -Volumes   # also drop named volumes
-```
-
-The boot order is **Langfuse → OTel Collector → Letta**: the collector's
-`otlphttp/langfuse` exporter needs `langfuse-server` resolvable on the
-shared docker network before it starts; Letta is independent and goes last.
-
-### URLs
-
-| Service | URL | Notes |
-|---|---|---|
-| Langfuse UI | http://localhost:3000 | Web UI for trace inspection / replay. |
-| OTel Collector (HTTP) | http://localhost:4319/v1/traces | Where the agent-runtime sends spans. Shifted off `:4318` to avoid clashing with Langfuse's own ingest. |
-| OTel Collector (gRPC) | localhost:4317 | Same collector, gRPC receiver. |
-| Langfuse OTLP ingest | http://localhost:3000/api/public/otel | The collector's `otlphttp/langfuse` exporter forwards here. Don't point the agent-runtime here directly — go through the collector so we can fan out. |
-| Letta | http://localhost:8283 | MCP endpoint for hot memory tools. |
-
-### Unified compose (optional)
-
-If your Docker is ≥ 4.27 (Compose v2.20+), you can also boot everything
-through the top-level include:
-
-```powershell
-docker compose -f infra/docker-compose.yml up -d
-```
-
-The PowerShell scripts use the per-stack form so they work on any
-Compose version that supports profiles.
-
----
-
-*Generated by the Skippy_space orchestrator swarm. Read the PRD before writing code.*
+Skippy plans, delegates, monitors and synthesizes. Engineering, Coding, Design, Marketing, Finance, Research, Publishing and DevOps own the work. Layered beercan sprites and Skippy's voice remain product features; model/provider choices are independent of those identities.

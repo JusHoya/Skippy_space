@@ -9,7 +9,10 @@
 // that carry extra fields (e.g. a `weekly` note's rollup pointers) round-trip
 // losslessly — we validate the closed core, preserve the rest.
 
+import { isDeepStrictEqual } from 'node:util';
+
 import matter from 'gray-matter';
+import yaml from 'js-yaml';
 import { z } from 'zod';
 import { ulid } from 'ulid';
 
@@ -134,9 +137,26 @@ export interface ParsedNote {
   body: string;
 }
 
+// YAML is parsed with js-yaml's CORE_SCHEMA (null/bool/int/float/str/seq/map),
+// i.e. WITHOUT the YAML 1.1 `timestamp` type. gray-matter's default engine
+// turns `due: 2026-10-01` into a Date, which a rewrite then serializes as
+// `2026-10-01T00:00:00.000Z` — silent type drift in unknown metadata (FR-WIKI-02,
+// red-team E3-5). Timestamps stay the exact strings the author wrote; §8.3's
+// `created_at`/`updated_at` are validated as ISO datetime strings anyway.
+const MATTER_OPTS = {
+  engines: {
+    yaml: (s: string): object => {
+      const data = yaml.load(s, { schema: yaml.CORE_SCHEMA });
+      return data !== null && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    },
+  },
+};
+
 /** Parse a markdown note into { frontmatter, body }. Does not validate. */
 export function parseNote(raw: string): ParsedNote {
-  const file = matter(raw);
+  // Passing options also bypasses gray-matter's shared parse cache, so each
+  // caller gets its own (mutable) frontmatter object.
+  const file = matter(raw, MATTER_OPTS);
   return { frontmatter: file.data as Record<string, unknown>, body: file.content };
 }
 
@@ -191,6 +211,177 @@ export function serializeNote(
   // body always starts cleanly after the closing fence.
   const content = body.startsWith('\n') ? body : `\n${body}`;
   return matter.stringify(content, canonicalize(parsed.data));
+}
+
+const SURGICAL_KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const FENCE_LINE_RE = /^---[ \t]*$/;
+const BOM = '﻿';
+
+/** One frontmatter line with its own terminator (`\n`, `\r\n` or '' at EOF). */
+interface FmLine {
+  text: string;
+  eol: string;
+}
+
+/** A `---`-fenced note split into byte-exact parts. */
+interface FencedNote {
+  bom: string;
+  openLine: string;
+  openEol: string;
+  lines: FmLine[];
+  closeLine: string;
+  closeEol: string;
+  /** The line ending most used inside the fenced block (new lines get it). */
+  dominantEol: string;
+}
+
+/** Split `raw` at its frontmatter fences, keeping every line's own terminator. */
+function splitFenced(raw: string): FencedNote | null {
+  let s = raw;
+  let bom = '';
+  if (s.startsWith(BOM)) {
+    bom = BOM;
+    s = s.slice(1);
+  }
+  const all: FmLine[] = [];
+  const re = /([^\n]*?)(\r\n|\n|$)/gy;
+  let pos = 0;
+  while (pos < s.length) {
+    re.lastIndex = pos;
+    const m = re.exec(s);
+    if (!m || m[0].length === 0) break;
+    all.push({ text: m[1] ?? '', eol: m[2] ?? '' });
+    pos += m[0].length;
+  }
+  if (all.length < 2 || !FENCE_LINE_RE.test(all[0]!.text) || all[0]!.eol === '') return null;
+  const closeIdx = all.findIndex((l, i) => i > 0 && FENCE_LINE_RE.test(l.text));
+  if (closeIdx < 0) return null;
+  const block = all.slice(0, closeIdx + 1);
+  const crlf = block.filter((l) => l.eol === '\r\n').length;
+  const lf = block.filter((l) => l.eol === '\n').length;
+  return {
+    bom,
+    openLine: all[0]!.text,
+    openEol: all[0]!.eol,
+    lines: all.slice(1, closeIdx),
+    closeLine: all[closeIdx]!.text,
+    closeEol: all[closeIdx]!.eol,
+    dominantEol: crlf > lf ? '\r\n' : '\n',
+  };
+}
+
+function renderFenced(n: FencedNote, body: string): string {
+  const fm = n.lines.map((l) => l.text + l.eol).join('');
+  // gray-matter drops one line terminator after the closing fence; a body is
+  // re-attached after the fence's own terminator (or a dominant one if none).
+  const closeEol = n.closeEol === '' && body !== '' ? n.dominantEol : n.closeEol;
+  return `${n.bom}${n.openLine}${n.openEol}${fm}${n.closeLine}${closeEol}${body}`;
+}
+
+/**
+ * Re-serialize an edited note while preserving the author's text (FR-WIKI-02
+ * "preserve unknown metadata and authored text"; red-team E3-5, M0 final #4).
+ *
+ * Only the top-level lines of keys whose value changed are rewritten (a new key
+ * is appended before the closing fence); comments, key order, quoting, every
+ * untouched line INCLUDING ITS OWN LINE ENDING, a leading UTF-8 BOM and the body
+ * bytes stay exactly as they were. Rewritten lines take the line ending of the
+ * line they replace; new lines take the block's dominant ending. The result is
+ * re-parsed and must yield exactly `frontmatter` and `body`. If the surgical
+ * edit cannot be proven equivalent (anchors, flow maps spanning lines, a
+ * removed key), the frontmatter block is re-serialized canonically (YAML
+ * comments in it are dropped) while the BOM and the body bytes are still kept;
+ * only if even that cannot be verified is the plain `serializeNote` output used.
+ * Validates §8.3 and THROWS on invalid input, like `serializeNote`.
+ */
+export function serializeNotePreserving(
+  originalRaw: string,
+  frontmatter: NoteFrontmatterInput,
+  body: string,
+): string {
+  const canonical = serializeNote(frontmatter, body); // validates §8.3
+  try {
+    const surgical = surgicalEdit(originalRaw, frontmatter, body);
+    if (surgical !== null) return surgical;
+  } catch {
+    /* fall through */
+  }
+  try {
+    const block = canonicalBlockEdit(originalRaw, frontmatter, body);
+    if (block !== null) return block;
+  } catch {
+    /* fall through */
+  }
+  return originalRaw.startsWith(BOM) ? BOM + canonical : canonical;
+}
+
+/** Re-parse `out` and require exactly `body`, and `frontmatter` when given. */
+function verifies(out: string, body: string, frontmatter?: Record<string, unknown>): boolean {
+  const check = parseNote(out);
+  if (check.body !== body) return false;
+  return frontmatter === undefined || isDeepStrictEqual(check.frontmatter, frontmatter);
+}
+
+function surgicalEdit(
+  originalRaw: string,
+  frontmatter: NoteFrontmatterInput,
+  body: string,
+): string | null {
+  const note = splitFenced(originalRaw);
+  if (!note) return null;
+  const before = parseNote(originalRaw).frontmatter;
+  const target = Object.fromEntries(
+    Object.entries(frontmatter).filter(([, v]) => v !== undefined),
+  );
+  // A key removal cannot be expressed surgically; let the canonical path do it.
+  if (Object.keys(before).some((k) => !(k in target))) return null;
+
+  const lines = note.lines;
+  for (const [key, value] of Object.entries(target)) {
+    if (isDeepStrictEqual(value, before[key])) continue;
+    if (!SURGICAL_KEY_RE.test(key)) return null;
+    const rendered = yaml
+      .dump({ [key]: value }, { lineWidth: -1, noRefs: true })
+      .replace(/\n+$/, '')
+      .split('\n');
+    const keyRe = new RegExp(`^${key}[ \\t]*:`);
+    const hits = lines.flatMap((l, i) => (keyRe.test(l.text) ? [i] : []));
+    if (hits.length > 1) return null;
+    if (hits.length === 0) {
+      lines.push(...rendered.map((text) => ({ text, eol: note.dominantEol })));
+      continue;
+    }
+    const start = hits[0]!;
+    let end = start + 1;
+    // The value's extent: indented continuation lines and column-0 sequence items.
+    while (end < lines.length && /^([ \t]|-([ \t]|$))/.test(lines[end]!.text)) end++;
+    const firstEol = lines[start]!.eol;
+    const lastEol = lines[end - 1]!.eol;
+    const replacement = rendered.map((text, i) => ({
+      text,
+      eol: i === rendered.length - 1 ? lastEol : firstEol,
+    }));
+    lines.splice(start, end - start, ...replacement);
+  }
+
+  const out = renderFenced(note, body);
+  return verifies(out, body, target) ? out : null;
+}
+
+/** Canonical frontmatter block, but the BOM, fences' endings and body bytes kept. */
+function canonicalBlockEdit(
+  originalRaw: string,
+  frontmatter: NoteFrontmatterInput,
+  body: string,
+): string | null {
+  const note = splitFenced(originalRaw);
+  if (!note) return null;
+  const parsed = NoteFrontmatterSchema.parse(frontmatter);
+  const canon = canonicalize(parsed);
+  const dumped = yaml.dump(canon, { lineWidth: -1, noRefs: true }).replace(/\n+$/, '').split('\n');
+  note.lines = dumped.map((text) => ({ text, eol: note.dominantEol }));
+  const out = renderFenced(note, body);
+  return verifies(out, body) ? out : null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
