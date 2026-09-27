@@ -13,7 +13,7 @@
 //
 // Run: node --import tsx --test src/tool-authority-rt4.test.ts
 
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs, readdirSync } from 'node:fs';
 import * as os from 'node:os';
@@ -37,9 +37,23 @@ process.env.LETTA_DISABLED = '1';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 
+const createdTmpDirs: string[] = [];
+
 async function tmpDir(prefix: string): Promise<string> {
-  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+  createdTmpDirs.push(dir);
+  return dir;
 }
+
+after(async () => {
+  for (const dir of createdTmpDirs) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+});
 
 /** Parse charter text with the real parser; on the baseline (no such export)
  * the test fails here rather than at module link time. */

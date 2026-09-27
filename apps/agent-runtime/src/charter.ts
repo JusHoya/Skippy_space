@@ -16,8 +16,10 @@
 //
 //   - duplicate keys are a parse error (js-yaml default);
 //   - a mis-indented top-level key is a parse error (js-yaml default);
-//   - YAML anchors, aliases and merge keys are refused anywhere in the
-//     frontmatter (they can rewrite authority fields out of sight);
+//   - YAML anchors, aliases, merge keys and explicit tags are refused anywhere
+//     in the frontmatter (they can rewrite or retype authority fields out of
+//     sight); anchor/alias names are matched as YAML defines them (any
+//     non-space, non-flow-indicator run), so non-ASCII names count too;
 //   - the document must be a mapping;
 //   - any parse error makes the charter *unloaded*: `loaded: false`, so
 //     `derivePolicy` fails closed (`charter_not_loaded`) while the markdown
@@ -170,9 +172,15 @@ function stripQuotedAndComments(fm: string): string {
   return out;
 }
 
-/** `&anchor`, `*alias` (as a value or list item) or a `<<` merge key. */
-const ANCHOR_OR_ALIAS = /(?:^|[\s[{,:])[&*][A-Za-z0-9_-]+/m;
+/** `&anchor`, `*alias` (as a value or list item) or a `<<` merge key. YAML
+ * anchor names are any run of non-space, non-flow-indicator characters, so
+ * the name class is the complement of those — not `[A-Za-z0-9_-]`, which let
+ * `tools: &é [Read]` / `disallowed_tools: *é` through (red-team F2 D6). */
+const ANCHOR_OR_ALIAS = /(?:^|[\s[{,:])[&*][^\s,[\]{}]+/m;
 const MERGE_KEY = /(?:^|[\s{,])<<\s*:/m;
+/** `!tag` / `!!type` (structural position): explicit tags can retype an
+ * authority value (`!!binary`, `!!set`); the schema needs none of them. */
+const YAML_TAG = /(?:^|[\s[{,:])![^\s,[\]{}]*/m;
 
 /**
  * Parse a charter markdown document into frontmatter + body. Throws
@@ -196,6 +204,9 @@ export function parseCharterText(text: string): { frontmatter: Record<string, un
   }
   if (MERGE_KEY.test(structural)) {
     throw new CharterParseError('YAML merge keys (<<) are not permitted in charter frontmatter');
+  }
+  if (YAML_TAG.test(structural)) {
+    throw new CharterParseError('YAML tags (!tag, !!type) are not permitted in charter frontmatter');
   }
 
   let doc: unknown;

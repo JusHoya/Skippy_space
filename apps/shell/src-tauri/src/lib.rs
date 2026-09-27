@@ -167,6 +167,9 @@ fn claude_code_spawn_availability() -> claude_spawn::SpawnAvailability {
 ///
 /// Failure modes:
 /// * ineligible (no opt-in) — structured `{code: "ineligible", message}`.
+/// * cwd rejected (drive root, home/ancestor, profile or credential
+///   directory, UNC/8.3/`..` forms, missing, or resolving to any of those) or
+///   an empty brief / flag-shaped model — structured `{code: "spawn_failed"}`.
 /// * `claude` not on PATH — surfaced as `executable claude not found on PATH`.
 /// * cwd unreadable / PTY open failure — surfaced verbatim from portable-pty.
 /// In all cases we *do not* publish a `claude_code_spawned` envelope; the
@@ -195,16 +198,18 @@ async fn claude_code_spawn(
     );
 
     let resolved_model = model.unwrap_or_else(|| DEFAULT_CLAUDE_MODEL.to_string());
-    let resolved_cwd_path = match cwd {
-        Some(p) => {
-            let pb = std::path::PathBuf::from(p);
-            if !pb.is_absolute() {
-                return Err(refusal("cwd must be an absolute path".to_string()));
-            }
-            pb
-        }
+    // The cwd — explicit or the `.git` walk-up default — must be a validated
+    // project root / worktree: never a drive root, the home directory or an
+    // ancestor of it, a profile or credential directory, nor a path that
+    // resolves to one (F2 D4; same rules as the runtime's `rootRejection`).
+    let requested_cwd = match cwd {
+        Some(p) => std::path::PathBuf::from(p),
         None => resolve_project_root().map_err(refusal)?,
     };
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from);
+    let resolved_cwd_path = claude_spawn::validate_cwd(&requested_cwd, home.as_deref()).map_err(refusal)?;
     let resolved_cwd_str = resolved_cwd_path
         .to_str()
         .ok_or_else(|| refusal("cwd contains non-utf8 bytes".to_string()))?
@@ -212,8 +217,9 @@ async fn claude_code_spawn(
     let spawn_id = Uuid::new_v4().to_string();
 
     // Structured argv (never a shell string); see `claude_spawn::build_args`
-    // for the flag-by-flag rationale and the `--help` evidence.
-    let owned_args = claude_spawn::build_args(&task_brief, &resolved_model);
+    // for the flag-by-flag rationale and the `--help` evidence. The brief is
+    // the positional prompt after `--`, never an option (F2 D4).
+    let owned_args = claude_spawn::build_args(&task_brief, &resolved_model)?;
     let args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
     // ANTHROPIC_API_KEY is the only env var the CLI strictly needs; we forward
     // it from the shell's env if set. (claude also reads ~/.claude credentials

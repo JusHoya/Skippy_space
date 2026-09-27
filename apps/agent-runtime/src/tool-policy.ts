@@ -20,10 +20,28 @@
 //      `process.cwd()` (red-team N2): no roots => read roots are empty and every
 //      built-in filesystem read is denied (the board can still use the brokered
 //      vault MCP tools). A root may not be a drive root, the user's home
-//      directory or an ancestor of it. Well-known credential locations
-//      (`.ssh/`, `.aws/`, `.env*`, `*.pem`, `id_rsa*`, `.npmrc`, `.netrc`,
-//      `.git-credentials`, `.claude/.credentials*`, `.codex/auth*`, …) are
-//      denied even inside the roots as defense in depth (FR-SEC-02).
+//      directory or an ancestor of it, a well-known credential location, a
+//      dot-directory directly under the home directory, or the profile's
+//      `AppData` (`Local`/`Roaming`/`LocalLow`) directory itself. Well-known
+//      credential locations (`.ssh/`, `.aws/`, `.env*`, `*.pem`, `id_rsa*`,
+//      `.npmrc`, `.netrc`, `.git-credentials`, `.claude/.credentials*`,
+//      `.codex/auth*`, …) are denied even inside the roots as defense in
+//      depth (FR-SEC-02). The credential rule is evaluated on the literal
+//      argument AND on its canonical long real path (`realpathSync.native` of
+//      the nearest existing ancestor, so an 8.3 short name such as `ENV~1`
+//      or a junction such as `lnk -> .aws` resolves to the name the rule
+//      knows — red-team F2 D1/D3), and any path segment containing
+//      `~<digit>` is refused outright as an 8.3 alias (the vault broker's
+//      short-name rule). Grep and Glob are search tools whose *results* can
+//      reach credential files the arguments never named (F2 D2): before
+//      either runs, the effective search tree is enumerated (bounded, long
+//      names, reparse points not followed) and — Grep — every credential
+//      entry found is excluded by rewriting the call's `glob` with anchored
+//      negative globs through the PreToolUse hook's `updatedInput`; — Glob —
+//      the call is denied when its pattern could match any credential entry.
+//      A tree over the enumeration cap is denied (narrow `path`). As defense
+//      in depth a PostToolUse hook replaces any Grep/Glob output that still
+//      names a credential path (see "Search output redaction").
 //   2. `evaluateToolCall(policy, call, hooks)` is the single decision function.
 //      Hard limits (grant, disallow, known tool, roots, arguments, no
 //      grandchildren) are checked first and cannot be overridden by approval.
@@ -33,9 +51,17 @@
 //      Agent SDK's native controls (verified against the installed
 //      @anthropic-ai/claude-agent-sdk 0.3.162 `Options` type): `permissionMode`
 //      (never bypass), `tools`, empty `allowedTools`, `disallowedTools`,
-//      `canUseTool`, a `PreToolUse` hook, `cwd`, `settingSources: []` and
-//      `strictMcpConfig`. The hook fires for every tool call (even ones the CLI
-//      would auto-approve), so a denial is enforcement, not observation.
+//      `canUseTool`, a `PreToolUse` hook, a `PostToolUse` hook, `cwd`,
+//      `settingSources: []` and `strictMcpConfig`. The PreToolUse hook fires
+//      for every tool call (even ones the CLI would auto-approve), so a
+//      denial is enforcement, not observation. Verified live against CLI
+//      2.1.162 (F2): `canUseTool` is NOT consulted for the auto-approved
+//      read tools (Read/Grep/Glob), so the PreToolUse hook is their only
+//      pre-execution gate and the only place an input rewrite can happen
+//      (`permissionDecision: 'allow'` + `updatedInput` reaches rg); a
+//      PostToolUse `updatedToolOutput` in the tool's own output shape
+//      replaces what the model sees (the CLI validates it with the tool's
+//      `outputSchema` and falls back to the original on mismatch).
 //   4. `assertExecutorEligible` refuses an adapter whose declared capabilities
 //      cannot enforce the policy.
 //   5. The in-process MCP tools dispatch through `authorizeMcpDispatch` (see
@@ -55,7 +81,7 @@
 // entries must name catalogued tools.
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -183,10 +209,49 @@ const KNOWN_CHARTER_KEYS = new Set([
 const AUTHORITY_KEY_PATTERN =
   /(permission|allow|bypass|danger|sandbox|network|approv|tool|mcp|root|scope|sudo|trust)/i;
 
+/** Charter mapping keys must be printable ASCII (red-team F2 D5: a Cyrillic
+ * `о` in `permissiоn_mode` made the key unknown and therefore ignored). */
+const NON_ASCII_KEY = /[^\x20-\x7e]/;
+
+/** A key within this optimal-string-alignment (Damerau-Levenshtein) distance
+ * of a known authority key, after normalisation, is a lookalike
+ * (`permision_mode`, `tool`, `mcp_server`) and fails closed (F2 D5). */
+const AUTHORITY_KEY_MAX_EDIT_DISTANCE = 2;
+
 /** Canonical spelling used to compare charter keys: trimmed, lower-cased,
  * `-` folded to `_`. */
 function normalizeCharterKey(key: string): string {
   return key.trim().toLowerCase().replace(/-/g, '_');
+}
+
+/** Optimal string alignment distance (Damerau-Levenshtein with adjacent
+ * transpositions). Small inputs only (charter keys). */
+export function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  const d: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) (d[i] as number[])[0] = i;
+  for (let j = 0; j <= n; j++) (d[0] as number[])[j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const row = d[i] as number[];
+      const prev = d[i - 1] as number[];
+      row[j] = Math.min((prev[j] as number) + 1, (row[j - 1] as number) + 1, (prev[j - 1] as number) + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        row[j] = Math.min(row[j] as number, ((d[i - 2] as number[])[j - 2] as number) + 1);
+      }
+    }
+  }
+  return (d[m] as number[])[n] as number;
+}
+
+/** The known authority key `norm` looks like (edit distance <= 2), or null. */
+function lookalikeAuthorityKey(norm: string): string | null {
+  for (const k of KNOWN_AUTHORITY_KEYS) {
+    if (norm !== k && editDistance(norm, k) <= AUTHORITY_KEY_MAX_EDIT_DISTANCE) return k;
+  }
+  return null;
 }
 
 const MCP_SERVER_NAME = /^[a-z][a-z0-9-]*(?:_[a-z0-9-]+)*$/;
@@ -205,6 +270,7 @@ export type ToolPolicyErrorCode =
   | 'unknown_disallowed_tool'
   | 'invalid_mcp_servers'
   | 'unknown_authority_field'
+  | 'invalid_charter_key'
   | 'invalid_context'
   | 'invalid_root'
   | 'adapter_ineligible';
@@ -372,12 +438,20 @@ function requireAbsolute(charter: Charter, label: string, p: string | undefined)
   return path.resolve(p);
 }
 
+/** Profile directories directly under the home directory that are never a
+ * root by themselves: they hold every per-user credential store on disk. */
+const HOME_PROFILE_DIRS: readonly string[] = ['AppData', 'AppData/Local', 'AppData/Roaming', 'AppData/LocalLow'];
+
 /**
  * Why `root` may not serve as a filesystem root for an agent, or null. A root
- * must be absolute and interpretable (no `~`, env-var, UNC/device forms), and
- * may not be a drive/filesystem root, the user's home directory, or an
- * ancestor of the home directory — lexically or after resolving reparse
- * points. Such a root would put every credential store on disk in scope.
+ * must be absolute and interpretable (no `~`, env-var, UNC/device, 8.3
+ * short-name forms), and may not be a drive/filesystem root, the user's home
+ * directory, an ancestor of the home directory, a well-known credential
+ * location (or inside one), a dot-directory directly under the home
+ * directory (`~/.ssh`, `~/.claude`, `~/.config`, …) or the profile's
+ * `AppData` / `AppData/{Local,Roaming,LocalLow}` directory itself — lexically
+ * or after resolving reparse points. Such a root would put credential stores
+ * in scope (F2 observation).
  */
 export function rootRejection(root: string, home: string = os.homedir()): string | null {
   if (typeof root !== 'string' || root.trim() === '') return 'root must be a non-empty string';
@@ -390,9 +464,19 @@ export function rootRejection(root: string, home: string = os.homedir()): string
   const forms = new Set([key(abs), key(realish(abs))]);
   const homeForms = new Set([key(homeAbs), key(realish(homeAbs))]);
   for (const r of forms) {
+    const cred = credentialPathRejection(r);
+    if (cred) return `a credential location may not be a root: ${cred}`;
     for (const h of homeForms) {
       if (r === h) return 'the user home directory may not be a root';
       if (contains(r, h)) return 'an ancestor of the user home directory may not be a root';
+      if (contains(h, r)) {
+        const rel = path.relative(h, r).split(/[\\/]/);
+        if (rel[0]?.startsWith('.')) return `a dot-directory under the user home directory (${rel[0]}) may not be a root`;
+        const relKey = rel.join('/').toLowerCase();
+        if (HOME_PROFILE_DIRS.some((d) => d.toLowerCase() === relKey)) {
+          return `the profile directory ${rel.join('/')} may not be a root`;
+        }
+      }
     }
   }
   return null;
@@ -408,13 +492,19 @@ function requireRoot(charter: Charter, label: string, p: string | undefined): st
 
 /**
  * Walk the frontmatter and fail closed on any authority-shaped key that is
- * not exactly a known top-level authority key (FR-BOARD-01, red-team N4):
+ * not exactly a known top-level authority key (FR-BOARD-01, red-team N4, F2
+ * D5). The rule, applied to every mapping key at every depth:
+ *   - a key containing any non-printable-ASCII character (Cyrillic
+ *     lookalikes, zero-width characters) is refused (`invalid_charter_key`);
  *   - a top-level key whose normalised form is a known authority key but whose
- *     spelling differs (`Tools`, `disallowed-tools`, ` tools`);
+ *     spelling differs (`Tools`, `disallowed-tools`, ` tools`) is refused;
  *   - a top-level key outside the charter schema that matches the authority
- *     pattern (`allowed_tools`, `dangerously_skip_permissions`);
- *   - any nested key (any depth, inside mappings or sequences) that is or looks
- *     like an authority key — authority is top-level only.
+ *     pattern (`allowed_tools`, `dangerously_skip_permissions`) or lies within
+ *     edit distance 2 of a known authority key (`permision_mode`, `toolz`)
+ *     is refused rather than silently ignored;
+ *   - any nested key (any depth, inside mappings or sequences) that is, looks
+ *     like, or is within edit distance 2 of an authority key is refused —
+ *     authority is top-level only.
  */
 function checkCharterKeys(charter: Charter): void {
   const visit = (value: unknown, depth: number, trail: string): void => {
@@ -426,6 +516,14 @@ function checkCharterKeys(charter: Charter): void {
     for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
       const norm = normalizeCharterKey(key);
       const label = trail ? `${trail}.${key}` : key;
+      if (NON_ASCII_KEY.test(key)) {
+        fail(
+          'invalid_charter_key',
+          charter,
+          `charter key ${JSON.stringify(key)} (${label}) contains non-ASCII characters; keys must be printable ASCII (FR-BOARD-01)`,
+        );
+      }
+      const lookalike = lookalikeAuthorityKey(norm);
       if (depth === 0) {
         if (KNOWN_AUTHORITY_KEYS.has(norm) && key !== norm) {
           fail(
@@ -434,14 +532,14 @@ function checkCharterKeys(charter: Charter): void {
             `authority field \`${key}\` must be spelled exactly \`${norm}\`; refusing an alias spelling (FR-BOARD-01)`,
           );
         }
-        if (!KNOWN_CHARTER_KEYS.has(norm) && AUTHORITY_KEY_PATTERN.test(norm)) {
+        if (!KNOWN_CHARTER_KEYS.has(norm) && (AUTHORITY_KEY_PATTERN.test(norm) || lookalike)) {
           fail(
             'unknown_authority_field',
             charter,
-            `unrecognized authority field \`${key}\`; refusing rather than silently ignoring it (FR-BOARD-01)`,
+            `unrecognized authority field \`${key}\`${lookalike ? ` (looks like \`${lookalike}\`)` : ''}; refusing rather than silently ignoring it (FR-BOARD-01)`,
           );
         }
-      } else if (KNOWN_AUTHORITY_KEYS.has(norm) || AUTHORITY_KEY_PATTERN.test(norm)) {
+      } else if (KNOWN_AUTHORITY_KEYS.has(norm) || AUTHORITY_KEY_PATTERN.test(norm) || lookalike) {
         fail(
           'unknown_authority_field',
           charter,
@@ -574,7 +672,15 @@ export type DenyCode =
   | 'approval_required';
 
 export type PolicyDecision =
-  | { allow: true; actionClass: ActionClass; approved: boolean }
+  | {
+      allow: true;
+      actionClass: ActionClass;
+      approved: boolean;
+      /** Present when the call may proceed only with this rewritten input
+       * (Grep: credential entries excluded by anchored negative globs). The
+       * executor must run the rewritten input or not run at all. */
+      updatedInput?: Record<string, unknown>;
+    }
   | { allow: false; code: DenyCode; reason: string; actionClass?: ActionClass };
 
 export interface ApprovalRequest {
@@ -747,6 +853,8 @@ export type PathInterpretation = { ok: true; path: string } | { ok: false; reaso
 const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
 const ENV_VAR_FORM = /%[^%\\/]+%|\$(?:\{|\(|[A-Za-z_])/;
 const WIN_RESERVED_NAME = /^(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)(?:\..*)?$/i;
+/** `~<digit>` anywhere in a segment: the Win32 8.3 short-name form. */
+const SHORT_NAME_SEGMENT = /~\d/;
 /** Exactly the CLI's static-prefix cut set (Glob `b3f`), so the directory we
  * guard is the directory rg is handed. */
 const GLOB_META = /[*?[{]/;
@@ -775,12 +883,14 @@ function pathAmbiguity(p: string, names: boolean): string | null {
     if (p.includes(':', /^[a-zA-Z]:/.test(p) ? 2 : 0)) {
       return 'a colon after the drive prefix (alternate data stream / device) is not permitted';
     }
-    if (names) {
-      for (const seg of p.split(/[\\/]/)) {
-        if (seg === '' || seg === '.' || seg === '..') continue;
-        if (/[. ]$/.test(seg)) return `segment "${seg}" ends in a dot or space (Win32 strips it, aliasing another name)`;
-        if (WIN_RESERVED_NAME.test(seg)) return `segment "${seg}" is a reserved device name`;
-      }
+    for (const seg of p.split(/[\\/]/)) {
+      if (seg === '' || seg === '.' || seg === '..') continue;
+      // F2 D1: `ENV~1`, `AWS~1`, `PROGRA~1` alias a long name the deny list
+      // knows; refused outright (both literal paths and glob alternatives).
+      if (SHORT_NAME_SEGMENT.test(seg)) return `segment "${seg}" looks like an 8.3 short name (aliases another name)`;
+      if (!names) continue;
+      if (/[. ]$/.test(seg)) return `segment "${seg}" ends in a dot or space (Win32 strips it, aliasing another name)`;
+      if (WIN_RESERVED_NAME.test(seg)) return `segment "${seg}" is a reserved device name`;
     }
   }
   return null;
@@ -935,7 +1045,193 @@ function globRootFor(alt: string, searchBase: string): string {
   return path.resolve(searchBase, prefix === '' ? '.' : prefix);
 }
 
-type ArgCheck = { ok: true } | { ok: false; code: DenyCode; reason: string };
+// ──────────────────────────────────────────────────────────────────────────────
+// Search-tree credential scan (red-team F2 D2; FR-SEC-01 "observing tool
+// events is not enforcement", FR-SEC-02)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Grep and Glob return whatever rg finds under their search root, so the
+// name-based deny list on the *arguments* proved nothing about the *results*
+// (`Grep SECRET` with no glob dumped `.env`, `.aws/credentials`, `.ssh/*` and
+// `server.pem`; `glob: ".en?"` and `Glob "**/*"` likewise). Before either
+// tool runs, `scanForCredentials` enumerates the effective search root with
+// long names (`readdirSync` returns them), never following reparse points
+// (rg is invoked without `--follow`, so neither does it) and skipping only
+// the VCS directories the CLI always excludes plus `node_modules`. It is
+// bounded (MAX_SCAN_ENTRIES / MAX_SCAN_DEPTH); hitting a bound is a denial,
+// never a guess ("narrow `path`"). The scan is a superset of what rg can
+// reach (rg additionally honours .gitignore), so:
+//   - Grep: every credential directory/file found is excluded by appending
+//     `!/<relative path>` to the call's `glob` (rg: gitignore-style globs
+//     relative to its cwd, which the CLI sets to the search root; a later
+//     glob wins, a negated directory is pruned). The rewrite reaches rg via
+//     the PreToolUse hook's `updatedInput` (verified live, CLI 2.1.162). A
+//     credential path the CLI's glob splitter could not carry intact
+//     (whitespace, comma, glob metacharacters) makes the call a denial.
+//   - Glob: the call is denied when any brace alternative of its pattern
+//     could match a credential file found under the root (gitignore glob
+//     semantics, evaluated over-inclusively: when in doubt, it matches).
+// `node_modules` is not enumerated (pnpm stores make it unbounded); rg's
+// Grep only reaches it in a worktree without a .gitignore, and the
+// PostToolUse redaction below still covers anything it returns (OQ-18).
+
+/** Directory names never enumerated: the VCS directories the CLI's Grep
+ * always passes as `--glob !<name>` (verified: `.git .svn .hg .bzr .jj .sl`)
+ * and `node_modules`. */
+const SCAN_SKIP_DIRS: ReadonlySet<string> = new Set(['.git', '.svn', '.hg', '.bzr', '.jj', '.sl', 'node_modules']);
+export const MAX_SCAN_ENTRIES = 25_000;
+export const MAX_SCAN_DEPTH = 40;
+
+export interface CredentialScan {
+  /** Credential-matching directories (relative, `/`-separated); not descended
+   * for the `dirs` list but their files are still enumerated into `files`. */
+  dirs: string[];
+  /** Credential-matching files (relative, `/`-separated), including those
+   * under a credential directory. */
+  files: string[];
+  entries: number;
+}
+
+export type CredentialScanResult = { ok: true; scan: CredentialScan } | { ok: false; reason: string };
+
+/**
+ * Enumerate `root` (a directory) for credential-matching entries. A root
+ * that is not an existing directory yields an empty scan (a file root was
+ * already judged by `checkPathArg`; a missing root has nothing to leak).
+ */
+export function scanForCredentials(root: string): CredentialScanResult {
+  let isDir = false;
+  try {
+    isDir = statSync(root).isDirectory();
+  } catch {
+    isDir = false;
+  }
+  const scan: CredentialScan = { dirs: [], files: [], entries: 0 };
+  if (!isDir) return { ok: true, scan };
+  const stack: Array<{ abs: string; rel: string; depth: number; inCredDir: boolean }> = [
+    { abs: root, rel: '', depth: 0, inCredDir: false },
+  ];
+  while (stack.length > 0) {
+    const cur = stack.pop() as { abs: string; rel: string; depth: number; inCredDir: boolean };
+    if (cur.depth > MAX_SCAN_DEPTH) {
+      return { ok: false, reason: `search tree under ${root} is deeper than ${MAX_SCAN_DEPTH}; narrow \`path\`` };
+    }
+    let entries: import('node:fs').Dirent[];
+    try {
+      entries = readdirSync(cur.abs, { withFileTypes: true });
+    } catch (err) {
+      return { ok: false, reason: `cannot enumerate ${cur.abs}: ${String(err)}` };
+    }
+    for (const e of entries) {
+      scan.entries++;
+      if (scan.entries > MAX_SCAN_ENTRIES) {
+        return { ok: false, reason: `search tree under ${root} exceeds ${MAX_SCAN_ENTRIES} entries; narrow \`path\`` };
+      }
+      const rel = cur.rel === '' ? e.name : `${cur.rel}/${e.name}`;
+      const cred = cur.inCredDir || credentialPathRejection(e.name) !== null;
+      if (e.isDirectory() && !e.isSymbolicLink()) {
+        if (SCAN_SKIP_DIRS.has(e.name.toLowerCase())) continue;
+        const credDir = !cur.inCredDir && cred;
+        if (credDir) scan.dirs.push(rel);
+        stack.push({ abs: path.join(cur.abs, e.name), rel, depth: cur.depth + 1, inCredDir: cur.inCredDir || credDir });
+        continue;
+      }
+      // Files and reparse points (never followed): judged by name only.
+      if (cred) scan.files.push(rel);
+    }
+  }
+  return { ok: true, scan };
+}
+
+/** Characters the CLI's Grep glob splitter (whitespace, then commas outside
+ * braces) or rg's glob parser would mangle in an anchored `!/path` negative. */
+const UNEXPRESSIBLE_IN_GLOB = /[\s,*?[\]{}\\!]/;
+
+/** The `!/<rel>` negatives that exclude every credential entry of `scan`
+ * (directories prune their subtree), or null when one cannot be expressed. */
+export function credentialNegatives(scan: CredentialScan): string[] | null {
+  const out: string[] = [];
+  const underDir = (rel: string): boolean => scan.dirs.some((d) => rel === d || rel.startsWith(`${d}/`));
+  for (const rel of [...scan.dirs, ...scan.files.filter((f) => !underDir(f))]) {
+    if (UNEXPRESSIBLE_IN_GLOB.test(rel) || rel === '') return null;
+    out.push(`!/${rel}`);
+  }
+  return out;
+}
+
+/**
+ * Could the gitignore-style glob `glob` (one brace alternative, rg `--glob`
+ * semantics) match the relative file path `rel`? Over-inclusive by design:
+ * a pattern without `/` matches the basename at any depth, a leading `/` or
+ * an inner `/` anchors at the root, a trailing `/` matches the directory and
+ * everything under it, `**` anywhere is treated as "anything", `\` is tried
+ * both as an escape and as a separator, matching is case-insensitive. A
+ * "yes" here only ever leads to a denial.
+ */
+export function globCouldMatch(glob: string, rel: string): boolean {
+  const target = rel.replace(/\\/g, '/');
+  const variants = glob.includes('\\') ? [glob, glob.replace(/\\/g, '/')] : [glob];
+  return variants.some((g) => globVariantMatches(g, target));
+}
+
+function globVariantMatches(glob: string, rel: string): boolean {
+  let g = glob.trim();
+  if (g === '') return true;
+  if (g.endsWith('/')) g = `${g}**`;
+  let anchored = false;
+  if (g.startsWith('/')) {
+    anchored = true;
+    g = g.replace(/^\/+/, '');
+  } else if (g.includes('/')) {
+    anchored = true;
+  }
+  let body = '';
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i] as string;
+    if (c === '*') {
+      if (g[i + 1] === '*') {
+        const start = i;
+        while (g[i + 1] === '*') i++;
+        // `**` as a full component matches zero or more directories; any other
+        // placement is treated as "anything" (over-inclusive).
+        const fullComponent = (start === 0 || g[start - 1] === '/') && (i + 1 >= g.length || g[i + 1] === '/');
+        if (fullComponent && g[i + 1] === '/') {
+          i++;
+          body += '(?:.*/)?';
+        } else {
+          body += '.*';
+        }
+      } else {
+        body += '[^/]*';
+      }
+    } else if (c === '?') {
+      body += '[^/]';
+    } else if (c === '[') {
+      const close = g.indexOf(']', i + 2);
+      if (close === -1) {
+        body += '\\[';
+      } else {
+        let cls = g.slice(i + 1, close);
+        if (cls.startsWith('!')) cls = `^${cls.slice(1)}`;
+        body += `[${cls.replace(/\\/g, '\\\\')}]`;
+        i = close;
+      }
+    } else if (c === '\\' && i + 1 < g.length) {
+      i++;
+      body += escapeRegExp(g[i] as string);
+    } else {
+      body += escapeRegExp(c);
+    }
+  }
+  const re = anchored ? new RegExp(`^${body}$`, 'i') : new RegExp(`(?:^|/)${body}$`, 'i');
+  return re.test(rel);
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+}
+
+type ArgCheck = { ok: true; updatedInput?: Record<string, unknown> } | { ok: false; code: DenyCode; reason: string };
 
 const argOk: ArgCheck = { ok: true };
 
@@ -955,6 +1251,19 @@ function checkInputFields(canonical: string, input: Record<string, unknown>): Ar
   return argOk;
 }
 
+/** Why the interpreted absolute path `p` — literally or through its
+ * canonical long real path (nearest existing ancestor resolved, so 8.3 short
+ * names and junctions/symlinks resolve to the name the deny list knows) —
+ * names a credential location, or null (F2 D1/D3). */
+export function credentialTargetRejection(p: string): string | null {
+  const literal = credentialPathRejection(p);
+  if (literal) return literal;
+  const real = realish(p);
+  if (key(real) === key(p)) return null;
+  const viaReal = credentialPathRejection(real);
+  return viaReal ? `resolves to ${real}: ${viaReal}` : null;
+}
+
 /** Interpret one path argument and run it through the PathGuard. */
 async function checkPathArg(
   label: string,
@@ -965,7 +1274,7 @@ async function checkPathArg(
 ): Promise<ArgCheck> {
   const r = interpretToolPath(raw, base);
   if (!r.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" refused: ${r.reason}` };
-  const cred = credentialPathRejection(r.path);
+  const cred = credentialTargetRejection(r.path);
   if (cred) return { ok: false, code: 'credential_path', reason: `${label} "${raw}" (${r.path}) denied: ${cred}` };
   const g = await guard(r.path, roots, base);
   if (!g.ok) return { ok: false, code: 'path_outside_roots', reason: `${label} "${raw}" (${r.path}) denied: ${g.reason}` };
@@ -989,10 +1298,40 @@ async function checkGlobPattern(
     const cred = credentialPathRejection(alt);
     if (cred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: alternative "${alt}": ${cred}` };
     const root = globRootFor(alt, searchBase);
-    const rootCred = credentialPathRejection(root);
+    const rootCred = credentialTargetRejection(root);
     if (rootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${root}: ${rootCred}` };
     const g = await guard(root, roots, searchBase);
     if (!g.ok) return bad(`alternative "${alt}" searches ${root}: ${g.reason}`);
+  }
+  // F2 D2: rg runs `--files --glob <alt>` inside the search base (or, for an
+  // absolute alternative, inside the pattern's static prefix) and lists any
+  // file the alternative matches, credential files included. Deny when any
+  // alternative could match a credential file actually present there.
+  const scanned = new Map<string, CredentialScan>();
+  for (const alt of alts) {
+    const abs = path.isAbsolute(alt);
+    const rgRoot = abs ? globRootFor(alt, searchBase) : path.resolve(searchBase);
+    let scan = scanned.get(key(rgRoot));
+    if (!scan) {
+      const r = scanForCredentials(rgRoot);
+      if (!r.ok) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: ${r.reason}` };
+      scan = r.scan;
+      scanned.set(key(rgRoot), scan);
+    }
+    if (scan.files.length === 0) continue;
+    let relPattern = alt;
+    if (abs) {
+      const prefix = path.normalize(rgRoot);
+      relPattern = alt.slice(prefix.length).replace(/^[\\/]+/, '');
+    }
+    const hit = scan.files.find((f) => globCouldMatch(relPattern, f));
+    if (hit !== undefined) {
+      return {
+        ok: false,
+        code: 'credential_path',
+        reason: `glob pattern "${pattern}" refused: alternative "${alt}" can match a credential file under ${rgRoot}`,
+      };
+    }
   }
   return argOk;
 }
@@ -1077,8 +1416,29 @@ async function checkReadArgs(
       if (!c.ok) return c;
       const g = pathField('glob');
       if (g.bad) return g.bad;
-      if (g.value !== undefined) return checkGrepGlob(g.value);
-      return argOk;
+      if (g.value !== undefined) {
+        const gc = checkGrepGlob(g.value);
+        if (!gc.ok) return gc;
+      }
+      // F2 D2: exclude every credential entry under the search root by
+      // rewriting `glob` with anchored negatives (rg: a later glob wins and
+      // a negated directory is pruned). The rewrite is mandatory: the caller
+      // runs the rewritten input or nothing.
+      const searchRoot = interpretToolPath(p.value ?? '', base);
+      if (!searchRoot.ok) return { ok: false, code: 'path_outside_roots', reason: `path refused: ${searchRoot.reason}` };
+      const scanned = scanForCredentials(searchRoot.path);
+      if (!scanned.ok) return { ok: false, code: 'credential_path', reason: `Grep refused: ${scanned.reason}` };
+      const negatives = credentialNegatives(scanned.scan);
+      if (negatives === null) {
+        return {
+          ok: false,
+          code: 'credential_path',
+          reason: `Grep refused: a credential entry under ${searchRoot.path} cannot be excluded by glob; narrow \`path\``,
+        };
+      }
+      if (negatives.length === 0) return argOk;
+      const glob = [g.value, ...negatives].filter((t): t is string => typeof t === 'string' && t !== '').join(' ');
+      return { ok: true, updatedInput: { ...input, glob } };
     }
     default:
       return { ok: false, code: 'invalid_arguments', reason: `no read-argument rule for ${canonical}` };
@@ -1161,10 +1521,12 @@ export async function evaluateToolCall(
 
   // ── Class-specific argument / root validation (hard limits) ────────────────
   let networkPreapproved = false;
+  let updatedInput: Record<string, unknown> | undefined;
   switch (actionClass) {
     case 'read': {
       const r = await checkReadArgs(policy, canonical, input, guard);
       if (!r.ok) return deny(r.code, r.reason, actionClass);
+      updatedInput = r.updatedInput;
       break;
     }
     case 'write': {
@@ -1235,8 +1597,10 @@ export async function evaluateToolCall(
   }
 
   // ── Approval ───────────────────────────────────────────────────────────────
+  const allow = (approved: boolean): PolicyDecision =>
+    updatedInput ? { allow: true, actionClass, approved, updatedInput } : { allow: true, actionClass, approved };
   const need = networkPreapproved ? { needed: false, why: '' } : approvalNeeded(policy, actionClass);
-  if (!need.needed) return { allow: true, actionClass, approved: false };
+  if (!need.needed) return allow(false);
   if (policy.permissionMode === 'dontAsk') {
     return deny('approval_required', `${need.why}; permission_mode dontAsk never asks`, actionClass);
   }
@@ -1248,7 +1612,7 @@ export async function evaluateToolCall(
     approved = false;
   }
   return approved === true
-    ? { allow: true, actionClass, approved: true }
+    ? allow(true)
     : deny('approval_required', `${need.why}; no approval was granted`, actionClass);
 }
 
@@ -1391,7 +1755,94 @@ export interface PolicyAuditEvent {
   agentId: string;
   toolName: string;
   decision: PolicyDecision;
-  via: 'PreToolUse' | 'canUseTool' | 'mcp-broker';
+  via: 'PreToolUse' | 'PostToolUse' | 'canUseTool' | 'mcp-broker';
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Search output redaction (F2 D2 defense in depth)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// After Grep/Glob ran, the PostToolUse hook inspects the tool's own result
+// object (`tool_response`; shapes verified against the bundled CLI 2.1.162:
+// Grep `{mode?, numFiles, filenames[], content?, numLines?, numMatches?, …}`,
+// Glob `{durationMs, numFiles, filenames[], truncated}`) and, when ANY listed
+// path or ANY path-looking prefix of a content line names a credential
+// location (literally or through its real path), replaces the whole output
+// with an empty result of the same shape plus a notice (`updatedToolOutput`,
+// which the CLI validates against the tool's outputSchema and then sends to
+// the model instead of the original). Prefix extraction is deliberately
+// over-inclusive (every `:`/`-` boundary of a line is tried, so `path:1:x`,
+// `path-12-x` context lines and `path:3` counts are all covered); a false
+// positive costs one redacted search, a false negative leaks a secret.
+
+const SEARCH_REDACTION_NOTICE =
+  '[Skippy tool policy: search results withheld because they included a well-known credential location (FR-SEC-02); narrow `path` or add an excluding glob]';
+const MAX_PREFIXES_PER_LINE = 64;
+
+function candidatePathPrefixes(line: string): string[] {
+  const out: string[] = [];
+  const driveOffset = /^[A-Za-z]:/.test(line) ? 2 : 0;
+  for (let i = driveOffset; i < line.length && out.length < MAX_PREFIXES_PER_LINE; i++) {
+    const c = line[i];
+    if (c === ':' || c === '-') out.push(line.slice(0, i));
+  }
+  out.push(line);
+  return out;
+}
+
+function namesCredential(candidate: string, searchRoot: string): boolean {
+  const c = candidate.trim();
+  if (c === '') return false;
+  const abs = path.isAbsolute(c) ? path.normalize(c) : path.resolve(searchRoot, c);
+  return credentialPathRejection(c) !== null || credentialTargetRejection(abs) !== null;
+}
+
+/**
+ * Judge a Grep/Glob result. Returns the replacement output (same shape) and
+ * the reason when the result names a credential path, else null.
+ */
+export function redactSearchOutput(
+  policy: ExecutionPolicy,
+  toolName: string,
+  toolInput: unknown,
+  toolResponse: unknown,
+): { replacement: Record<string, unknown>; reason: string } | null {
+  const canonical = canonicalTool(toolName);
+  if (canonical !== 'Grep' && canonical !== 'Glob') return null;
+  if (!toolResponse || typeof toolResponse !== 'object' || Array.isArray(toolResponse)) return null;
+  const input = toolInput && typeof toolInput === 'object' ? (toolInput as Record<string, unknown>) : {};
+  const root = interpretToolPath(typeof input['path'] === 'string' ? input['path'] : '', policy.cwd);
+  const searchRoot = root.ok ? root.path : policy.cwd;
+  const res = toolResponse as Record<string, unknown>;
+  const offenders: string[] = [];
+  const filenames = Array.isArray(res['filenames']) ? (res['filenames'] as unknown[]) : [];
+  for (const f of filenames) {
+    if (typeof f !== 'string') continue;
+    if (namesCredential(f, searchRoot)) offenders.push(f);
+  }
+  if (typeof res['content'] === 'string') {
+    for (const line of res['content'].split(/\r?\n/)) {
+      if (candidatePathPrefixes(line).some((p) => namesCredential(p, searchRoot))) {
+        offenders.push(line.slice(0, 80));
+        break;
+      }
+    }
+  }
+  if (offenders.length === 0) return null;
+  const reason = `${canonical} results named ${offenders.length} credential path(s) under ${searchRoot}; output withheld`;
+  if (canonical === 'Glob') {
+    return { replacement: { durationMs: 0, numFiles: 0, filenames: [], truncated: false }, reason };
+  }
+  const mode = typeof res['mode'] === 'string' ? res['mode'] : 'files_with_matches';
+  const replacement: Record<string, unknown> = { mode, numFiles: 0, filenames: [] };
+  if (mode === 'content') {
+    replacement['content'] = SEARCH_REDACTION_NOTICE;
+    replacement['numLines'] = 1;
+  } else if (mode === 'count') {
+    replacement['content'] = '';
+    replacement['numMatches'] = 0;
+  }
+  return { replacement, reason };
 }
 
 export interface SdkEnforcementHooks extends EnforcementHooks {
@@ -1468,12 +1919,47 @@ export function buildClaudeSdkPermissionOptions(
       decision,
     );
     hooks.onDecision?.({ agentId: policy.agentId, toolName: hookInput.tool_name, decision, via: 'PreToolUse' });
-    if (decision.allow) return {}; // defer to the normal permission flow (canUseTool)
+    if (decision.allow) {
+      // A mandatory rewrite (Grep credential negatives) can only reach the
+      // tool from here: canUseTool is never consulted for auto-approved read
+      // tools (verified live). `allow` + `updatedInput` runs the rewritten
+      // call; nothing else is broadened (the policy already decided allow).
+      if (decision.updatedInput) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'allow',
+            permissionDecisionReason: 'Allowed by Skippy tool policy with credential exclusions applied',
+            updatedInput: decision.updatedInput,
+          },
+        };
+      }
+      return {}; // defer to the normal permission flow (canUseTool)
+    }
     return {
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
         permissionDecisionReason: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
+      },
+    };
+  };
+
+  const postToolUse: HookCallback = async (hookInput) => {
+    if (hookInput.hook_event_name !== 'PostToolUse') return {};
+    const verdict = redactSearchOutput(policy, hookInput.tool_name, hookInput.tool_input, hookInput.tool_response);
+    if (!verdict) return {};
+    hooks.onDecision?.({
+      agentId: policy.agentId,
+      toolName: hookInput.tool_name,
+      decision: deny('credential_path', verdict.reason, 'read'),
+      via: 'PostToolUse',
+    });
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        updatedToolOutput: verdict.replacement,
+        additionalContext: SEARCH_REDACTION_NOTICE,
       },
     };
   };
@@ -1488,7 +1974,7 @@ export function buildClaudeSdkPermissionOptions(
       hooks.onDecision?.({ agentId: policy.agentId, toolName, decision, via: 'canUseTool' });
     }
     return decision.allow
-      ? { behavior: 'allow', updatedInput: input, toolUseID: options.toolUseID }
+      ? { behavior: 'allow', updatedInput: decision.updatedInput ?? input, toolUseID: options.toolUseID }
       : {
           behavior: 'deny',
           message: `Denied by Skippy tool policy (${decision.code}): ${decision.reason}`,
@@ -1512,7 +1998,10 @@ export function buildClaudeSdkPermissionOptions(
       ]),
     ],
     canUseTool,
-    hooks: { PreToolUse: [{ hooks: [preToolUse] }] },
+    hooks: {
+      PreToolUse: [{ hooks: [preToolUse] }],
+      PostToolUse: [{ matcher: 'Grep|Glob', hooks: [postToolUse] }],
+    },
     cwd: policy.cwd,
     additionalDirectories: policy.readRoots.filter((r) => r !== policy.cwd),
     // Ignore user/project/local settings so ambient `permissions.allow` rules

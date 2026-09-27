@@ -14,7 +14,7 @@
 //
 // Run: node --import tsx --test src/tool-policy.test.ts
 
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs, readdirSync } from 'node:fs';
 import * as os from 'node:os';
@@ -54,9 +54,23 @@ const BOARD_IDS = readdirSync(path.join(REPO_ROOT, 'agent_space', 'boards'))
   .map((f) => f.slice(0, -3))
   .sort();
 
+const createdTmpDirs: string[] = [];
+
 async function tmpDir(prefix: string): Promise<string> {
-  return fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+  const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)));
+  createdTmpDirs.push(dir);
+  return dir;
 }
+
+after(async () => {
+  for (const dir of createdTmpDirs) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+});
 
 function charter(frontmatter: Record<string, unknown>, loaded = true): Charter {
   return {

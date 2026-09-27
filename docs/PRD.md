@@ -342,6 +342,7 @@ Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled
 | OQ-15 | Is Obsidian Local REST ever a vault write path? (FR-WIKI-01/02) | No: REST is read/search only; all vault writes go through the local VaultBroker (lock, hash CAS, containment, append-only rules) |
 | OQ-16 | Reserved append-only paths and ingest limits (FR-WIKI-02/03) | Every `.md` under `40_Daily/` is reserved for `type: daily` and `50_Agents/<board>/agent_log.md` for `agent_log`; ingest rejects files over 64 MiB; rejection records for unsafe names go to `00_Inbox/_ingest-errors/` |
 | OQ-17 | Content-level secret exposure to boards (FR-SEC-02) | Credential paths are denied by name; a secret inside an ordinarily named file in an assigned worktree remains readable. Revisit with T10 executors (e.g. negative globs or content redaction) |
+| OQ-18 | Search-tree enumeration bounds for Grep/Glob credential exclusion (FR-SEC-01/02) | Before a Grep/Glob runs, the search root is enumerated (long names, reparse points not followed, `.git`-style VCS directories and `node_modules` skipped) up to 25,000 entries / depth 40; a tree over the bound is denied ("narrow `path`"), never approximated. Grep gets anchored negative globs for every credential entry found; Glob is denied when its pattern could match one. A PostToolUse hook withholds any Grep/Glob output that still names a credential path (covers the `node_modules` carve-out). Revisit the bounds and the carve-out with T10 executors |
 
 ### Owner decisions, 2026-09-26
 
