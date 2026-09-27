@@ -56,7 +56,7 @@ typescript-eslint's recommended config deliberately disables core rules that `ts
 
 ## CI (`.github/workflows/ci.yml`)
 
-- Earlier runs failed at `pnpm/action-setup@v4` with "Multiple versions of pnpm specified" because the step set `version: 9` while `package.json` declares `packageManager: pnpm@9.15.0`. `gh run list` showed no successful run. The explicit version is removed; the action now reads `packageManager`.
+- Earlier runs failed at `pnpm/action-setup@v4` with "Multiple versions of pnpm specified" because the step set `version: 9` while `package.json` declares `packageManager: pnpm@9.15.0`. `gh run list` showed no successful run. The old ubuntu `rust` job had also failed, at `cargo test` with exit 101 (run 28278478351; its log has since expired). The explicit version is removed; the action now reads `packageManager`.
 - `ts` job (ubuntu-latest): install → typecheck → lint → `pnpm -r test` → `test:scripts` → `build:runtime` → UI build.
 - `windows` job (windows-latest): install → typecheck → lint → `pnpm -r test` → `test:scripts` → `build:runtime` → UI build → Rust toolchain + cache → `cargo check` → `cargo test`.
 - Triggers: `push` to `main` and `pull_request`. The workflow does not run for a push to `m0/foundation` alone; it runs when a PR is opened.
