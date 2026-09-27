@@ -2842,7 +2842,12 @@ mod f5_regression_tests {
 
     #[tokio::test]
     async fn f5_d1_repo_at_a_190_char_root_commits_and_leaves_nothing_in_the_git_dir() {
-        let pre = std::env::temp_dir()
+        // Build on the canonical long temp path: an 8.3 short temp dir (as on CI
+        // runners) is expanded by git past MAX_PATH, which is not what this test probes.
+        let canon = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canon = canon.to_string_lossy();
+        let base = std::path::PathBuf::from(canon.strip_prefix(r"\\?\").unwrap_or(&canon));
+        let pre = base
             .join(format!("skippy-f5-lp-{}-", &uuid::Uuid::new_v4().simple().to_string()[..8]))
             .to_string_lossy()
             .into_owned();

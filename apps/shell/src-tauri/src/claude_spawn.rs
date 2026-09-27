@@ -465,7 +465,10 @@ mod tests {
 
     #[test]
     fn validate_cwd_requires_an_existing_directory_and_rechecks_the_real_path() {
-        let tmp = std::env::temp_dir().join(format!("skippy-cwd-{}", uuid::Uuid::new_v4()));
+        // Start from the canonical long temp path: CI runners report an 8.3
+        // short form (`RUNNER~1`), which validate_cwd rightly refuses.
+        let base = strip_verbatim(std::fs::canonicalize(std::env::temp_dir()).unwrap());
+        let tmp = base.join(format!("skippy-cwd-{}", uuid::Uuid::new_v4()));
         let work = tmp.join("work");
         std::fs::create_dir_all(&work).unwrap();
         let file = work.join("f.txt");
