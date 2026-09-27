@@ -35,9 +35,10 @@
 //      `~<digit>` is refused outright as an 8.3 alias (the vault broker's
 //      short-name rule). Grep and Glob are search tools whose *results* can
 //      reach credential files the arguments never named (F2 D2, F3): before
-//      either runs, the exact tree rg will walk (the interpreted `path`, or
-//      for an absolute Glob pattern its static prefix, as a real long path)
-//      is enumerated in full — bounded, long names, reparse points not
+//      either runs, the exact tree rg will walk (Grep: the interpreted
+//      `path`; Glob: the CLI's own single split of the raw pattern,
+//      `cliGlobSplit` — for a pattern without a metacharacter that is its
+//      `dirname`; as a real long path) is enumerated in full — bounded, long names, reparse points not
 //      descended, NO carve-outs — and the call is DENIED when any credential
 //      entry exists anywhere in that tree or the bound is hit ("narrow
 //      `path`"). Nothing is rewritten and no glob is modelled: a glob can
@@ -79,7 +80,8 @@
 // has an exact input-field allowlist; every path argument is interpreted the
 // way the bundled CLI resolves it (see "Built-in tool arguments" below) and
 // environment-dependent forms (`~`, env vars, root-/drive-relative, UNC) are
-// refused; Glob patterns are checked per brace alternative; `disallowed_tools`
+// refused; Glob patterns are refused per brace alternative (the tree rg
+// walks is derived once from the raw pattern); `disallowed_tools`
 // entries must name catalogued tools.
 
 import { createHash, randomUUID } from 'node:crypto';
@@ -770,9 +772,11 @@ function withinVaultScope(policy: ExecutionPolicy, rel: string): boolean {
 //   : resolve(cwd, p).
 // `backfillObservableInput` (what the PreToolUse hook sees) is applied only to
 // `file_path`/`notebook_path`, so Grep/Glob reach the hook with a raw `~`.
-// Glob (`Au7`) runs `rg --files --glob <pattern>` in `path`; when the pattern
-// is absolute it instead searches the pattern's static prefix (text before the
-// first of `*?[{`, cut at the last separator) and ignores `path`. Grep (`call`)
+// Glob (`Au7`) runs `rg --files --glob <pattern> … <path>`; when the pattern
+// is absolute it instead searches the pattern's split base (`b3f`: the text
+// before the first of `*?[{`, cut at the last separator — or, with no
+// metacharacter, the pattern's `dirname`) and ignores `path`; see
+// `cliGlobSplit` for the transcribed code. Grep (`call`)
 // passes `glob` to `rg --glob` after splitting on whitespace and (outside
 // braces) commas. Neither expands environment variables (rg runs via
 // execFile, no shell).
@@ -793,7 +797,9 @@ function withinVaultScope(policy: ExecutionPolicy, rel: string): boolean {
 //   - Glob patterns: every brace alternative (nested, capped) AND the raw
 //     pattern are checked; each must be free of the forms above and of `..`
 //     segments, and its static prefix — absolute, or resolved against `path`
-//     — must pass the PathGuard. Unbalanced braces are refused.
+//     — must pass the PathGuard. Unbalanced braces are refused. Separately,
+//     the tree rg walks (`cliGlobSplit` of the raw pattern) must pass the
+//     PathGuard and the search-tree credential gate.
 //   - Grep `glob` filters must be relative and `..`-free in every alternative.
 
 /** Exact input fields per catalogued built-in (SDK `sdk-tools.d.ts` + the
@@ -1031,9 +1037,97 @@ export function credentialPathRejection(p: string): string | null {
   return null;
 }
 
-/** Directory rg will enumerate for one glob alternative: the text before the
- * first glob metacharacter, cut after the last separator (the CLI's Glob
- * `b3f` split), or the whole literal when there is no metacharacter. */
+// ──────────────────────────────────────────────────────────────────────────────
+// The CLI's own Glob/Grep search-root derivation (EC2; FR-SEC-01/02)
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// Transcribed from the CLI bundled in @anthropic-ai/claude-agent-sdk-win32-x64
+// 0.3.162 (claude.exe, CLI 2.1.162). `Zl`/`mk` are `require("path")` (win32 on
+// Windows), `x8()` is the session cwd (the SDK `cwd` option), `o8()` the
+// platform:
+//
+//   Glob.getPath({path:H}){return H?GK(H):x8()}
+//   Glob.call: Au7(H.pattern, tC.getPath(H), …)
+//   function b3f(H){let q=/[*?[{]/,$=H.match(q);
+//     if(!$||$.index===void 0){let z=Zl.dirname(H),Y=Zl.basename(H);
+//       return{baseDir:z,relativePattern:Y}}
+//     let K=H.slice(0,$.index),_=Math.max(K.lastIndexOf("/"),K.lastIndexOf(Zl.sep));
+//     if(_===-1)return{baseDir:"",relativePattern:H};
+//     let f=K.slice(0,_),A=H.slice(_+1);if(f===""&&_===0)f="/";
+//     if(o8()==="windows"&&/^[A-Za-z]:$/.test(f))f=f+Zl.sep;
+//     return{baseDir:f,relativePattern:A}}
+//   async function Au7(H,q,…){let A=q,z=H;
+//     if(Zl.isAbsolute(H)){let{baseDir:L,relativePattern:Z}=b3f(H);if(L)A=L,z=Z}
+//     … j=["--files","--glob",z,"--sort=modified","--no-ignore","--hidden",…];
+//     D=await o6H(j,A,_) …}
+//   zz7 (rg runner): execFile(rg, [...rgArgs, ...j, A], {cwd: x8(), …})
+//   Grep.call: J=q?GK(q):x8(); … o6H(L,J,…)   (rg positional = J, cwd = x8())
+//   function GK(H,q){let $=q??x8();…let K=H.trim();if(!K)return mk.normalize($);
+//     if(K==="~")return homedir();if(K.startsWith("~/"))return mk.join(homedir(),K.slice(2));
+//     let _=K;if(o8()==="windows"&&K.match(/^\/[a-z]\//i))_=OVH(K);
+//     if(mk.isAbsolute(_))return mk.normalize(_);return mk.resolve($,_)}
+//   OVH (for `/c/…`): K[1].toUpperCase()+":"+K.slice(2).replaceAll("/","\\")
+//
+// So the tree rg walks is the LAST positional argument: for Glob the raw
+// pattern is split ONCE (never per brace alternative) — a pattern without a
+// metacharacter walks its `dirname` with its `basename` as the glob, which
+// matches that name at ANY depth — and for Grep it is the interpreted `path`.
+// `--glob` values only filter within that tree.
+
+/** The CLI's `GK` path helper, verbatim (no refusals: callers validate the
+ * argument with `interpretToolPath` first). */
+function cliToolPath(raw: string, cwd: string): string {
+  const k = raw.trim();
+  if (!k) return path.normalize(cwd);
+  if (k === '~') return os.homedir();
+  if (k.startsWith('~/')) return path.join(os.homedir(), k.slice(2));
+  let p = k;
+  if (onWindows() && /^\/[a-z]\//i.test(k)) p = `${k.charAt(1).toUpperCase()}:${k.slice(2).replace(/\//g, '\\')}`;
+  if (path.isAbsolute(p)) return path.normalize(p);
+  return path.resolve(cwd, p);
+}
+
+/** The CLI's Glob `b3f` split of an (absolute) pattern, verbatim. */
+function cliSplitAbsolutePattern(pattern: string): { baseDir: string; relativePattern: string } {
+  const m = GLOB_META.exec(pattern);
+  if (!m) return { baseDir: path.dirname(pattern), relativePattern: path.basename(pattern) };
+  const head = pattern.slice(0, m.index);
+  const cut = Math.max(head.lastIndexOf('/'), head.lastIndexOf(path.sep));
+  if (cut === -1) return { baseDir: '', relativePattern: pattern };
+  let baseDir = head.slice(0, cut);
+  const relativePattern = pattern.slice(cut + 1);
+  if (baseDir === '' && cut === 0) baseDir = '/';
+  if (onWindows() && /^[A-Za-z]:$/.test(baseDir)) baseDir = baseDir + path.sep;
+  return { baseDir, relativePattern };
+}
+
+/**
+ * Exactly what the bundled CLI hands rg for a Glob call (`Au7`): `baseDir` is
+ * rg's positional search path (the tree it walks; rg's cwd is the session
+ * `cwd`) and `relativePattern` its `--glob`. `pathArg` is the raw Glob `path`
+ * input (an empty/absent value means the session cwd), `cwd` the session cwd.
+ */
+export function cliGlobSplit(
+  pattern: string,
+  pathArg: string | undefined,
+  cwd: string,
+): { baseDir: string; relativePattern: string } {
+  let baseDir = pathArg ? cliToolPath(pathArg, cwd) : cwd;
+  let relativePattern = pattern;
+  if (path.isAbsolute(pattern)) {
+    const split = cliSplitAbsolutePattern(pattern);
+    if (split.baseDir) {
+      baseDir = split.baseDir;
+      relativePattern = split.relativePattern;
+    }
+  }
+  return { baseDir, relativePattern };
+}
+
+/** Static prefix of one absolute glob alternative, used only to REFUSE an
+ * alternative that names a place outside the roots or a credential location
+ * (never to decide what rg walks: that is `cliGlobSplit` on the raw
+ * pattern). */
 function globRootFor(alt: string, searchBase: string): string {
   const idx = alt.search(GLOB_META);
   let prefix: string;
@@ -1064,9 +1158,12 @@ function globRootFor(alt: string, searchBase: string): string {
 //   The tree rg will walk is enumerated in full and the call is denied if a
 //   credential entry exists anywhere in it.
 //
-// - The tree is the interpreted `path` (Grep, Glob) or — for an absolute
-//   Glob pattern — the pattern's static prefix, which is the cwd the CLI
-//   hands rg; it is normalised and resolved to its real long path first.
+// - The tree is rg's positional search path: the interpreted `path` (Grep;
+//   Glob with a relative pattern) or — for an absolute Glob pattern — the
+//   CLI's single split of the raw pattern (`cliGlobSplit`; a pattern with no
+//   metacharacter walks its `dirname`, and a brace pattern is cut at its
+//   first `{`, never per alternative). It is normalised and resolved to its
+//   real long path first.
 // - `readdirSync` returns long names; reparse points (symlinks, junctions)
 //   are judged by name and NOT descended, matching rg without `--follow`.
 // - There is NO carve-out: `node_modules`, `.git` and every other directory
@@ -1218,9 +1315,13 @@ async function checkPathArg(
   return argOk;
 }
 
-/** Glob `pattern` (+ optional `path`) must stay inside the read roots. */
+/** Glob `pattern` (+ optional `path`) must stay inside the read roots.
+ * `pathArg` is the raw Glob `path` (already validated by `checkPathArg`),
+ * `cwd` the session cwd, `searchBase` the interpreted `path` (or `cwd`). */
 async function checkGlobPattern(
   pattern: string,
+  pathArg: string | undefined,
+  cwd: string,
   searchBase: string,
   roots: readonly string[],
   guard: PathGuard,
@@ -1240,19 +1341,21 @@ async function checkGlobPattern(
     const g = await guard(root, roots, searchBase);
     if (!g.ok) return bad(`alternative "${alt}" searches ${root}: ${g.reason}`);
   }
-  // F2 D2 / F3: rg runs `--files --glob <alt>` inside the search base (or,
-  // for an absolute alternative, inside the pattern's static prefix — the
-  // CLI ignores `path` then) and lists any file the alternative matches.
-  // The whole tree rg walks is enumerated; a credential entry anywhere in it
-  // denies the call. The pattern itself is not modelled (it can only narrow).
-  const judged = new Set<string>();
-  for (const alt of alts) {
-    const rgRoot = path.isAbsolute(alt) ? globRootFor(alt, searchBase) : path.resolve(searchBase);
-    if (judged.has(key(rgRoot))) continue;
-    judged.add(key(rgRoot));
-    const why = searchTreeRejection(`glob pattern "${pattern}"`, rgRoot);
-    if (why) return { ok: false, code: 'credential_path', reason: why };
-  }
+  // F2 D2 / F3 / EC2: the tree rg walks is exactly the CLI's split of the RAW
+  // pattern (`cliGlobSplit`: one split, never per brace alternative; a
+  // pattern without a metacharacter walks its `dirname`). That tree is
+  // root-checked and enumerated in full; a credential entry anywhere in it
+  // denies the call. The relative pattern is not modelled (it only narrows).
+  const split = cliGlobSplit(pattern, pathArg, cwd);
+  const baseWhy = pathAmbiguity(split.baseDir, true);
+  if (baseWhy) return bad(`rg would search "${split.baseDir}": ${baseWhy}`);
+  const rgRoot = path.resolve(cwd, split.baseDir);
+  const rgRootCred = credentialTargetRejection(rgRoot);
+  if (rgRootCred) return { ok: false, code: 'credential_path', reason: `glob pattern "${pattern}" refused: searches ${rgRoot}: ${rgRootCred}` };
+  const g = await guard(rgRoot, roots, cwd);
+  if (!g.ok) return bad(`rg would search ${rgRoot}: ${g.reason}`);
+  const why = searchTreeRejection(`glob pattern "${pattern}"`, rgRoot);
+  if (why) return { ok: false, code: 'credential_path', reason: why };
   return argOk;
 }
 
@@ -1322,7 +1425,7 @@ async function checkReadArgs(
         const r = interpretToolPath(p.value, base);
         if (r.ok) searchBase = r.path;
       }
-      return checkGlobPattern(pattern, searchBase, roots, guard);
+      return checkGlobPattern(pattern, p.value, base, searchBase, roots, guard);
     }
     case 'Grep': {
       if (typeof input['pattern'] !== 'string') {
@@ -1684,7 +1787,12 @@ export interface PolicyAuditEvent {
 // every such substring goes through the same `credentialPathRejection` the
 // deny list uses — there is no second copy of the list to drift. Listed
 // filenames and the `path:` prefix of each content line are additionally
-// resolved to their real long path. Output that cannot be judged within
+// resolved to their real long path (a relative one against the session cwd,
+// as the CLI prints it, and the search root). The search root itself (Grep
+// `path`; Glob `cliGlobSplit` base) is re-resolved at PostToolUse time and
+// the output withheld when it now names a credential location — a Grep over
+// a single file prints no filename, so a TOCTOU swap of that `path` is only
+// visible this way (D2). Output that cannot be judged within
 // bounds (oversized, malformed shape, a line with too many boundaries) is
 // withheld too. A false positive costs one redacted search; a false
 // negative leaks a secret.
@@ -1705,7 +1813,7 @@ const END_BOUNDARY = /[\\/:\s-]/;
  * by the deny list; the `path:` prefix is also judged through its real path.
  * Returns a reason string when the line cannot be judged within bounds.
  */
-export function lineCredentialRejection(line: string, searchRoot: string): string | null {
+export function lineCredentialRejection(line: string, searchRoot: string, cliCwd?: string): string | null {
   if (line === '') return null;
   const starts: number[] = [0];
   const ends: number[] = [];
@@ -1731,9 +1839,15 @@ export function lineCredentialRejection(line: string, searchRoot: string): strin
   const colon = line.indexOf(':', drive);
   const prefix = (colon === -1 ? line : line.slice(0, colon)).trim();
   if (prefix !== '') {
-    const abs = path.isAbsolute(prefix) ? path.normalize(prefix) : path.resolve(searchRoot, prefix);
-    const why = credentialTargetRejection(abs);
-    if (why) return `"${prefix.slice(0, 80)}": ${why}`;
+    // The CLI prints a relative prefix relative to its session cwd (`JBH`:
+    // `path.relative(x8(), p)` unless that climbs out); `searchRoot` is kept
+    // as a second base (defense in depth).
+    const bases = cliCwd === undefined || key(cliCwd) === key(searchRoot) ? [searchRoot] : [cliCwd, searchRoot];
+    for (const b of bases) {
+      const abs = path.isAbsolute(prefix) ? path.normalize(prefix) : path.resolve(b, prefix);
+      const why = credentialTargetRejection(abs);
+      if (why) return `"${prefix.slice(0, 80)}": ${why}`;
+    }
   }
   return null;
 }
@@ -1752,9 +1866,14 @@ export function redactSearchOutput(
   const canonical = canonicalTool(toolName);
   if (canonical !== 'Grep' && canonical !== 'Glob') return null;
   const input = toolInput && typeof toolInput === 'object' ? (toolInput as Record<string, unknown>) : {};
-  const root = interpretToolPath(typeof input['path'] === 'string' ? input['path'] : '', policy.cwd);
-  const searchRoot = root.ok ? root.path : policy.cwd;
-  const withhold = (reason: string, mode?: unknown): { replacement: Record<string, unknown>; reason: string } => {
+  const pathArg = typeof input['path'] === 'string' ? input['path'] : undefined;
+  const root = interpretToolPath(pathArg ?? '', policy.cwd);
+  let searchRoot = root.ok ? root.path : policy.cwd;
+  if (canonical === 'Glob' && typeof input['pattern'] === 'string' && root.ok) {
+    // The tree the CLI actually handed rg (see `cliGlobSplit`).
+    searchRoot = path.resolve(policy.cwd, cliGlobSplit(input['pattern'], pathArg, policy.cwd).baseDir);
+  }
+  const withhold =(reason: string, mode?: unknown): { replacement: Record<string, unknown>; reason: string } => {
     const full = `${canonical} output withheld (search root ${searchRoot}): ${reason}`;
     if (canonical === 'Glob') return { replacement: { durationMs: 0, numFiles: 0, filenames: [], truncated: false }, reason: full };
     const m = typeof mode === 'string' ? mode : 'files_with_matches';
@@ -1775,6 +1894,13 @@ export function redactSearchOutput(
   else if (toolResponse && typeof toolResponse === 'object' && !Array.isArray(toolResponse)) res = toolResponse as Record<string, unknown>;
   else return withhold(`unrecognised tool_response shape (${Array.isArray(toolResponse) ? 'array' : typeof toolResponse})`);
   const mode = res['mode'];
+  // D2 TOCTOU: the search root is re-resolved NOW. A Grep over a single file
+  // prints content lines without a filename, so a `path` swapped (junction /
+  // symlink) to a credential location after the gate ran is only visible
+  // here.
+  const rootNow = credentialTargetRejection(searchRoot);
+  if (rootNow) return withhold(`search root now resolves to a credential location: ${rootNow}`, mode);
+  const outputBases = key(policy.cwd) === key(searchRoot) ? [searchRoot] : [policy.cwd, searchRoot];
   let bytes = 0;
   const lines: string[] = [];
   if (Object.hasOwn(res, 'filenames') && res['filenames'] !== undefined) {
@@ -1783,10 +1909,13 @@ export function redactSearchOutput(
       if (typeof f !== 'string') return withhold('`filenames` holds a non-string entry', mode);
       bytes += f.length;
       lines.push(f);
-      // A listed path is judged whole (literal and real) as well as by line.
-      const abs = path.isAbsolute(f) ? path.normalize(f) : path.resolve(searchRoot, f);
-      const why = credentialTargetRejection(abs);
-      if (why) return withhold(`listed path "${f.slice(0, 80)}": ${why}`, mode);
+      // A listed path is judged whole (literal and real) as well as by line;
+      // a relative one is relative to the session cwd (CLI `JBH`).
+      for (const b of outputBases) {
+        const abs = path.isAbsolute(f) ? path.normalize(f) : path.resolve(b, f);
+        const why = credentialTargetRejection(abs);
+        if (why) return withhold(`listed path "${f.slice(0, 80)}": ${why}`, mode);
+      }
     }
   }
   if (Object.hasOwn(res, 'content') && res['content'] !== undefined) {
@@ -1796,7 +1925,7 @@ export function redactSearchOutput(
   }
   if (bytes > MAX_REDACTION_BYTES) return withhold(`output is ${bytes} characters (over ${MAX_REDACTION_BYTES}); withheld unjudged`, mode);
   for (const line of lines) {
-    const why = lineCredentialRejection(line, searchRoot);
+    const why = lineCredentialRejection(line, searchRoot, policy.cwd);
     if (why) return withhold(why, mode);
   }
   return null;
