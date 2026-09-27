@@ -16,12 +16,17 @@
 // Algorithm (no shell interpolation anywhere — execFileSync with argv):
 //   0. If a pending-index-sync marker exists (<git-dir>/skippy-autocommit-pending,
 //      {version, ref, new, parent}, left by a tick whose commit landed but whose
-//      real-index sync failed), validate it first (E5-2): recover only if HEAD
-//      is still symbolically on `ref` and resolves to exactly `new`; otherwise
-//      (reset --hard, checkout of another branch, a user commit on top, a
-//      corrupt marker) drop it WITHOUT touching the index and report
-//      `dropped`. If recovery is attempted and fails, the tick stops with an
-//      explicit error rather than stacking a commit on an unsynced index.
+//      real-index sync failed), validate it first (E5-2, D5): recover only if
+//      its version is known (absent/1 = legacy without `ref`, 2 = current, which
+//      must carry `ref`), HEAD is still symbolically on `ref` and resolves to
+//      exactly `new`, `new` exists as a commit, and `parent` is `new`'s first
+//      parent (null <=> `new` is a root commit) and exists as a commit.
+//      Otherwise (reset --hard, checkout of another branch, a user commit on
+//      top, a corrupt/unknown/forged marker) drop it WITHOUT touching the
+//      index and report `dropped` — a bad marker never wedges the tick. If
+//      recovery is attempted and fails (e.g. a held index.lock), the tick
+//      stops with an explicit error rather than stacking a commit on an
+//      unsynced index.
 //   1. Resolve HEAD (or note it's unborn) and the symbolic ref it points to.
 //   2. Fail fast, untouched, if <git-dir>/index.lock already exists.
 //   3. Snapshot the real index's vault entries (`ls-files -s -v -z`) and
@@ -32,14 +37,37 @@
 //      paths are FLAGGED. Neither is ever committed or re-synced.
 //   4. Seed a throwaway index (read-tree HEAD), `add -A -- vault` into it,
 //      write-tree -> preliminary tree; the candidate list is every vault path
-//      whose (mode, oid) differs between HEAD and that tree.
+//      whose (mode, oid) differs between HEAD and that tree. The throwaway
+//      index lives in a fresh private directory in the OS temp dir
+//      (`<tmp>/skippy-ac-<16 hex>/index`, D1) — never under the git dir, so a
+//      long repo/worktree path can't push `<index>.lock` past MAX_PATH — and
+//      the directory (with any `.lock`) is removed in every case.
 //   5. Exclusions, each restored to its HEAD state in the temp index (or
-//      removed if HEAD lacks it) with ONE `update-index -z --index-info`:
-//        a. flagged paths, b. user-owned paths,
-//        c. secret filename hits, d. secret content hits — the content scan
-//           reads the exact blobs the commit would contain (`cat-file
-//           --batch`), as latin1 and again with NULs stripped (UTF-16).
-//      All are reported as `skipped`.
+//      removed if HEAD lacks it) with ONE `update-index -z --index-info`.
+//      Each excluded path gets exactly one reason (first match wins):
+//        flagged            skip-worktree / assume-unchanged (step 3)
+//        user-staged        user-owned (step 3)
+//        gitlink            a new or changed mode-160000 entry on either side
+//                           (nested repo, submodule pointer bump, D4); gitlinks
+//                           already in HEAD are left exactly as they are
+//        secret-filename    shared filename rules
+//        too-large-to-scan  blob (or pre-filter working-tree file) larger than
+//                           limits.maxScanBytes (64 MiB, D3) — fail closed
+//        secret-content     shared content rules hit the exact blob the commit
+//                           would contain (`cat-file --batch`, fetched in
+//                           batches of at most maxScanBytes; latin1 and again
+//                           with NULs stripped for UTF-16), OR — for a path
+//                           with ANY `filter` attribute (git-lfs, custom clean
+//                           filters, D2) — its working-tree bytes, i.e. the
+//                           pre-filter content the user wrote
+//        worktree-unscannable  filtered path whose working-tree file can't be
+//                           read (missing, not a regular file, non-UTF-8 name)
+//        changed-during-scan   filtered path whose working-tree file no longer
+//                           cleans to the staged blob after the scan
+//                           (`hash-object --stdin-paths`), so the scanned bytes
+//                           are not provably the committed bytes
+//      All are reported in `skipped` (byte order) and `skippedDetail`
+//      ({path, reason}).
 //   6. If nothing is left, no-op. Otherwise write-tree -> final tree.
 //   7. git commit-tree <tree> [-p HEAD] -m <msg> (plumbing: no hooks run).
 //   8. git update-ref HEAD <new> <old> — compare-and-swap; fails explicitly
@@ -58,14 +86,17 @@
 // then dropped (HEAD moved) and the next tick re-commits the working-tree
 // content, so the revert lasts only until the next tick.
 //
-// The temp index / pathspec files are removed in every case.
+// The temp index / pathspec files (and their private temp directories) are
+// removed in every case.
 //
 // Secrets: `commit-tree` never runs hooks, so a repo's own secret-scanning
 // pre-commit hook can never see (or block) this commit. The built-in guard
-// (step 5c/5d) is the only line of defense.
+// (step 5) is the only line of defense. Filtered paths are scanned both
+// post-filter (the blob) and pre-filter (the working-tree bytes), so an LFS
+// pointer or a reversible clean filter cannot smuggle a secret into history.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, isAbsolute, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -75,6 +106,8 @@ const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 const VAULT_PATHSPEC = 'vault';
 const PENDING_MARKER_NAME = 'skippy-autocommit-pending';
 const PENDING_MARKER_VERSION = 2;
+const GITLINK_MODE = '160000';
+const REGULAR_FILE_MODES = new Set(['100644', '100755']);
 const SYNC_RETRY_ATTEMPTS = 3;
 const SYNC_RETRY_DELAY_MS = 20;
 const MAX_GIT_OUTPUT = 1024 * 1024 * 1024;
@@ -94,6 +127,9 @@ const CONTENT_RULES = SECRET_PATTERNS.content.map((r) => ({
   re: new RegExp(r.pattern),
   ci: r.ignoreAsciiCase === true,
 }));
+/** Largest blob / pre-filter file the guard will scan (and so commit). */
+export const MAX_SCAN_BYTES = SECRET_PATTERNS.limits.maxScanBytes;
+if (!Number.isSafeInteger(MAX_SCAN_BYTES) || MAX_SCAN_BYTES <= 0) throw new Error('limits.maxScanBytes must be a positive integer');
 
 /** ASCII-only lowercase (identical to Rust's `to_ascii_lowercase`). */
 function asciiLower(s) {
@@ -232,25 +268,164 @@ function userOwnedPaths(snapshot, headEntries) {
   return owned;
 }
 
-/** Content-scan blobs by oid with one `cat-file --batch`. Returns hit oids. */
+/** A fresh private directory in the OS temp dir: `<tmp>/skippy-ac-<16 hex>`. */
+function makePrivateTempDir() {
+  const dir = join(tmpdir(), `skippy-ac-${crypto.randomBytes(8).toString('hex')}`);
+  mkdirSync(dir); // non-recursive: fails rather than reuse an existing dir
+  return dir;
+}
+
+/** Blob sizes by oid (`cat-file --batch-check`); throws on a missing object. */
+function blobSizes(root, oids) {
+  const sizes = new Map();
+  if (oids.length === 0) return sizes;
+  const lines = gitRaw(root, ['cat-file', '--batch-check'], { input: oids.map((o) => `${o}\n`).join('') })
+    .toString('latin1')
+    .split('\n')
+    .filter((l) => l.length > 0);
+  if (lines.length !== oids.length) throw new Error('cat-file --batch-check: truncated output');
+  oids.forEach((oid, i) => {
+    const f = lines[i].split(' ');
+    if (f[1] === 'missing') throw new Error(`cat-file --batch-check: blob ${oid} missing`);
+    const size = Number(f[2]);
+    if (f[0] !== oid || !Number.isSafeInteger(size) || size < 0) throw new Error('cat-file --batch-check: unexpected header');
+    sizes.set(oid, size);
+  });
+  return sizes;
+}
+
+/**
+ * Content-scan blobs by oid. Returns Map<oid, 'secret-content' |
+ * 'too-large-to-scan'> for the blobs that must not be committed. Blobs over
+ * MAX_SCAN_BYTES are never read (D3); the rest are fetched with
+ * `cat-file --batch` in groups of at most MAX_SCAN_BYTES total, so memory
+ * (and Node's string/buffer limits) stay bounded however big the vault is.
+ */
 function scanBlobsForSecrets(root, oids) {
-  const unique = [...new Set(oids)];
-  const hits = new Set();
-  if (unique.length === 0) return hits;
-  const out = gitRaw(root, ['cat-file', '--batch'], { input: unique.map((o) => `${o}\n`).join('') });
-  let pos = 0;
+  const unique = [...new Set(oids)].sort(byteOrder);
+  const verdicts = new Map();
+  const sizes = blobSizes(root, unique);
+  const groups = [];
+  let group = [];
+  let groupBytes = 0;
   for (const oid of unique) {
-    const nl = out.indexOf(0x0a, pos);
-    if (nl < 0) throw new Error('cat-file --batch: truncated output');
-    const header = out.subarray(pos, nl).toString('latin1').split(' ');
-    pos = nl + 1;
-    if (header[1] === 'missing') throw new Error(`cat-file --batch: blob ${oid} missing`);
-    const size = parseInt(header[2], 10);
-    if (header[0] !== oid || !Number.isFinite(size)) throw new Error('cat-file --batch: unexpected header');
-    if (matchesSecretContent(out.subarray(pos, pos + size))) hits.add(oid);
-    pos += size + 1; // trailing LF
+    const size = sizes.get(oid);
+    if (size > MAX_SCAN_BYTES) {
+      verdicts.set(oid, 'too-large-to-scan');
+      continue;
+    }
+    if (group.length > 0 && groupBytes + size > MAX_SCAN_BYTES) {
+      groups.push(group);
+      group = [];
+      groupBytes = 0;
+    }
+    group.push(oid);
+    groupBytes += size;
   }
-  return hits;
+  if (group.length > 0) groups.push(group);
+  for (const g of groups) {
+    const out = gitRaw(root, ['cat-file', '--batch'], { input: g.map((o) => `${o}\n`).join('') });
+    let pos = 0;
+    for (const oid of g) {
+      const nl = out.indexOf(0x0a, pos);
+      if (nl < 0) throw new Error('cat-file --batch: truncated output');
+      const header = out.subarray(pos, nl).toString('latin1').split(' ');
+      pos = nl + 1;
+      if (header[1] === 'missing') throw new Error(`cat-file --batch: blob ${oid} missing`);
+      const size = Number(header[2]);
+      if (header[0] !== oid || size !== sizes.get(oid) || pos + size > out.length) {
+        throw new Error('cat-file --batch: unexpected header');
+      }
+      if (matchesSecretContent(out.subarray(pos, pos + size))) verdicts.set(oid, 'secret-content');
+      pos += size + 1; // trailing LF
+    }
+  }
+  return verdicts;
+}
+
+/**
+ * The subset of `paths` with a `filter` attribute set to anything (`set` or
+ * any driver name, e.g. `lfs`); `unspecified` / `unset` mean no filter. One
+ * `check-attr -z --stdin` call, raw byte paths on stdin. Only `filter` can
+ * make the blob differ materially from the bytes the user wrote (`text`,
+ * `eol`, `diff` do not; `working-tree-encoding` output is still scanned as a
+ * blob, with the UTF-16 view).
+ */
+function filteredPaths(root, paths, env) {
+  if (paths.length === 0) return new Set();
+  const out = gitRaw(root, ['check-attr', '-z', '--stdin', 'filter'], {
+    env,
+    input: Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1'),
+  });
+  const f = out.toString('latin1').split('\0');
+  const filtered = new Set();
+  for (let i = 0; i + 2 < f.length; i += 3) {
+    if (f[i + 1] !== 'filter') throw new Error('check-attr: unexpected output');
+    if (f[i + 2] !== 'unspecified' && f[i + 2] !== 'unset') filtered.add(f[i]);
+  }
+  return filtered;
+}
+
+/** True if a byte-string path is valid UTF-8 (round-trips). */
+function isUtf8Path(bytePath) {
+  return toBytePath(toDisplayPath(bytePath)) === bytePath;
+}
+
+/**
+ * Pre-filter scan of one working-tree file (D2). Returns null when clean,
+ * else 'secret-content' | 'too-large-to-scan' | 'worktree-unscannable'.
+ */
+function scanWorktreeFile(root, bytePath) {
+  if (!isUtf8Path(bytePath)) return 'worktree-unscannable';
+  const full = join(root, toDisplayPath(bytePath));
+  try {
+    const st = lstatSync(full);
+    if (!st.isFile()) return 'worktree-unscannable';
+    if (st.size > MAX_SCAN_BYTES) return 'too-large-to-scan';
+    const bytes = readFileSync(full);
+    if (bytes.length > MAX_SCAN_BYTES) return 'too-large-to-scan';
+    return matchesSecretContent(bytes) ? 'secret-content' : null;
+  } catch {
+    return 'worktree-unscannable';
+  }
+}
+
+/** C-quote a byte-string path for line-based git stdin (`"..."`, octal escapes). */
+function cQuote(bytePath) {
+  let out = '"';
+  for (let i = 0; i < bytePath.length; i++) {
+    const c = bytePath.charCodeAt(i);
+    if (c === 0x22 || c === 0x5c) out += `\\${bytePath[i]}`;
+    else if (c < 0x20 || c === 0x7f) out += `\\${c.toString(8).padStart(3, '0')}`;
+    else out += bytePath[i];
+  }
+  return `${out}"`;
+}
+
+/**
+ * Filtered paths whose working-tree file no longer cleans to `expectedOid`
+ * (re-run the clean filter via `hash-object --stdin-paths`, no -w). If git
+ * cannot hash them at all, every path is treated as changed (fail closed).
+ */
+function changedSinceAdd(root, paths, expectedOid, env) {
+  const changed = new Set();
+  if (paths.length === 0) return changed;
+  let lines;
+  try {
+    lines = gitRaw(root, ['hash-object', '--stdin-paths'], {
+      env,
+      input: Buffer.from(paths.map((p) => `${cQuote(p)}\n`).join(''), 'latin1'),
+    })
+      .toString('latin1')
+      .split('\n')
+      .filter((l) => l.length > 0);
+  } catch {
+    return new Set(paths);
+  }
+  paths.forEach((p, i) => {
+    if (lines.length !== paths.length || lines[i] !== expectedOid(p)) changed.add(p);
+  });
+  return changed;
 }
 
 export function commitAndAdvanceHead(root, tree, head, message) {
@@ -294,7 +469,7 @@ function syncRealIndex(root, newCommit, parentEntries, paths) {
       (p) => !snap.flagged.has(p) && !snap.unmerged.has(p) && snap.entries.get(p) === parentEntries.get(p),
     );
     if (safe.length === 0) return 0; // never run a pathspec-less reset
-    const dir = mkdtempSync(join(tmpdir(), 'skippy-autocommit-sync-'));
+    const dir = makePrivateTempDir();
     try {
       const specFile = join(dir, 'pathspec');
       writeFileSync(specFile, Buffer.from(safe.map((p) => `${p}\0`).join(''), 'latin1'));
@@ -335,11 +510,49 @@ function parseMarker(raw) {
     return null;
   }
   if (!m || typeof m !== 'object' || Array.isArray(m)) return null;
+  // Known versions only (D5): absent or 1 = legacy (no `ref`), 2 = current.
+  const hasVersion = Object.prototype.hasOwnProperty.call(m, 'version');
+  if (hasVersion && m.version !== 1 && m.version !== PENDING_MARKER_VERSION) return null;
   if (typeof m.new !== 'string' || !OID_RE.test(m.new)) return null;
   if (!(m.parent === null || m.parent === undefined || (typeof m.parent === 'string' && OID_RE.test(m.parent)))) return null;
   const hasRef = Object.prototype.hasOwnProperty.call(m, 'ref');
+  if (hasVersion && m.version === PENDING_MARKER_VERSION && !hasRef) return null;
   if (hasRef && !(m.ref === null || (typeof m.ref === 'string' && m.ref.startsWith('refs/')))) return null;
   return { new: m.new, parent: m.parent ?? null, hasRef, ref: hasRef ? m.ref : undefined };
+}
+
+/** Parent oids of commit `oid` (header order), or null if it isn't a commit. */
+function commitParents(root, oid) {
+  let raw;
+  try {
+    if (git(root, ['cat-file', '-t', oid]) !== 'commit') return null;
+    raw = gitRaw(root, ['cat-file', 'commit', oid]).toString('latin1');
+  } catch {
+    return null;
+  }
+  const end = raw.indexOf('\n\n');
+  return (end < 0 ? raw : raw.slice(0, end))
+    .split('\n')
+    .filter((l) => l.startsWith('parent '))
+    .map((l) => l.slice('parent '.length));
+}
+
+/**
+ * D5: `new` must be a commit whose first parent is exactly `parent` (or a
+ * root commit when `parent` is null), and `parent` must exist as a commit.
+ * Returns null if the marker is consistent, else the reason to drop it.
+ */
+function markerObjectsProblem(root, marker) {
+  const parents = commitParents(root, marker.new);
+  if (!parents) return `${marker.new} is not an existing commit`;
+  const first = parents[0] ?? null;
+  if (first !== marker.parent) {
+    return `recorded parent ${marker.parent ?? '(none)'} is not the first parent of ${marker.new} (${first ?? 'root commit'})`;
+  }
+  if (marker.parent !== null && !commitParents(root, marker.parent)) {
+    return `parent ${marker.parent} is not an existing commit`;
+  }
+  return null;
 }
 
 /**
@@ -374,6 +587,12 @@ function recoverPendingSync(root, gitDir) {
     };
   }
 
+  const problem = markerObjectsProblem(root, marker);
+  if (problem) {
+    dropMarker(markerPath);
+    return { synced: false, newSha: marker.new, dropped: `inconsistent pending marker: ${problem}; index left untouched` };
+  }
+
   try {
     const parentEntries = treeEntries(root, marker.parent);
     const newEntries = treeEntries(root, marker.new);
@@ -391,10 +610,10 @@ function recoverPendingSync(root, gitDir) {
  *
  * @param {string} root repo root (contains `vault/`)
  * @param {() => string} [now] injectable clock for tests
- * @returns {{status: 'noop'|'committed'|'pending-sync', skipped: string[], recovered: object|null, syncError?: string}}
+ * @returns {{status: 'noop'|'committed'|'pending-sync', skipped: string[], skippedDetail: {path: string, reason: string}[], recovered: object|null, syncError?: string}}
  */
 export function runAutocommit(root, now = () => new Date().toISOString()) {
-  if (!existsSync(join(root, 'vault'))) return { status: 'noop', skipped: [], recovered: null };
+  if (!existsSync(join(root, 'vault'))) return { status: 'noop', skipped: [], skippedDetail: [], recovered: null };
 
   const gitDir = resolveGitDir(root);
 
@@ -412,8 +631,8 @@ export function runAutocommit(root, now = () => new Date().toISOString()) {
   const head = resolveHead(root);
   const ref = resolveSymbolicHead(root);
 
-  const tempDir = mkdtempSync(join(tmpdir(), 'skippy-autocommit-'));
-  const env = { GIT_INDEX_FILE: join(tempDir, `index-${crypto.randomUUID()}`) };
+  const tempDir = makePrivateTempDir();
+  const env = { GIT_INDEX_FILE: join(tempDir, 'index') };
   try {
     const headEntries = treeEntries(root, head);
     const snapshot = realIndexSnapshot(root);
@@ -426,24 +645,45 @@ export function runAutocommit(root, now = () => new Date().toISOString()) {
     const prelimEntries = treeEntries(root, preliminaryTree);
     const allChanged = differingPaths(headEntries, prelimEntries);
 
-    const flaggedHits = allChanged.filter((p) => snapshot.flagged.has(p));
-    const ownedHits = allChanged.filter((p) => !snapshot.flagged.has(p) && owned.has(p));
-    const candidates = allChanged.filter((p) => !snapshot.flagged.has(p) && !owned.has(p));
-    const nameHits = candidates.filter((p) => matchesSecretFilename(p));
-    const toScan = candidates.filter((p) => !nameHits.includes(p) && prelimEntries.has(p));
-    const blobOf = (p) => {
-      const [mode, oid] = prelimEntries.get(p).split(' ');
-      return mode === '160000' ? null : oid; // gitlinks have no content here
-    };
-    const hitOids = scanBlobsForSecrets(root, toScan.map(blobOf).filter(Boolean));
-    const contentHits = toScan.filter((p) => hitOids.has(blobOf(p)));
+    const modeOf = (entries, p) => (entries.has(p) ? entries.get(p).split(' ')[0] : null);
+    const blobOf = (p) => prelimEntries.get(p).split(' ')[1];
 
-    const excluded = [...flaggedHits, ...ownedHits, ...nameHits, ...contentHits];
-    const excludedSet = new Set(excluded);
-    const commitPaths = allChanged.filter((p) => !excludedSet.has(p));
+    /** @type {Map<string, string>} path -> reason; first match wins. */
+    const reasons = new Map();
+    for (const p of allChanged) {
+      if (snapshot.flagged.has(p)) reasons.set(p, 'flagged');
+      else if (owned.has(p)) reasons.set(p, 'user-staged');
+      else if (modeOf(headEntries, p) === GITLINK_MODE || modeOf(prelimEntries, p) === GITLINK_MODE) reasons.set(p, 'gitlink');
+      else if (matchesSecretFilename(p)) reasons.set(p, 'secret-filename');
+    }
+
+    // Post-filter scan: the exact blobs the commit would contain.
+    const toScan = allChanged.filter((p) => !reasons.has(p) && prelimEntries.has(p));
+    const blobVerdicts = scanBlobsForSecrets(root, toScan.map(blobOf));
+    for (const p of toScan) {
+      const v = blobVerdicts.get(blobOf(p));
+      if (v) reasons.set(p, v);
+    }
+
+    // Pre-filter scan (D2): for regular files with any `filter` attribute,
+    // also scan the working-tree bytes and prove they still clean to the blob.
+    const regular = toScan.filter((p) => !reasons.has(p) && REGULAR_FILE_MODES.has(modeOf(prelimEntries, p)));
+    const filtered = filteredPaths(root, regular, env);
+    const scannedFiltered = [];
+    for (const p of regular) {
+      if (!filtered.has(p)) continue;
+      const v = scanWorktreeFile(root, p);
+      if (v) reasons.set(p, v);
+      else scannedFiltered.push(p);
+    }
+    for (const p of changedSinceAdd(root, scannedFiltered, blobOf, env)) reasons.set(p, 'changed-during-scan');
+
+    const excluded = allChanged.filter((p) => reasons.has(p));
+    const commitPaths = allChanged.filter((p) => !reasons.has(p));
     const skipped = excluded.map(toDisplayPath);
+    const skippedDetail = excluded.map((p) => ({ path: toDisplayPath(p), reason: reasons.get(p) }));
 
-    if (commitPaths.length === 0) return { status: 'noop', skipped, recovered };
+    if (commitPaths.length === 0) return { status: 'noop', skipped, skippedDetail, recovered };
 
     let tree = preliminaryTree;
     if (excluded.length > 0) {
@@ -455,18 +695,18 @@ export function runAutocommit(root, now = () => new Date().toISOString()) {
       tree = git(root, ['write-tree'], { env });
     }
     const headTree = head ? git(root, ['rev-parse', `${head}^{tree}`]) : EMPTY_TREE;
-    if (tree === headTree) return { status: 'noop', skipped, recovered };
+    if (tree === headTree) return { status: 'noop', skipped, skippedDetail, recovered };
 
     const stamp = now().replace(/\.\d+Z$/, 'Z');
     const newCommit = commitAndAdvanceHead(root, tree, head, `chore(vault): auto-commit ${stamp}`);
 
     try {
       syncRealIndex(root, newCommit, headEntries, commitPaths);
-      return { status: 'committed', skipped, recovered };
+      return { status: 'committed', skipped, skippedDetail, recovered };
     } catch (e) {
       // HEAD already advanced — NOT a failed commit. Next tick finishes it.
       writePendingMarker(gitDir, ref, newCommit, head);
-      return { status: 'pending-sync', skipped, recovered, syncError: e.message };
+      return { status: 'pending-sync', skipped, skippedDetail, recovered, syncError: e.message };
     }
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
@@ -486,7 +726,7 @@ function reportResult(result) {
     console.error(`autocommit: committed but index sync pending: ${result.syncError}`);
   }
   if (result.skipped?.length) {
-    console.error(`autocommit: skipped vault paths (user-staged/flagged/secret): ${result.skipped.join(', ')}`);
+    console.error(`autocommit: skipped vault paths: ${result.skippedDetail.map((d) => `${d.path} (${d.reason})`).join(', ')}`);
   }
 }
 

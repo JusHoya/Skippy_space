@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, chmodSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, chmodSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -745,6 +745,10 @@ test('E5-6 rm --cached vault path stays staged for removal', () =>
     assert.ok(status.split('\n').includes('D  vault/x.md'), `staged rm --cached was undone: ${status}`);
   }));
 
+// Intent-to-add is user-owned BY DESIGN (E5-6): the `git add -N` entry differs
+// from HEAD, so the autocommit never commits it and leaves the i-t-a entry
+// exactly as the user made it (an earlier red-team expectation that it be
+// committed was stale).
 test('E5-6 intent-to-add and fully staged vault paths are user-owned', () =>
   withRepo((r) => {
     r.write('vault/m.md', 'm1\n');
@@ -869,3 +873,327 @@ test('E5-9 user commit inside the pending window is healed on the next tick', ()
     assert.equal(r.show('HEAD:vault/n.md'), 'v2', 'next tick must re-commit the vault change');
     assert.equal(r.status(), '');
   }));
+
+// =========================================================================
+// Final-round red-team regressions (EC5 D1..D5). Mirrors the Rust twin's
+// `f5_regression_tests` module case for case. Every case fails on a24234e
+// except D1 here: the long-path failure was Rust-only (its temp index lived
+// under the git dir); this case pins the Node engine to the same semantics.
+// =========================================================================
+
+const SCAN_CAP = 64 * 1024 * 1024; // limits.maxScanBytes
+const SECRET_BODY = 'OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\naws AKIAABCDEFGHIJKLMNOP\n';
+
+const skippyFilesIn = (dir) => readdirSync(dir).filter((f) => /skippy/.test(f));
+const reasonOf = (res, path) => res.skippedDetail?.find((d) => d.path === path)?.reason;
+
+// --- D1: temp index lives in the OS temp dir, not the git dir. -----------
+
+test('F5-D1 a repo at a 190-char root commits and leaves nothing in the git dir', (t) => {
+  const pre = join(tmpdir(), `skippy-f5-lp-${crypto.randomBytes(4).toString('hex')}-`);
+  const need = 190 - pre.length;
+  if (need < 8) {
+    t.skip(`OS temp dir is too long (${tmpdir().length} chars) to build a 190-char repo root`);
+    return;
+  }
+  const dir = pre + 'a'.repeat(need);
+  mkdirSync(dir, { recursive: true });
+  try {
+    const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' });
+    g('init', '-q', '-b', 'main');
+    g('config', 'user.name', 'Skippy Test');
+    g('config', 'user.email', 'skippy-test@example.invalid');
+    g('config', 'commit.gpgsign', 'false');
+    g('config', 'core.hooksPath', '.no-hooks');
+    g('config', 'core.longpaths', 'false'); // the default; pin it against global config
+    write(dir, 'vault/n.md', 'x\n');
+    g('add', '.');
+    g('commit', '-q', '-m', 'init');
+    write(dir, 'vault/n.md', 'y\n');
+    const res = runAutocommit(dir);
+    assert.equal(res.status, 'committed', JSON.stringify(res));
+    assert.equal(g('show', 'HEAD:vault/n.md').trim(), 'y');
+    assert.equal(g('status', '--porcelain').trim(), '');
+    assert.deepEqual(skippyFilesIn(join(dir, '.git')), [], 'temp files must never be created in the git dir');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- D2: filtered paths are scanned pre-filter (working-tree bytes). -----
+
+test('F5-D2 a secret behind an LFS-style clean filter is not committed', () =>
+  withRepo((r) => {
+    // Simulated git-lfs: the clean filter turns content into a pointer-like
+    // hash, so the blob scan alone would see nothing.
+    r.q('config', 'filter.lfs.clean', 'git hash-object --stdin');
+    r.q('config', 'filter.lfs.smudge', 'cat');
+    r.q('config', 'filter.lfs.required', 'true');
+    r.write('.gitattributes', 'vault/*.txt filter=lfs diff=lfs merge=lfs -text\n');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/creds.txt', SECRET_BODY);
+    r.write('vault/ok.txt', 'harmless payload\n');
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    const tree = r.headTree();
+    assert.ok(!tree.includes('vault/creds.txt'), `filtered secret reached history: ${tree}`);
+    assert.ok(tree.includes('vault/ok.txt'), 'clean filtered file must still be committed');
+    assert.deepEqual(res.skipped, ['vault/creds.txt']);
+    assert.equal(reasonOf(res, 'vault/creds.txt'), 'secret-content');
+    assert.equal(r.status(), '', 'committed filtered file must be synced to the real index');
+  }));
+
+test('F5-D2 a secret behind a reversible (rot13) clean filter is not committed', () =>
+  withRepo((r) => {
+    r.q('config', 'filter.rot.clean', 'tr A-Za-z N-ZA-Mn-za-m');
+    r.q('config', 'filter.rot.smudge', 'tr A-Za-z N-ZA-Mn-za-m');
+    r.write('.gitattributes', 'vault/*.md filter=rot\n');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/n.md', 'my aws key AKIAABCDEFGHIJKLMNOP\n');
+    r.write('vault/fine.md', 'nothing here\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skipped, ['vault/n.md']);
+    assert.equal(r.show('HEAD:vault/n.md'), 'k', 'rot13-encoded secret was committed');
+    assert.ok(r.headTree().includes('vault/fine.md'));
+  }));
+
+test('F5-D2 a secret stored through real git-lfs is not committed', (t) => {
+  try {
+    execFileSync('git', ['lfs', 'version'], { stdio: 'ignore' });
+  } catch {
+    t.skip('git-lfs is not installed (the simulated-filter case covers the mechanism)');
+    return;
+  }
+  withRepo((r) => {
+    r.q('lfs', 'install', '--local');
+    r.write('.gitattributes', 'vault/*.txt filter=lfs diff=lfs merge=lfs -text\n');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/creds.txt', SECRET_BODY);
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skipped, ['vault/creds.txt']);
+    assert.ok(!r.headTree().includes('vault/creds.txt'));
+  });
+});
+
+test('F5-D2 diff/text attributes alone do not trigger the pre-filter path', () =>
+  withRepo((r) => {
+    r.write('.gitattributes', 'vault/*.md diff=foo text\n');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skipped, []);
+  }));
+
+// --- D3: blobs over the scan limit are excluded, never fatal. ------------
+
+test('F5-D3 a blob over the scan limit is skipped and unrelated vault work still commits', () =>
+  withRepo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/big.bin', Buffer.alloc(SCAN_CAP + 1, 'the magnificent skippy thinks monkeys are adorable\n'));
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.ok(!r.headTree().includes('vault/big.bin'), 'unscanned blob was committed');
+    assert.deepEqual(res.skipped, ['vault/big.bin']);
+    assert.equal(reasonOf(res, 'vault/big.bin'), 'too-large-to-scan');
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    assert.equal(autocommit.MAX_SCAN_BYTES, SCAN_CAP, 'limits.maxScanBytes must be 64 MiB');
+  }));
+
+// --- D4: gitlinks are never added or changed. ----------------------------
+
+function nestedRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  execFileSync('git', ['init', '-q', dir]);
+  execFileSync('git', ['-C', dir, '-c', 'user.name=x', '-c', 'user.email=x@x', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'x']);
+}
+
+// Every skip reason, byte-ordered, same strings as the Rust twin's
+// `skipped_detail` (Rust: `tests::skip_reasons_match_the_node_twin`).
+test('F5 skip reasons are reported per path, in byte order', () => {
+  const repo = makeRepo();
+  try {
+    const g = repo.git;
+    write(repo.dir, '.gitattributes', 'vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\n');
+    g('config', 'filter.rot.clean', 'tr A-Za-z N-ZA-Mn-za-m');
+    g('config', 'filter.rot.smudge', 'tr A-Za-z N-ZA-Mn-za-m');
+    // Non-deterministic clean filter: every run appends its own PID, so the
+    // post-scan re-hash can never match the staged blob.
+    g('config', 'filter.pid.clean', 'cat; echo $$');
+    g('config', 'filter.pid.smudge', 'cat');
+    write(repo.dir, 'vault/flag.md', 'f1\n');
+    write(repo.dir, 'vault/mine.md', 'm1\n');
+    write(repo.dir, 'vault/n.md', 'x\n');
+    seedInitialCommit(repo); // adds README.md only
+    g('add', '-A', '.');
+    g('commit', '-q', '-m', 'seed vault');
+    g('update-index', '--assume-unchanged', 'vault/flag.md');
+    write(repo.dir, 'vault/flag.md', 'f2\n');
+    write(repo.dir, 'vault/mine.md', 'm2\n');
+    g('add', 'vault/mine.md');
+    write(repo.dir, 'vault/.env', 'K=1\n');
+    write(repo.dir, 'vault/leak.md', 'AKIAABCDEFGHIJKLMNOP\n');
+    write(repo.dir, 'vault/rot/leak.md', 'AKIAABCDEFGHIJKLMNOP\n');
+    write(repo.dir, 'vault/pid/p.md', 'plain\n');
+    write(repo.dir, 'vault/big.bin', Buffer.alloc(SCAN_CAP + 1, 'the magnificent skippy\n'));
+    nestedRepo(join(repo.dir, 'vault', 'sub'));
+    write(repo.dir, 'vault/n.md', 'y\n');
+
+    const res = runAutocommit(repo.dir);
+    assert.equal(res.status, 'committed');
+    const want = [
+      ['vault/.env', 'secret-filename'],
+      ['vault/big.bin', 'too-large-to-scan'],
+      ['vault/flag.md', 'flagged'],
+      ['vault/leak.md', 'secret-content'],
+      ['vault/mine.md', 'user-staged'],
+      ['vault/pid/p.md', 'changed-during-scan'],
+      ['vault/rot/leak.md', 'secret-content'],
+      ['vault/sub', 'gitlink'],
+    ];
+    assert.deepEqual(res.skippedDetail?.map((d) => [d.path, d.reason]), want);
+    assert.deepEqual(res.skipped, want.map(([p]) => p));
+    const files = g('ls-tree', '-r', '--name-only', 'HEAD').split('\n');
+    assert.equal(g('show', 'HEAD:vault/n.md').trim(), 'y');
+    for (const [p] of want) if (p !== 'vault/flag.md' && p !== 'vault/mine.md') assert.ok(!files.includes(p), `${p} was committed`);
+  } finally {
+    cleanup(repo);
+  }
+});
+
+test('F5-D4 a nested repo inside the vault is not committed as an orphan gitlink', () =>
+  withRepo((r) => {
+    r.write('a', 'a\n');
+    r.commitAll('init');
+    nestedRepo(join(r.dir, 'vault', 'cloned'));
+    r.write('vault/n.md', 'x\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skipped, ['vault/cloned']);
+    assert.equal(reasonOf(res, 'vault/cloned'), 'gitlink');
+    assert.ok(!/^160000/m.test(r.ok('ls-tree', '-r', 'HEAD')), 'orphan gitlink committed');
+    assert.ok(r.headTree().includes('vault/n.md'));
+  }));
+
+test('F5-D4 a vault submodule pointer bump is not autocommitted', () =>
+  withRepo((r) => {
+    const src = e5Repo();
+    try {
+      src.write('n.md', 'v1\n');
+      src.commitAll('s');
+      r.write('a', 'a\n');
+      r.commitAll('init');
+      r.q('-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', src.dir, 'vault');
+      r.q('commit', '-q', '-m', 'add vault submodule');
+      const before = r.ok('rev-parse', 'HEAD');
+      write(r.dir, 'vault/n.md', 'v2\n');
+      execFileSync('git', ['-C', join(r.dir, 'vault'), '-c', 'user.name=x', '-c', 'user.email=x@x', '-c', 'commit.gpgsign=false', 'commit', '-q', '-am', 'inner']);
+      const res = runAutocommit(r.dir);
+      assert.equal(res.status, 'noop');
+      assert.deepEqual(res.skipped, ['vault']);
+      assert.equal(r.ok('rev-parse', 'HEAD'), before, 'submodule pointer bump was committed');
+    } finally {
+      cleanup(src);
+    }
+  }));
+
+test('F5-D4 an existing gitlink in HEAD is kept when its checkout disappears', () =>
+  withRepo((r) => {
+    r.write('a', 'a\n');
+    r.commitAll('init');
+    const inner = join(r.dir, 'vault', 'cloned');
+    nestedRepo(inner);
+    r.q('add', 'vault/cloned');
+    r.q('commit', '-q', '-m', 'user adds a gitlink on purpose');
+    rmSync(inner, { recursive: true, force: true });
+    r.write('vault/n.md', 'x\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skipped, ['vault/cloned']);
+    assert.match(r.ok('ls-tree', 'HEAD', 'vault/cloned'), /^160000 commit /, 'gitlink deletion was committed');
+  }));
+
+// --- D5: pending-marker hardening. ---------------------------------------
+
+/** c1 (n=A) -> c2 (n=B) -> c3 (n=C); real index n.md reset to `resetTo`'s blob. */
+function markerChain(r, resetTo) {
+  const shas = {};
+  for (const [name, body] of [['c1', 'A\n'], ['c2', 'B\n'], ['c3', 'C\n']]) {
+    r.write('vault/n.md', body);
+    r.commitAll(name);
+    shas[name] = r.ok('rev-parse', 'HEAD');
+  }
+  r.q('reset', '-q', shas[resetTo], '--', 'vault/n.md');
+  return shas;
+}
+
+test('F5-D5 a marker with an unknown version is dropped without touching the index', () =>
+  withRepo((r) => {
+    const { c2, c3 } = markerChain(r, 'c2');
+    const before = r.ok('ls-files', '-s');
+    writeFileSync(r.marker, JSON.stringify({ version: 99, ref: 'refs/heads/main', new: c3, parent: c2 }));
+    const res = runAutocommit(r.dir);
+    assert.ok(res.recovered?.dropped, `unknown version must be dropped: ${JSON.stringify(res.recovered)}`);
+    assert.ok(!existsSync(r.marker));
+    assert.equal(r.ok('ls-files', '-s'), before, 'index was touched by an unknown-version marker');
+  }));
+
+test('F5-D5 a v2 marker without a ref is dropped without touching the index', () =>
+  withRepo((r) => {
+    const { c2, c3 } = markerChain(r, 'c2');
+    const before = r.ok('ls-files', '-s');
+    writeFileSync(r.marker, JSON.stringify({ version: 2, new: c3, parent: c2 }));
+    const res = runAutocommit(r.dir);
+    assert.ok(res.recovered?.dropped, JSON.stringify(res.recovered));
+    assert.equal(r.ok('ls-files', '-s'), before);
+  }));
+
+test('F5-D5 a marker whose parent is not the first parent of new is dropped', () =>
+  withRepo((r) => {
+    const { c1, c3 } = markerChain(r, 'c1');
+    const before = r.ok('ls-files', '-s');
+    writeFileSync(r.marker, JSON.stringify({ version: 2, ref: 'refs/heads/main', new: c3, parent: c1 }));
+    const res = runAutocommit(r.dir);
+    assert.ok(res.recovered?.dropped, `forged parent must be dropped: ${JSON.stringify(res.recovered)}`);
+    assert.ok(!existsSync(r.marker));
+    assert.equal(r.ok('ls-files', '-s'), before, 'index was synced from a forged parent');
+  }));
+
+test('F5-D5 a marker whose parent object is missing never wedges the tick', () =>
+  withRepo((r) => {
+    r.write('vault/n.md', 'A\n');
+    r.commitAll('c1');
+    const c1 = r.ok('rev-parse', 'HEAD');
+    writeFileSync(r.marker, JSON.stringify({ version: 2, ref: 'refs/heads/main', new: c1, parent: '1'.repeat(40) }));
+    r.write('vault/n.md', 'B\n');
+    const res = runAutocommit(r.dir);
+    assert.ok(res.recovered?.dropped, JSON.stringify(res.recovered));
+    assert.equal(res.status, 'committed');
+    assert.ok(!existsSync(r.marker), 'bad marker must not survive');
+    assert.equal(r.show('HEAD:vault/n.md'), 'B');
+  }));
+
+test('F5-D5 a consistent v2 and a consistent legacy (v1) marker are still recovered', () => {
+  for (const legacy of [false, true]) {
+    withRepo((r) => {
+      const { c2, c3 } = markerChain(r, 'c2');
+      const m = legacy ? { new: c3, parent: c2 } : { version: 2, ref: 'refs/heads/main', new: c3, parent: c2 };
+      writeFileSync(r.marker, JSON.stringify(m));
+      const res = runAutocommit(r.dir);
+      assert.ok(res.recovered?.synced, `legacy=${legacy}: ${JSON.stringify(res.recovered)}`);
+      assert.ok(!existsSync(r.marker));
+      assert.equal(r.show(':vault/n.md'), 'C', 'recovery must sync the index to new');
+      assert.equal(r.status(), '');
+    });
+  }
+});

@@ -22,12 +22,17 @@
 //! 0. If a pending-index-sync marker exists
 //!    (`<git-dir>/skippy-autocommit-pending`, `{version, ref, new, parent}`,
 //!    left by a tick whose commit landed but whose real-index sync failed),
-//!    validate it first (E5-2): recover only if HEAD is still symbolically on
-//!    `ref` and resolves to exactly `new`; otherwise (reset --hard, checkout
-//!    of another branch, a user commit on top, a corrupt marker) drop it
-//!    WITHOUT touching the index and report it as dropped. If recovery is
-//!    attempted and fails, the tick stops with an explicit error rather than
-//!    stacking a commit on an unsynced index. See [`recover_pending_sync`].
+//!    validate it first (E5-2, D5): recover only if its version is known
+//!    (absent/1 = legacy without `ref`, 2 = current, which must carry `ref`),
+//!    HEAD is still symbolically on `ref` and resolves to exactly `new`, `new`
+//!    exists as a commit, and `parent` is `new`'s first parent (null <=> `new`
+//!    is a root commit) and exists as a commit. Otherwise (reset --hard,
+//!    checkout of another branch, a user commit on top, a corrupt/unknown/
+//!    forged marker) drop it WITHOUT touching the index and report it as
+//!    dropped — a bad marker never wedges the tick. If recovery is attempted
+//!    and fails (e.g. a held `index.lock`), the tick stops with an explicit
+//!    error rather than stacking a commit on an unsynced index. See
+//!    [`recover_pending_sync`].
 //! 1. Resolve `HEAD` (or note it's unborn) and the symbolic ref it names.
 //! 2. Fail fast, without touching anything, if `<git-dir>/index.lock`
 //!    already exists (someone else holds the real index lock).
@@ -40,14 +45,37 @@
 //! 4. Seed a throwaway index (`GIT_INDEX_FILE=<tmp> git read-tree HEAD`),
 //!    `add -A -- vault` into it, `write-tree` -> preliminary tree. The
 //!    candidate list is every vault path whose (mode, oid) differs between
-//!    HEAD and that tree.
+//!    HEAD and that tree. The throwaway index lives in a fresh private
+//!    directory in the OS temp dir (`<tmp>/skippy-ac-<16 hex>/index`, D1) —
+//!    never under the git dir, so a long repo/worktree path can't push
+//!    `<index>.lock` past MAX_PATH — and the directory (with any `.lock`) is
+//!    removed in every case.
 //! 5. Exclusions, each restored to its HEAD state in the temp index (or
-//!    removed if HEAD lacks it) with ONE `update-index -z --index-info`:
-//!      a. flagged paths, b. user-owned paths,
-//!      c. secret filename hits, d. secret content hits — the content scan
-//!         reads the exact blobs the commit would contain (`cat-file
-//!         --batch`), one char per byte and again with NULs stripped (UTF-16).
-//!    All are reported back as `skipped` paths.
+//!    removed if HEAD lacks it) with ONE `update-index -z --index-info`. Each
+//!    excluded path gets exactly one [`SkipReason`] (first match wins):
+//!      * `flagged` — skip-worktree / assume-unchanged (step 3);
+//!      * `user-staged` — user-owned (step 3);
+//!      * `gitlink` — a new or changed mode-160000 entry on either side
+//!        (nested repo, submodule pointer bump, D4); gitlinks already in
+//!        HEAD are left exactly as they are;
+//!      * `secret-filename` — shared filename rules;
+//!      * `too-large-to-scan` — blob (or pre-filter working-tree file) larger
+//!        than `limits.maxScanBytes` (64 MiB, D3), fail closed;
+//!      * `secret-content` — shared content rules hit the exact blob the
+//!        commit would contain (`cat-file --batch`, fetched in batches of at
+//!        most `maxScanBytes`; one char per byte and again with NULs stripped
+//!        for UTF-16), OR — for a path with ANY `filter` attribute (git-lfs,
+//!        custom clean filters, D2) — its working-tree bytes, i.e. the
+//!        pre-filter content the user wrote;
+//!      * `worktree-unscannable` — filtered path whose working-tree file
+//!        can't be read (missing, not a regular file, non-UTF-8 name);
+//!      * `changed-during-scan` — filtered path whose working-tree file no
+//!        longer cleans to the staged blob after the scan (`hash-object
+//!        --stdin-paths`), so the scanned bytes are not provably the
+//!        committed bytes.
+//!
+//!    All are reported back as `skipped` paths (byte order) plus
+//!    `skipped_detail` (path, reason).
 //! 6. If nothing is left, no-op. Otherwise `write-tree` -> final tree.
 //! 7. `git commit-tree <tree> [-p HEAD] -m <msg>` builds the commit object.
 //!    `commit-tree` is plumbing: it never runs commit hooks, so a flaky
@@ -74,7 +102,8 @@
 //! marker is then dropped (HEAD moved) and the next tick re-commits the
 //! working-tree content, so the revert lasts only until the next tick.
 //!
-//! The temp index / pathspec files are removed in all cases.
+//! The temp index / pathspec files (and their private temp directories) are
+//! removed in all cases.
 //!
 //! ## Secrets (FR-WIKI-06)
 //!
@@ -86,7 +115,10 @@
 //! `.git-credentials`, `secrets.*` except Markdown notes) plus a content scan
 //! for private-key armor (incl. PGP), AWS key ids and secret-key
 //! assignments, Anthropic/OpenAI/Stripe/GitHub/Slack/Google key shapes.
-//! Matches are skipped — left exactly as HEAD has them, or absent.
+//! Matches are skipped — left exactly as HEAD has them, or absent. Paths
+//! with a `filter` attribute are scanned both post-filter (the blob) and
+//! pre-filter (the working-tree bytes), so an LFS pointer or a reversible
+//! clean filter cannot smuggle a secret into history.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -113,6 +145,37 @@ const PENDING_MARKER_NAME: &str = "skippy-autocommit-pending";
 const PENDING_MARKER_VERSION: u64 = 2;
 const SYNC_RETRY_ATTEMPTS: u32 = 3;
 const SYNC_RETRY_DELAY_MS: u64 = 20;
+const GITLINK_MODE: &str = "160000";
+const REGULAR_FILE_MODES: [&str; 2] = ["100644", "100755"];
+
+/// Why a changed vault path was withheld from the autocommit. The string
+/// forms are identical to the Node twin's `skippedDetail[].reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    Flagged,
+    UserStaged,
+    Gitlink,
+    SecretFilename,
+    TooLargeToScan,
+    SecretContent,
+    WorktreeUnscannable,
+    ChangedDuringScan,
+}
+
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::Flagged => "flagged",
+            SkipReason::UserStaged => "user-staged",
+            SkipReason::Gitlink => "gitlink",
+            SkipReason::SecretFilename => "secret-filename",
+            SkipReason::TooLargeToScan => "too-large-to-scan",
+            SkipReason::SecretContent => "secret-content",
+            SkipReason::WorktreeUnscannable => "worktree-unscannable",
+            SkipReason::ChangedDuringScan => "changed-during-scan",
+        }
+    }
+}
 
 /// Shared with the Node twin (single source of truth).
 const SECRET_PATTERNS_JSON: &str = include_str!("../../../../scripts/git-autocommit-secret-patterns.json");
@@ -135,6 +198,8 @@ struct ContentRule {
 struct SecretRules {
     filename: Vec<FilenameRule>,
     content: Vec<ContentRule>,
+    /// Largest blob / pre-filter file the guard will scan (and so commit).
+    max_scan_bytes: u64,
 }
 
 static SECRET_RULES: Lazy<SecretRules> = Lazy::new(|| {
@@ -158,8 +223,16 @@ static SECRET_RULES: Lazy<SecretRules> = Lazy::new(|| {
             ignore_ascii_case: r.get("ignoreAsciiCase").and_then(serde_json::Value::as_bool).unwrap_or(false),
         })
         .collect();
-    SecretRules { filename, content }
+    let max_scan_bytes = v["limits"]["maxScanBytes"]
+        .as_u64()
+        .filter(|&n| n > 0 && n <= (1u64 << 53) - 1)
+        .expect("limits.maxScanBytes must be a positive integer");
+    SecretRules { filename, content, max_scan_bytes }
 });
+
+fn max_scan_bytes() -> u64 {
+    SECRET_RULES.max_scan_bytes
+}
 
 /// One char per byte (identical to Node's `Buffer#toString('latin1')`).
 fn latin1(bytes: &[u8]) -> String {
@@ -231,8 +304,11 @@ pub struct RecoveryOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct AutocommitReport {
     pub outcome: AutocommitOutcome,
-    /// Vault paths withheld from the commit (user-staged, flagged, secret).
+    /// Vault paths withheld from the commit, in byte order.
+    #[allow(dead_code)] // mirrors the Node twin's `skipped`; read by tests/harness
     pub skipped: Vec<String>,
+    /// `skipped` with the reason for each path (Node: `skippedDetail`).
+    pub skipped_detail: Vec<(String, SkipReason)>,
     pub recovered: Option<RecoveryOutcome>,
 }
 
@@ -489,43 +565,228 @@ fn user_owned_paths(snap: &IndexSnapshot, head_entries: &Entries) -> BTreeSet<BP
     owned
 }
 
-/// Content-scan blobs by oid with one `cat-file --batch`. Returns hit oids.
-async fn scan_blobs_for_secrets(root: &Path, oids: &[String]) -> Result<BTreeSet<String>> {
-    let unique: Vec<String> = oids.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
-    let mut hits = BTreeSet::new();
-    if unique.is_empty() {
-        return Ok(hits);
+/// A fresh private directory in the OS temp dir: `<tmp>/skippy-ac-<16 hex>`.
+/// Removed (with everything in it, e.g. a stray `index.lock`) on drop.
+struct PrivateTempDir(PathBuf);
+
+impl PrivateTempDir {
+    fn new() -> Result<Self> {
+        let hex = uuid::Uuid::new_v4().simple().to_string();
+        let dir = std::env::temp_dir().join(format!("skippy-ac-{}", &hex[..16]));
+        // Non-recursive: fails rather than reuse an existing directory.
+        std::fs::create_dir(&dir).with_context(|| format!("failed to create temp dir {}", dir.display()))?;
+        Ok(Self(dir))
     }
-    let input: String = unique.iter().map(|o| format!("{o}\n")).collect();
-    let out = git_raw(root, &["cat-file", "--batch"], &[], Some(input.as_bytes()))
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Blob sizes by oid (`cat-file --batch-check`); errors on a missing object.
+async fn blob_sizes(root: &Path, oids: &[String]) -> Result<BTreeMap<String, u64>> {
+    let mut sizes = BTreeMap::new();
+    if oids.is_empty() {
+        return Ok(sizes);
+    }
+    let input: String = oids.iter().map(|o| format!("{o}\n")).collect();
+    let out = git_raw(root, &["cat-file", "--batch-check"], &[], Some(input.as_bytes()))
         .await
-        .context("git cat-file --batch failed")?;
-    let mut pos = 0usize;
-    for oid in &unique {
-        let nl = out[pos..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map(|i| pos + i)
-            .ok_or_else(|| anyhow!("cat-file --batch: truncated output"))?;
-        let header = latin1(&out[pos..nl]);
-        let fields: Vec<&str> = header.split(' ').collect();
-        pos = nl + 1;
-        if fields.get(1) == Some(&"missing") {
-            bail!("cat-file --batch: blob {oid} missing");
+        .context("git cat-file --batch-check failed")?;
+    let text = latin1(&out);
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    if lines.len() != oids.len() {
+        bail!("cat-file --batch-check: truncated output");
+    }
+    for (oid, line) in oids.iter().zip(lines) {
+        let f: Vec<&str> = line.split(' ').collect();
+        if f.get(1) == Some(&"missing") {
+            bail!("cat-file --batch-check: blob {oid} missing");
         }
-        let size: usize = fields
+        let size: u64 = f
             .get(2)
             .and_then(|s| s.parse().ok())
-            .ok_or_else(|| anyhow!("cat-file --batch: unexpected header"))?;
-        if fields[0] != oid || pos + size > out.len() {
-            bail!("cat-file --batch: unexpected header");
+            .ok_or_else(|| anyhow!("cat-file --batch-check: unexpected header"))?;
+        if f[0] != oid {
+            bail!("cat-file --batch-check: unexpected header");
         }
-        if matches_secret_content(&out[pos..pos + size]) {
-            hits.insert(oid.clone());
-        }
-        pos += size + 1; // trailing LF
+        sizes.insert(oid.clone(), size);
     }
-    Ok(hits)
+    Ok(sizes)
+}
+
+/// Content-scan blobs by oid. Returns the verdict for every blob that must
+/// not be committed (`SecretContent` / `TooLargeToScan`). Blobs over
+/// `maxScanBytes` are never read (D3); the rest are fetched with
+/// `cat-file --batch` in groups of at most `maxScanBytes` total, so memory
+/// stays bounded however big the vault is (same grouping as the Node twin).
+async fn scan_blobs_for_secrets(root: &Path, oids: &[String]) -> Result<BTreeMap<String, SkipReason>> {
+    let unique: Vec<String> = oids.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
+    let mut verdicts = BTreeMap::new();
+    let sizes = blob_sizes(root, &unique).await?;
+    let cap = max_scan_bytes();
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut group: Vec<String> = Vec::new();
+    let mut group_bytes = 0u64;
+    for oid in &unique {
+        let size = sizes[oid];
+        if size > cap {
+            verdicts.insert(oid.clone(), SkipReason::TooLargeToScan);
+            continue;
+        }
+        if !group.is_empty() && group_bytes + size > cap {
+            groups.push(std::mem::take(&mut group));
+            group_bytes = 0;
+        }
+        group.push(oid.clone());
+        group_bytes += size;
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    for g in &groups {
+        let input: String = g.iter().map(|o| format!("{o}\n")).collect();
+        let out = git_raw(root, &["cat-file", "--batch"], &[], Some(input.as_bytes()))
+            .await
+            .context("git cat-file --batch failed")?;
+        let mut pos = 0usize;
+        for oid in g {
+            let nl = out[pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| pos + i)
+                .ok_or_else(|| anyhow!("cat-file --batch: truncated output"))?;
+            let header = latin1(&out[pos..nl]);
+            let fields: Vec<&str> = header.split(' ').collect();
+            pos = nl + 1;
+            if fields.get(1) == Some(&"missing") {
+                bail!("cat-file --batch: blob {oid} missing");
+            }
+            let size: usize = fields
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| anyhow!("cat-file --batch: unexpected header"))?;
+            if fields[0] != oid || size as u64 != sizes[oid] || pos + size > out.len() {
+                bail!("cat-file --batch: unexpected header");
+            }
+            if matches_secret_content(&out[pos..pos + size]) {
+                verdicts.insert(oid.clone(), SkipReason::SecretContent);
+            }
+            pos += size + 1; // trailing LF
+        }
+    }
+    Ok(verdicts)
+}
+
+/// The subset of `paths` with a `filter` attribute set to anything (`set` or
+/// any driver name, e.g. `lfs`); `unspecified` / `unset` mean no filter. One
+/// `check-attr -z --stdin` call, raw byte paths on stdin. Only `filter` can
+/// make the blob differ materially from the bytes the user wrote (`text`,
+/// `eol`, `diff` do not; `working-tree-encoding` output is still scanned as
+/// a blob, with the UTF-16 view).
+async fn filtered_paths(root: &Path, paths: &[BPath], env: &[(&str, &OsStr)]) -> Result<BTreeSet<BPath>> {
+    let mut filtered = BTreeSet::new();
+    if paths.is_empty() {
+        return Ok(filtered);
+    }
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p);
+        input.push(0);
+    }
+    let out = git_raw(root, &["check-attr", "-z", "--stdin", "filter"], env, Some(&input))
+        .await
+        .context("git check-attr filter failed")?;
+    let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
+    let mut i = 0;
+    while i + 2 < fields.len() {
+        if fields[i + 1] != b"filter" {
+            bail!("check-attr: unexpected output");
+        }
+        let value = fields[i + 2];
+        if value != b"unspecified" && value != b"unset" {
+            filtered.insert(fields[i].to_vec());
+        }
+        i += 3;
+    }
+    Ok(filtered)
+}
+
+/// Pre-filter scan of one working-tree file (D2). `None` when clean.
+async fn scan_worktree_file(root: &Path, path: &[u8]) -> Option<SkipReason> {
+    let Ok(rel) = std::str::from_utf8(path) else {
+        return Some(SkipReason::WorktreeUnscannable);
+    };
+    let full = root.join(rel);
+    let Ok(meta) = tokio::fs::symlink_metadata(&full).await else {
+        return Some(SkipReason::WorktreeUnscannable);
+    };
+    if !meta.is_file() {
+        return Some(SkipReason::WorktreeUnscannable);
+    }
+    if meta.len() > max_scan_bytes() {
+        return Some(SkipReason::TooLargeToScan);
+    }
+    let Ok(bytes) = tokio::fs::read(&full).await else {
+        return Some(SkipReason::WorktreeUnscannable);
+    };
+    if bytes.len() as u64 > max_scan_bytes() {
+        return Some(SkipReason::TooLargeToScan);
+    }
+    matches_secret_content(&bytes).then_some(SkipReason::SecretContent)
+}
+
+/// C-quote a raw path for line-based git stdin (`"..."`, octal escapes).
+fn c_quote(path: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'"'];
+    for &c in path {
+        if c == b'"' || c == b'\\' {
+            out.push(b'\\');
+            out.push(c);
+        } else if c < 0x20 || c == 0x7f {
+            out.extend_from_slice(format!("\\{c:03o}").as_bytes());
+        } else {
+            out.push(c);
+        }
+    }
+    out.push(b'"');
+    out
+}
+
+/// Filtered paths whose working-tree file no longer cleans to its staged
+/// blob (re-run the clean filter via `hash-object --stdin-paths`, no -w).
+/// If git cannot hash them at all, every path counts as changed (fail
+/// closed).
+async fn changed_since_add(
+    root: &Path,
+    paths: &[(BPath, String)],
+    env: &[(&str, &OsStr)],
+) -> BTreeSet<BPath> {
+    if paths.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut input = Vec::new();
+    for (p, _) in paths {
+        input.extend_from_slice(&c_quote(p));
+        input.push(b'\n');
+    }
+    let Ok(out) = git_raw(root, &["hash-object", "--stdin-paths"], env, Some(&input)).await else {
+        return paths.iter().map(|(p, _)| p.clone()).collect();
+    };
+    let text = latin1(&out);
+    let lines: Vec<&str> = text.split('\n').filter(|l| !l.is_empty()).collect();
+    paths
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, oid))| lines.len() != paths.len() || lines[*i] != oid)
+        .map(|(_, (p, _))| p.clone())
+        .collect()
 }
 
 /// Build the commit object for `tree` (parented on `head`, if any) and
@@ -586,7 +847,6 @@ where
 /// whole-vault reset. Returns the number of paths synced.
 async fn sync_real_index(
     root: &Path,
-    git_dir: &Path,
     new_commit: &str,
     parent_entries: &Entries,
     paths: &[BPath],
@@ -604,7 +864,8 @@ async fn sync_real_index(
         if safe.is_empty() {
             return Ok(0); // never run a pathspec-less reset
         }
-        let spec_file = git_dir.join(format!("skippy-autocommit-pathspec-{}", uuid::Uuid::new_v4()));
+        let dir = PrivateTempDir::new()?;
+        let spec_file = dir.path().join("pathspec");
         let mut content = Vec::new();
         for p in &safe {
             content.extend_from_slice(p);
@@ -623,7 +884,7 @@ async fn sync_real_index(
             "--pathspec-file-nul".into(),
         ];
         let result = git_raw(root, &args, &[], None).await;
-        let _ = tokio::fs::remove_file(&spec_file).await;
+        drop(dir);
         result.context("git reset -q <commit> --pathspec-from-file failed to sync the real index")?;
         Ok(safe.len())
     })
@@ -665,6 +926,18 @@ fn is_oid(s: &str) -> bool {
 fn parse_marker(raw: &str) -> Option<PendingMarker> {
     let v: serde_json::Value = serde_json::from_str(raw).ok()?;
     let obj = v.as_object()?;
+    // Known versions only (D5): absent or 1 = legacy (no `ref`), 2 = current.
+    // Compared as f64 so `2` and `2.0` behave exactly like JS `=== 2`.
+    let version = match obj.get("version") {
+        None => None,
+        Some(v) => match v.as_f64() {
+            Some(n) if n == 1.0 || n == PENDING_MARKER_VERSION as f64 => Some(n),
+            _ => return None,
+        },
+    };
+    if version == Some(PENDING_MARKER_VERSION as f64) && !obj.contains_key("ref") {
+        return None;
+    }
     let new = obj.get("new")?.as_str().filter(|s| is_oid(s))?.to_string();
     let parent = match obj.get("parent") {
         None | Some(serde_json::Value::Null) => None,
@@ -678,6 +951,47 @@ fn parse_marker(raw: &str) -> Option<PendingMarker> {
         Some(_) => return None,
     };
     Some(PendingMarker { new, parent, head_ref })
+}
+
+/// Parent oids of commit `oid` (header order), or `None` if it isn't a commit.
+async fn commit_parents(root: &Path, oid: &str) -> Option<Vec<String>> {
+    if git(root, &["cat-file", "-t", oid], &[]).await.ok()? != "commit" {
+        return None;
+    }
+    let raw = git_raw(root, &["cat-file", "commit", oid], &[], None).await.ok()?;
+    let text = latin1(&raw);
+    let header = text.split("\n\n").next().unwrap_or("");
+    Some(
+        header
+            .split('\n')
+            .filter_map(|l| l.strip_prefix("parent "))
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// D5: `new` must be a commit whose first parent is exactly `parent` (or a
+/// root commit when `parent` is `None`), and `parent` must exist as a
+/// commit. `None` if the marker is consistent, else the reason to drop it.
+async fn marker_objects_problem(root: &Path, marker: &PendingMarker) -> Option<String> {
+    let Some(parents) = commit_parents(root, &marker.new).await else {
+        return Some(format!("{} is not an existing commit", marker.new));
+    };
+    let first = parents.first().cloned();
+    if first != marker.parent {
+        return Some(format!(
+            "recorded parent {} is not the first parent of {} ({})",
+            marker.parent.as_deref().unwrap_or("(none)"),
+            marker.new,
+            first.as_deref().unwrap_or("root commit")
+        ));
+    }
+    if let Some(parent) = &marker.parent {
+        if commit_parents(root, parent).await.is_none() {
+            return Some(format!("parent {parent} is not an existing commit"));
+        }
+    }
+    None
 }
 
 /// Step 0 of every tick. See the module docs. `None` if there was no marker.
@@ -741,11 +1055,21 @@ async fn recover_pending_sync(root: &Path, git_dir: &Path) -> Option<RecoveryOut
         });
     }
 
+    if let Some(problem) = marker_objects_problem(root, &marker).await {
+        let _ = tokio::fs::remove_file(&marker_path).await;
+        return Some(RecoveryOutcome {
+            synced: false,
+            new_sha: Some(marker.new.clone()),
+            dropped: Some(format!("inconsistent pending marker: {problem}; index left untouched")),
+            error: None,
+        });
+    }
+
     let result = async {
         let parent_entries = tree_entries(root, marker.parent.as_deref()).await?;
         let new_entries = tree_entries(root, Some(&marker.new)).await?;
         let paths = differing_paths(&parent_entries, &new_entries);
-        sync_real_index(root, git_dir, &marker.new, &parent_entries, &paths).await
+        sync_real_index(root, &marker.new, &parent_entries, &paths).await
     }
     .await;
 
@@ -782,10 +1106,15 @@ pub async fn try_commit(root: &Path, bus: &Arc<EventBus>) -> Result<AutocommitOu
                     info!("git_autocommit: recovered pending index sync");
                 }
             }
-            if !report.skipped.is_empty() {
+            if !report.skipped_detail.is_empty() {
                 debug!(
-                    "git_autocommit: skipped vault paths (user-staged/flagged/secret): {}",
-                    report.skipped.join(", ")
+                    "git_autocommit: skipped vault paths: {}",
+                    report
+                        .skipped_detail
+                        .iter()
+                        .map(|(p, r)| format!("{p} ({})", r.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             match report.outcome {
@@ -831,7 +1160,12 @@ async fn run_autocommit(root: &Path) -> Result<AutocommitOutcome> {
 pub(crate) async fn run_autocommit_report(root: &Path) -> Result<AutocommitReport> {
     let vault = root.join("vault");
     if !vault.exists() {
-        return Ok(AutocommitReport { outcome: AutocommitOutcome::NoOp, skipped: Vec::new(), recovered: None });
+        return Ok(AutocommitReport {
+            outcome: AutocommitOutcome::NoOp,
+            skipped: Vec::new(),
+            skipped_detail: Vec::new(),
+            recovered: None,
+        });
     }
 
     let git_dir = resolve_git_dir(root).await.context("not a git repository")?;
@@ -861,13 +1195,15 @@ pub(crate) async fn run_autocommit_report(root: &Path) -> Result<AutocommitRepor
     let head = resolve_head(root).await?;
     let head_ref = resolve_symbolic_head(root).await?;
 
-    let temp_index =
-        git_dir.join(format!("skippy-autocommit-index-{}", uuid::Uuid::new_v4()));
-    // Always clean up the temp index file, whatever the outcome.
+    // D1: the temp index lives in a private dir under the OS temp dir (never
+    // the git dir); the dir, index and any `.lock` go away whatever happens.
+    let temp_dir = PrivateTempDir::new()?;
+    let temp_index = temp_dir.path().join("index");
     let result = run_autocommit_inner(root, &git_dir, &temp_index, head.as_deref(), head_ref.as_deref()).await;
-    let _ = tokio::fs::remove_file(&temp_index).await;
-    let (outcome, skipped) = result?;
-    Ok(AutocommitReport { outcome, skipped, recovered })
+    drop(temp_dir);
+    let (outcome, skipped_detail) = result?;
+    let skipped = skipped_detail.iter().map(|(p, _)| p.clone()).collect();
+    Ok(AutocommitReport { outcome, skipped, skipped_detail, recovered })
 }
 
 async fn run_autocommit_inner(
@@ -876,7 +1212,7 @@ async fn run_autocommit_inner(
     temp_index: &Path,
     head: Option<&str>,
     head_ref: Option<&str>,
-) -> Result<(AutocommitOutcome, Vec<String>)> {
+) -> Result<(AutocommitOutcome, Vec<(String, SkipReason)>)> {
     let env = [("GIT_INDEX_FILE", temp_index.as_os_str())];
 
     let head_entries = tree_entries(root, head).await?;
@@ -898,43 +1234,78 @@ async fn run_autocommit_inner(
     let prelim_entries = tree_entries(root, Some(&preliminary_tree)).await?;
     let all_changed = differing_paths(&head_entries, &prelim_entries);
 
-    let flagged_hits: Vec<BPath> = all_changed.iter().filter(|p| snapshot.flagged.contains(*p)).cloned().collect();
-    let owned_hits: Vec<BPath> = all_changed
-        .iter()
-        .filter(|p| !snapshot.flagged.contains(*p) && owned.contains(*p))
-        .cloned()
-        .collect();
-    let candidates: Vec<BPath> = all_changed
-        .iter()
-        .filter(|p| !snapshot.flagged.contains(*p) && !owned.contains(*p))
-        .cloned()
-        .collect();
-    let name_hits: Vec<BPath> = candidates.iter().filter(|p| matches_secret_filename(p)).cloned().collect();
-    let blob_of = |p: &BPath| -> Option<String> {
-        let entry = prelim_entries.get(p)?;
-        let (mode, oid) = entry.split_once(' ')?;
-        (mode != "160000").then(|| oid.to_string()) // gitlinks have no content here
+    let mode_of = |entries: &Entries, p: &BPath| -> Option<String> {
+        entries.get(p).and_then(|e| e.split_once(' ')).map(|(m, _)| m.to_string())
     };
-    let to_scan: Vec<(BPath, String)> = candidates
+    let blob_of = |p: &BPath| -> Option<String> {
+        prelim_entries.get(p).and_then(|e| e.split_once(' ')).map(|(_, oid)| oid.to_string())
+    };
+
+    // path -> reason; first match wins (same order as the Node twin).
+    let mut reasons: BTreeMap<BPath, SkipReason> = BTreeMap::new();
+    for p in &all_changed {
+        let reason = if snapshot.flagged.contains(p) {
+            Some(SkipReason::Flagged)
+        } else if owned.contains(p) {
+            Some(SkipReason::UserStaged)
+        } else if mode_of(&head_entries, p).as_deref() == Some(GITLINK_MODE)
+            || mode_of(&prelim_entries, p).as_deref() == Some(GITLINK_MODE)
+        {
+            Some(SkipReason::Gitlink)
+        } else if matches_secret_filename(p) {
+            Some(SkipReason::SecretFilename)
+        } else {
+            None
+        };
+        if let Some(r) = reason {
+            reasons.insert(p.clone(), r);
+        }
+    }
+
+    // Post-filter scan: the exact blobs the commit would contain.
+    let to_scan: Vec<(BPath, String)> = all_changed
         .iter()
-        .filter(|p| !name_hits.contains(p))
+        .filter(|p| !reasons.contains_key(*p))
         .filter_map(|p| blob_of(p).map(|oid| (p.clone(), oid)))
         .collect();
-    let hit_oids =
+    let verdicts =
         scan_blobs_for_secrets(root, &to_scan.iter().map(|(_, o)| o.clone()).collect::<Vec<_>>()).await?;
-    let content_hits: Vec<BPath> = to_scan
-        .iter()
-        .filter(|(_, oid)| hit_oids.contains(oid))
-        .map(|(p, _)| p.clone())
-        .collect();
+    for (p, oid) in &to_scan {
+        if let Some(v) = verdicts.get(oid) {
+            reasons.insert(p.clone(), *v);
+        }
+    }
 
-    let mut excluded: Vec<BPath> = flagged_hits;
-    excluded.extend(owned_hits);
-    excluded.extend(name_hits);
-    excluded.extend(content_hits);
-    let excluded_set: BTreeSet<&BPath> = excluded.iter().collect();
-    let commit_paths: Vec<BPath> = all_changed.iter().filter(|p| !excluded_set.contains(p)).cloned().collect();
-    let skipped: Vec<String> = excluded.iter().map(|p| display_path(p)).collect();
+    // Pre-filter scan (D2): for regular files with any `filter` attribute,
+    // also scan the working-tree bytes and prove they still clean to the blob.
+    let regular: Vec<(BPath, String)> = to_scan
+        .iter()
+        .filter(|(p, _)| {
+            !reasons.contains_key(p)
+                && mode_of(&prelim_entries, p).is_some_and(|m| REGULAR_FILE_MODES.contains(&m.as_str()))
+        })
+        .cloned()
+        .collect();
+    let filtered = filtered_paths(root, &regular.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), &env).await?;
+    let mut scanned_filtered: Vec<(BPath, String)> = Vec::new();
+    for (p, oid) in &regular {
+        if !filtered.contains(p) {
+            continue;
+        }
+        match scan_worktree_file(root, p).await {
+            Some(v) => {
+                reasons.insert(p.clone(), v);
+            }
+            None => scanned_filtered.push((p.clone(), oid.clone())),
+        }
+    }
+    for p in changed_since_add(root, &scanned_filtered, &env).await {
+        reasons.insert(p, SkipReason::ChangedDuringScan);
+    }
+
+    let excluded: Vec<BPath> = all_changed.iter().filter(|p| reasons.contains_key(*p)).cloned().collect();
+    let commit_paths: Vec<BPath> = all_changed.iter().filter(|p| !reasons.contains_key(*p)).cloned().collect();
+    let skipped: Vec<(String, SkipReason)> = excluded.iter().map(|p| (display_path(p), reasons[p])).collect();
 
     if commit_paths.is_empty() {
         return Ok((AutocommitOutcome::NoOp, skipped));
@@ -974,7 +1345,7 @@ async fn run_autocommit_inner(
 
     let new_commit = commit_and_advance_head(root, &tree, head, &message).await?;
 
-    match sync_real_index(root, git_dir, &new_commit, &head_entries, &commit_paths).await {
+    match sync_real_index(root, &new_commit, &head_entries, &commit_paths).await {
         Ok(_) => Ok((AutocommitOutcome::Committed, skipped)),
         Err(e) => {
             // HEAD already advanced — this is NOT a failed commit.
@@ -1514,6 +1885,75 @@ mod tests {
         assert!(worktree_diff.contains("worktree version"));
     }
 
+    // --- EC5 final round: every skip reason, byte-ordered, same strings as
+    // the Node twin's `skippedDetail` (Node: "F5 skip reasons ..."). --------
+
+    #[tokio::test]
+    async fn skip_reasons_match_the_node_twin() {
+        let repo = TempRepo::new("reasons");
+        repo.write(".gitattributes", "vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\n");
+        repo.git_ok(&["config", "filter.rot.clean", "tr A-Za-z N-ZA-Mn-za-m"]);
+        repo.git_ok(&["config", "filter.rot.smudge", "tr A-Za-z N-ZA-Mn-za-m"]);
+        // Non-deterministic clean filter: every run appends its own PID, so
+        // the post-scan re-hash can never match the staged blob.
+        repo.git_ok(&["config", "filter.pid.clean", "cat; echo $$"]);
+        repo.git_ok(&["config", "filter.pid.smudge", "cat"]);
+        repo.write("vault/flag.md", "f1\n");
+        repo.write("vault/mine.md", "m1\n");
+        repo.write("vault/n.md", "x\n");
+        seed_initial_commit(&repo); // adds README.md only
+        repo.git_ok(&["add", "-A", "."]);
+        repo.git_ok(&["commit", "-q", "-m", "seed vault"]);
+        repo.git_ok(&["update-index", "--assume-unchanged", "vault/flag.md"]);
+        repo.write("vault/flag.md", "f2\n");
+        repo.write("vault/mine.md", "m2\n");
+        repo.git_ok(&["add", "vault/mine.md"]);
+        repo.write("vault/.env", "K=1\n");
+        repo.write("vault/leak.md", "AKIAABCDEFGHIJKLMNOP\n");
+        repo.write("vault/rot/leak.md", "AKIAABCDEFGHIJKLMNOP\n");
+        repo.write("vault/pid/p.md", "plain\n");
+        let line = b"the magnificent skippy\n";
+        let big: Vec<u8> = line.iter().copied().cycle().take(max_scan_bytes() as usize + 1).collect();
+        repo.write("vault/big.bin", String::from_utf8(big).unwrap().as_str());
+        let inner = repo.dir.join("vault").join("sub");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert!(StdCommand::new("git").arg("-C").arg(&inner).args(["init", "-q"]).status().unwrap().success());
+        assert!(StdCommand::new("git")
+            .arg("-C")
+            .arg(&inner)
+            .args(["-c", "user.name=x", "-c", "user.email=x@x", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "x"])
+            .status()
+            .unwrap()
+            .success());
+        repo.write("vault/n.md", "y\n");
+
+        let report = run_autocommit_report(repo.path()).await.expect("autocommit ok");
+        assert_eq!(report.outcome, AutocommitOutcome::Committed);
+        let got: Vec<(String, &str)> = report.skipped_detail.iter().map(|(p, r)| (p.clone(), r.as_str())).collect();
+        let want: Vec<(String, &str)> = [
+            ("vault/.env", "secret-filename"),
+            ("vault/big.bin", "too-large-to-scan"),
+            ("vault/flag.md", "flagged"),
+            ("vault/leak.md", "secret-content"),
+            ("vault/mine.md", "user-staged"),
+            ("vault/pid/p.md", "changed-during-scan"),
+            ("vault/rot/leak.md", "secret-content"),
+            ("vault/sub", "gitlink"),
+        ]
+        .into_iter()
+        .map(|(p, r)| (p.to_string(), r))
+        .collect();
+        assert_eq!(got, want);
+        assert_eq!(report.skipped, want.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+        let files = repo.git_ok(&["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert_eq!(repo.git_ok(&["show", "HEAD:vault/n.md"]), "y");
+        for (p, _) in &want {
+            if p != "vault/flag.md" && p != "vault/mine.md" {
+                assert!(!files.lines().any(|l| l == p), "{p} was committed");
+            }
+        }
+    }
+
     // --- E5-8: shared secret list self-test (same vectors as the Node suite).
 
     fn utf16(s: &str, big_endian: bool, bom: bool) -> Vec<u8> {
@@ -1875,6 +2315,10 @@ mod e5_regression_tests {
         assert!(status.lines().any(|l| l == "D  vault/x.md"), "staged rm --cached was undone: {status}");
     }
 
+    /// Intent-to-add is user-owned BY DESIGN (E5-6): the `git add -N` entry
+    /// differs from HEAD, so the autocommit never commits it and leaves the
+    /// i-t-a entry exactly as the user made it (an earlier red-team
+    /// expectation that it be committed was stale).
     #[tokio::test]
     async fn e5_6_intent_to_add_and_fully_staged_vault_paths_are_user_owned() {
         let r = Repo::new("ita");
@@ -1974,5 +2418,386 @@ mod e5_regression_tests {
         assert!(!r.marker().exists());
         assert_eq!(r.show("HEAD:vault/n.md"), "v2", "next tick must re-commit the vault change");
         assert_eq!(r.status(), "");
+    }
+}
+
+/// Final-round red-team regressions (EC5 D1..D5). Mirrors the Node suite's
+/// `F5-*` cases. Self-contained on purpose (only `run_autocommit_report` and
+/// its `outcome`/`skipped`/`recovered` fields plus the git CLI), so the same
+/// module also compiles against a24234e, where every case fails. The skip
+/// *reasons* are asserted in `tests::skip_reasons_match_the_node_twin`.
+#[cfg(test)]
+mod f5_regression_tests {
+    use super::{run_autocommit_report, AutocommitOutcome, AutocommitReport};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const SCAN_CAP: usize = 64 * 1024 * 1024; // limits.maxScanBytes
+    const SECRET_BODY: &str = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789\naws AKIAABCDEFGHIJKLMNOP\n";
+
+    struct Repo {
+        dir: PathBuf,
+    }
+
+    impl Repo {
+        fn at(dir: PathBuf) -> Self {
+            std::fs::create_dir_all(&dir).unwrap();
+            let r = Self { dir };
+            r.ok(&["init", "-q", "-b", "main"]);
+            r.ok(&["config", "user.name", "Skippy Test"]);
+            r.ok(&["config", "user.email", "skippy-test@example.invalid"]);
+            r.ok(&["config", "commit.gpgsign", "false"]);
+            r.ok(&["config", "core.hooksPath", ".no-hooks"]);
+            r
+        }
+
+        fn new(name: &str) -> Self {
+            Self::at(std::env::temp_dir().join(format!("skippy-f5-{name}-{}", uuid::Uuid::new_v4())))
+        }
+
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        fn run(&self, args: &[&str]) -> std::process::Output {
+            Command::new("git")
+                .arg("-C")
+                .arg(&self.dir)
+                .args(["-c", "core.quotepath=false"])
+                .args(args)
+                .output()
+                .expect("git spawn")
+        }
+
+        fn ok(&self, args: &[&str]) -> String {
+            let out = self.run(args);
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        fn write(&self, rel: &str, contents: impl AsRef<[u8]>) {
+            let p = self.dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+
+        fn commit_all(&self, msg: &str) {
+            self.ok(&["add", "-A", "."]);
+            self.ok(&["commit", "-q", "-m", msg]);
+        }
+
+        fn head_tree(&self) -> Vec<String> {
+            let out = self.run(&["ls-tree", "-r", "-z", "--name-only", "HEAD"]);
+            String::from_utf8_lossy(&out.stdout)
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        fn show(&self, spec: &str) -> String {
+            self.ok(&["show", spec])
+        }
+
+        fn status(&self) -> String {
+            self.ok(&["status", "--porcelain", "-uno"])
+        }
+
+        fn marker(&self) -> PathBuf {
+            self.dir.join(".git").join("skippy-autocommit-pending")
+        }
+
+        fn write_marker(&self, json: &str) {
+            std::fs::write(self.marker(), json).unwrap();
+        }
+
+        async fn tick(&self) -> AutocommitReport {
+            run_autocommit_report(self.path()).await.expect("autocommit ok")
+        }
+
+        /// c1 (n=A) -> c2 (n=B) -> c3 (n=C); real index n.md reset to `reset_to`'s blob.
+        fn marker_chain(&self, reset_to: usize) -> Vec<String> {
+            let mut shas = Vec::new();
+            for (name, body) in [("c1", "A\n"), ("c2", "B\n"), ("c3", "C\n")] {
+                self.write("vault/n.md", body);
+                self.commit_all(name);
+                shas.push(self.ok(&["rev-parse", "HEAD"]));
+            }
+            self.ok(&["reset", "-q", &shas[reset_to], "--", "vault/n.md"]);
+            shas
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn nested_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.name=x", "-c", "user.email=x@x", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "x"]);
+    }
+
+    fn skippy_files_in(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("skippy"))
+            .collect()
+    }
+
+    // --- D1: temp index lives in the OS temp dir, not the git dir. ---------
+
+    #[tokio::test]
+    async fn f5_d1_repo_at_a_190_char_root_commits_and_leaves_nothing_in_the_git_dir() {
+        let pre = std::env::temp_dir()
+            .join(format!("skippy-f5-lp-{}-", &uuid::Uuid::new_v4().simple().to_string()[..8]))
+            .to_string_lossy()
+            .into_owned();
+        if pre.len() + 8 > 190 {
+            eprintln!("SKIP f5_d1: OS temp dir is too long to build a 190-char repo root");
+            return;
+        }
+        let dir = PathBuf::from(format!("{pre}{}", "a".repeat(190 - pre.len())));
+        let r = Repo::at(dir);
+        r.ok(&["config", "core.longpaths", "false"]); // the default; pin it against global config
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/n.md", "y\n");
+        let rep = run_autocommit_report(r.path()).await;
+        assert!(matches!(&rep, Ok(x) if x.outcome == AutocommitOutcome::Committed), "{:?}", rep.map(|x| x.outcome));
+        assert_eq!(r.show("HEAD:vault/n.md"), "y");
+        assert_eq!(r.status(), "");
+        assert!(skippy_files_in(&r.dir.join(".git")).is_empty(), "temp files must never be created in the git dir");
+    }
+
+    // --- D2: filtered paths are scanned pre-filter (working-tree bytes). ---
+
+    #[tokio::test]
+    async fn f5_d2_secret_behind_an_lfs_style_clean_filter_is_not_committed() {
+        let r = Repo::new("fakelfs");
+        // Simulated git-lfs: the clean filter turns content into a pointer-
+        // like hash, so the blob scan alone would see nothing.
+        r.ok(&["config", "filter.lfs.clean", "git hash-object --stdin"]);
+        r.ok(&["config", "filter.lfs.smudge", "cat"]);
+        r.ok(&["config", "filter.lfs.required", "true"]);
+        r.write(".gitattributes", "vault/*.txt filter=lfs diff=lfs merge=lfs -text\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/creds.txt", SECRET_BODY);
+        r.write("vault/ok.txt", "harmless payload\n");
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        let tree = r.head_tree();
+        assert!(!tree.contains(&"vault/creds.txt".to_string()), "filtered secret reached history: {tree:?}");
+        assert!(tree.contains(&"vault/ok.txt".to_string()), "clean filtered file must still be committed");
+        assert_eq!(rep.skipped, vec!["vault/creds.txt".to_string()]);
+        assert_eq!(r.status(), "", "committed filtered file must be synced to the real index");
+    }
+
+    #[tokio::test]
+    async fn f5_d2_secret_behind_a_reversible_rot13_clean_filter_is_not_committed() {
+        let r = Repo::new("rot13");
+        r.ok(&["config", "filter.rot.clean", "tr A-Za-z N-ZA-Mn-za-m"]);
+        r.ok(&["config", "filter.rot.smudge", "tr A-Za-z N-ZA-Mn-za-m"]);
+        r.write(".gitattributes", "vault/*.md filter=rot\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/n.md", "my aws key AKIAABCDEFGHIJKLMNOP\n");
+        r.write("vault/fine.md", "nothing here\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(rep.skipped, vec!["vault/n.md".to_string()]);
+        assert_eq!(r.show("HEAD:vault/n.md"), "k", "rot13-encoded secret was committed");
+        assert!(r.head_tree().contains(&"vault/fine.md".to_string()));
+    }
+
+    #[tokio::test]
+    async fn f5_d2_secret_stored_through_real_git_lfs_is_not_committed() {
+        let has_lfs = Command::new("git").args(["lfs", "version"]).output().is_ok_and(|o| o.status.success());
+        if !has_lfs {
+            eprintln!("SKIP f5_d2 real-lfs: git-lfs is not installed (the simulated-filter case covers the mechanism)");
+            return;
+        }
+        let r = Repo::new("lfs");
+        r.ok(&["lfs", "install", "--local"]);
+        r.write(".gitattributes", "vault/*.txt filter=lfs diff=lfs merge=lfs -text\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/creds.txt", SECRET_BODY);
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(rep.skipped, vec!["vault/creds.txt".to_string()]);
+        assert!(!r.head_tree().contains(&"vault/creds.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn f5_d2_diff_and_text_attributes_alone_do_not_trigger_the_pre_filter_path() {
+        let r = Repo::new("attrs");
+        r.write(".gitattributes", "vault/*.md diff=foo text\n");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert!(rep.skipped.is_empty(), "{:?}", rep.skipped);
+    }
+
+    // --- D3: blobs over the scan limit are excluded, never fatal. ----------
+
+    #[tokio::test]
+    async fn f5_d3_blob_over_the_scan_limit_is_skipped_and_unrelated_vault_work_still_commits() {
+        let r = Repo::new("big");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        let line = b"the magnificent skippy thinks monkeys are adorable\n";
+        let big: Vec<u8> = line.iter().copied().cycle().take(SCAN_CAP + 1).collect();
+        r.write("vault/big.bin", big);
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(rep.skipped, vec!["vault/big.bin".to_string()]);
+        assert!(!r.head_tree().contains(&"vault/big.bin".to_string()), "unscanned blob was committed");
+        assert_eq!(r.show("HEAD:vault/n.md"), "y");
+    }
+
+    // --- D4: gitlinks are never added or changed. --------------------------
+
+    #[tokio::test]
+    async fn f5_d4_nested_repo_inside_the_vault_is_not_committed_as_an_orphan_gitlink() {
+        let r = Repo::new("embed");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        nested_repo(&r.dir.join("vault").join("cloned"));
+        r.write("vault/n.md", "x\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(rep.skipped, vec!["vault/cloned".to_string()]);
+        assert!(!r.ok(&["ls-tree", "-r", "HEAD"]).lines().any(|l| l.starts_with("160000")), "orphan gitlink committed");
+        assert!(r.head_tree().contains(&"vault/n.md".to_string()));
+    }
+
+    #[tokio::test]
+    async fn f5_d4_vault_submodule_pointer_bump_is_not_autocommitted() {
+        let src = Repo::new("vsubsrc");
+        src.write("n.md", "v1\n");
+        src.commit_all("s");
+        let r = Repo::new("vsub");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        let src_dir = src.dir.to_string_lossy().into_owned();
+        r.ok(&["-c", "protocol.file.allow=always", "submodule", "add", "-q", &src_dir, "vault"]);
+        r.ok(&["commit", "-q", "-m", "add vault submodule"]);
+        let before = r.ok(&["rev-parse", "HEAD"]);
+        r.write("vault/n.md", "v2\n");
+        let inner = Command::new("git")
+            .arg("-C")
+            .arg(r.dir.join("vault"))
+            .args(["-c", "user.name=x", "-c", "user.email=x@x", "-c", "commit.gpgsign=false", "commit", "-q", "-am", "inner"])
+            .output()
+            .unwrap();
+        assert!(inner.status.success());
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::NoOp);
+        assert_eq!(rep.skipped, vec!["vault".to_string()]);
+        assert_eq!(r.ok(&["rev-parse", "HEAD"]), before, "submodule pointer bump was committed");
+    }
+
+    #[tokio::test]
+    async fn f5_d4_existing_gitlink_in_head_is_kept_when_its_checkout_disappears() {
+        let r = Repo::new("glrm");
+        r.write("a", "a\n");
+        r.commit_all("init");
+        let inner = r.dir.join("vault").join("cloned");
+        nested_repo(&inner);
+        r.ok(&["add", "vault/cloned"]);
+        r.ok(&["commit", "-q", "-m", "user adds a gitlink on purpose"]);
+        std::fs::remove_dir_all(&inner).unwrap();
+        r.write("vault/n.md", "x\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(rep.skipped, vec!["vault/cloned".to_string()]);
+        assert!(r.ok(&["ls-tree", "HEAD", "vault/cloned"]).starts_with("160000 commit "), "gitlink deletion was committed");
+    }
+
+    // --- D5: pending-marker hardening. -------------------------------------
+
+    #[tokio::test]
+    async fn f5_d5_marker_with_an_unknown_version_is_dropped_without_touching_the_index() {
+        let r = Repo::new("v99");
+        let s = r.marker_chain(1);
+        let before = r.ok(&["ls-files", "-s"]);
+        r.write_marker(&format!(r#"{{"version":99,"ref":"refs/heads/main","new":"{}","parent":"{}"}}"#, s[2], s[1]));
+        let rep = r.tick().await;
+        assert!(rep.recovered.as_ref().is_some_and(|x| x.dropped.is_some()), "unknown version must be dropped: {:?}", rep.recovered);
+        assert!(!r.marker().exists());
+        assert_eq!(r.ok(&["ls-files", "-s"]), before, "index was touched by an unknown-version marker");
+    }
+
+    #[tokio::test]
+    async fn f5_d5_v2_marker_without_a_ref_is_dropped_without_touching_the_index() {
+        let r = Repo::new("v2noref");
+        let s = r.marker_chain(1);
+        let before = r.ok(&["ls-files", "-s"]);
+        r.write_marker(&format!(r#"{{"version":2,"new":"{}","parent":"{}"}}"#, s[2], s[1]));
+        let rep = r.tick().await;
+        assert!(rep.recovered.as_ref().is_some_and(|x| x.dropped.is_some()), "{:?}", rep.recovered);
+        assert_eq!(r.ok(&["ls-files", "-s"]), before);
+    }
+
+    #[tokio::test]
+    async fn f5_d5_marker_whose_parent_is_not_the_first_parent_of_new_is_dropped() {
+        let r = Repo::new("forged-parent");
+        let s = r.marker_chain(0);
+        let before = r.ok(&["ls-files", "-s"]);
+        r.write_marker(&format!(r#"{{"version":2,"ref":"refs/heads/main","new":"{}","parent":"{}"}}"#, s[2], s[0]));
+        let rep = r.tick().await;
+        assert!(rep.recovered.as_ref().is_some_and(|x| x.dropped.is_some()), "forged parent must be dropped: {:?}", rep.recovered);
+        assert!(!r.marker().exists());
+        assert_eq!(r.ok(&["ls-files", "-s"]), before, "index was synced from a forged parent");
+    }
+
+    #[tokio::test]
+    async fn f5_d5_marker_whose_parent_object_is_missing_never_wedges_the_tick() {
+        let r = Repo::new("missing-parent");
+        r.write("vault/n.md", "A\n");
+        r.commit_all("c1");
+        let c1 = r.ok(&["rev-parse", "HEAD"]);
+        r.write_marker(&format!(r#"{{"version":2,"ref":"refs/heads/main","new":"{c1}","parent":"{}"}}"#, "1".repeat(40)));
+        r.write("vault/n.md", "B\n");
+        let rep = run_autocommit_report(r.path()).await;
+        let rep = rep.expect("a bad marker must not wedge the tick");
+        assert!(rep.recovered.as_ref().is_some_and(|x| x.dropped.is_some()), "{:?}", rep.recovered);
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert!(!r.marker().exists(), "bad marker must not survive");
+        assert_eq!(r.show("HEAD:vault/n.md"), "B");
+    }
+
+    #[tokio::test]
+    async fn f5_d5_consistent_v2_and_legacy_v1_markers_are_still_recovered() {
+        for legacy in [false, true] {
+            let r = Repo::new("consistent");
+            let s = r.marker_chain(1);
+            let json = if legacy {
+                format!(r#"{{"new":"{}","parent":"{}"}}"#, s[2], s[1])
+            } else {
+                format!(r#"{{"version":2,"ref":"refs/heads/main","new":"{}","parent":"{}"}}"#, s[2], s[1])
+            };
+            r.write_marker(&json);
+            let rep = r.tick().await;
+            assert!(rep.recovered.as_ref().is_some_and(|x| x.synced), "legacy={legacy}: {:?}", rep.recovered);
+            assert!(!r.marker().exists());
+            assert_eq!(r.show(":vault/n.md"), "C", "recovery must sync the index to new");
+            assert_eq!(r.status(), "");
+        }
     }
 }
