@@ -11,12 +11,19 @@
 import { after, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Envelope, terminalRecordViolations, type EnvelopeT } from '@skippy/shared';
+import {
+  DelegationCompleteEnvelope,
+  Envelope,
+  readDelegationCompleteRecord,
+  terminalRecordViolations,
+  type EnvelopeT,
+} from '@skippy/shared';
 
 import { Board, type BoardDelegation, type BoardExecutor } from './board.js';
 import type { Charter } from './charter.js';
 import { resolveExecutionGate, type ExecutionGate } from './execution-gate.js';
 import { handleDelegateToBoard } from './mcp-delegate.js';
+import { executeBoardMissionViaSdk, type ClaudeAgentSdkModule } from './sdk-board.js';
 import { getSupervisor, resetSupervisor } from './supervisor.js';
 
 // ── capture sidecar envelopes written to stdout ─────────────────────────────
@@ -243,6 +250,73 @@ test('G0: across every non-success path, zero succeeded records and all records 
     if (e.type !== 'delegation_complete') continue;
     assert.notEqual(e.outcome, 'succeeded', `${e.delegationId} must not succeed`);
     assert.deepEqual(terminalRecordViolations(e), [], e.delegationId);
+  }
+});
+
+// ── N6c: every SDK result-mapping row yields a schema-valid envelope ────────
+//
+// The real SDK executor (sdk-board.ts) with an injected SDK stream, driven
+// through the Board, for every row of the `mapSdkResultMessage` table. The
+// emitted `delegation_complete` must satisfy the shared wire schema, the
+// outcome invariants, and read back from replay as the SAME outcome (a wire
+// "succeeded" that the replay reader downgrades to `unverified` is a lie).
+
+function sdkStream(messages: unknown[], throwAfter?: Error): () => Promise<ClaudeAgentSdkModule> {
+  const query = (() =>
+    (async function* (): AsyncGenerator<unknown> {
+      for (const m of messages) yield m;
+      if (throwAfter) throw throwAfter;
+    })()) as unknown as ClaudeAgentSdkModule['query'];
+  return () => Promise.resolve({ query });
+}
+
+const ok = { type: 'result', subtype: 'success', is_error: false } as const;
+
+const MAPPING_ROWS: Array<[string, unknown[], string, string | undefined, Error?]> = [
+  ['success', [{ ...ok, result: 'Parser done.', total_cost_usd: 0.01 }], 'succeeded', undefined],
+  ['success, no result text', [{ ...ok }], 'succeeded', undefined],
+  ['success, null result', [{ ...ok, result: null }], 'succeeded', undefined],
+  ['success, terminal completed + end_turn', [{ ...ok, result: 'x', terminal_reason: 'completed', stop_reason: 'end_turn' }], 'succeeded', undefined],
+  ['malformed permission_denials', [{ ...ok, result: 'x', permission_denials: {} }], 'failed', 'executor_error'],
+  ['permission_denials', [{ ...ok, result: 'x', permission_denials: [{ tool_name: 'Write', tool_use_id: 't1', tool_input: {} }] }], 'blocked', 'policy_refused'],
+  ['api_error_status', [{ ...ok, result: 'x', api_error_status: 529 }], 'failed', 'provider_error'],
+  ['hook_stopped', [{ ...ok, terminal_reason: 'hook_stopped' }], 'blocked', 'policy_refused'],
+  ['tool_deferred', [{ ...ok, terminal_reason: 'tool_deferred' }], 'blocked', 'approval_required'],
+  ['aborted_tools', [{ ...ok, terminal_reason: 'aborted_tools' }], 'interrupted', 'tool_execution_aborted'],
+  ['stop_reason refusal', [{ ...ok, stop_reason: 'refusal' }], 'failed', 'model_refused'],
+  ['stop_reason max_tokens', [{ ...ok, stop_reason: 'max_tokens' }], 'failed', 'executor_error'],
+  ['is_error success', [{ ...ok, is_error: true }], 'failed', 'executor_error'],
+  ['error subtype', [{ type: 'result', subtype: 'error_max_turns', is_error: true }], 'failed', 'executor_error'],
+  ['model_error', [{ ...ok, terminal_reason: 'model_error' }], 'failed', 'executor_error'],
+  ['no result', [{ type: 'assistant' }], 'failed', 'no_terminal_result'],
+  ['stream throws', [], 'failed', 'provider_error', new Error('socket hang up')],
+];
+
+test('N6c: every SDK result-mapping row emits a schema-valid delegation_complete that replays as the same outcome', async () => {
+  for (const [name, messages, outcome, code, throwAfter] of MAPPING_ROWS) {
+    const id = `N6c-${name}`;
+    const { board } = makeBoard(
+      () => ({ kind: 'live' }),
+      ({ boardId, missionBrief }) =>
+        executeBoardMissionViaSdk(
+          { boardId, systemPrompt: 'You are the Coding Board Captain.', model: 'claude-sonnet-4-6' as never, missionBrief },
+          { loadSdk: sdkStream(messages, throwAfter) },
+        ),
+    );
+    const env = await board.runAcceptedDelegation(mission(id));
+    assert.ok(env, name);
+    // What actually goes over the wire / into replay JSONL.
+    const wire: unknown = JSON.parse(JSON.stringify(env));
+    const parsed = DelegationCompleteEnvelope.safeParse(wire);
+    assert.ok(parsed.success, `${name}: ${parsed.success ? '' : parsed.error.message}`);
+    assert.equal(typeof (wire as { summary?: unknown }).summary, 'string', name);
+    assert.equal(parsed.data.outcome, outcome, name);
+    assert.equal(parsed.data.reason?.code, code, name);
+    assert.deepEqual(terminalRecordViolations(parsed.data), [], name);
+    const replayed = readDelegationCompleteRecord(wire);
+    assert.equal(replayed?.outcome, outcome, `${name}: replay reader disagrees with the wire`);
+    assert.equal(replayed?.legacy, false, name);
+    assert.equal(completions(id).length, 1, name);
   }
 });
 

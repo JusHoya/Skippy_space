@@ -13,6 +13,7 @@
 //   • tool policy refused      → `blocked`   (reason `policy_refused`)
 //   • provider threw           → `failed`    (reason `provider_error`)
 //   • executor error result    → `failed`    (reason `executor_error`)
+//   • model refused the request → `failed`   (reason `model_refused`)
 //   • stream ended, no result  → `failed`    (reason `no_terminal_result`)
 //   • validation failed        → `failed`    (reason `validation_failed`)
 //   • runtime shut down        → `interrupted` (reason `shutdown`)
@@ -88,6 +89,10 @@ export const OUTCOME_REASON_CODES = [
   // 'aborted_tools'`) — the run was cut short, not a hard provider/model
   // failure, so it maps to `interrupted` rather than `failed`.
   'tool_execution_aborted',
+  // The model itself declined the request (`stop_reason: 'refusal'` on the
+  // SDK result). Distinct from `executor_error` so a refusal is never read as
+  // a transient provider fault; still `failed`, never success (FR-RUN-01).
+  'model_refused',
 ] as const;
 export const OutcomeReasonCodeSchema = z.enum(OUTCOME_REASON_CODES);
 export type OutcomeReasonCode = z.infer<typeof OutcomeReasonCodeSchema>;

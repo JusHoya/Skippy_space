@@ -365,3 +365,199 @@ test('sdk executor: options actually passed to query() are locked down (D6)', as
   const serialized = JSON.stringify(opts, (_key, value) => (typeof value === 'function' ? '<fn>' : value));
   assert.doesNotMatch(serialized, /bypassPermissions/);
 });
+
+// ── N1: task-agent (subagent) denials never become success ─────────────────
+//
+// The real CLI does NOT put a subagent's hook/canUseTool denials into the
+// parent result's `permission_denials` (verified against bundled CLI 0.3.162:
+// raw `permission_denials: []` while the task agent's Read/Bash were denied).
+// These fakes drive the policy gate the adapter installs exactly as the CLI
+// does — a PreToolUse hook call and a canUseTool call carrying the task
+// agent's id — then report an ordinary "success" result.
+
+type HookFn = (input: unknown, toolUseID: string | undefined, o: { signal: AbortSignal }) => Promise<unknown>;
+type CanUseToolFn = (
+  toolName: string,
+  input: Record<string, unknown>,
+  o: { signal: AbortSignal; toolUseID: string; agentID?: string },
+) => Promise<{ behavior: string }>;
+
+/** A fake SDK whose query() runs `drive` against the installed gate, then
+ * yields `messages`. */
+function gateDrivingSdk(
+  drive: (gate: { hook: HookFn; canUseTool: CanUseToolFn }) => Promise<void>,
+  messages: unknown[],
+): () => Promise<ClaudeAgentSdkModule> {
+  const query = ((opts: { options: Record<string, unknown> }) => {
+    const hooks = opts.options.hooks as { PreToolUse: Array<{ hooks: HookFn[] }> };
+    const hook = hooks.PreToolUse[0]!.hooks[0]!;
+    const canUseTool = opts.options.canUseTool as CanUseToolFn;
+    async function* gen(): AsyncGenerator<unknown> {
+      await drive({ hook, canUseTool });
+      for (const m of messages) yield m;
+    }
+    return gen();
+  }) as unknown as ClaudeAgentSdkModule['query'];
+  return () => Promise.resolve({ query });
+}
+
+const signal = new AbortController().signal;
+const SUBAGENT = 'a-task-agent-01';
+const successResult = {
+  type: 'result',
+  subtype: 'success',
+  is_error: false,
+  result: 'All done, monkeys! Magnificent.',
+  stop_reason: 'end_turn',
+  terminal_reason: 'completed',
+  permission_denials: [],
+  total_cost_usd: 0.0004,
+};
+
+function preToolUse(toolName: string, toolInput: Record<string, unknown>, toolUseId: string, agentId?: string): unknown {
+  return {
+    hook_event_name: 'PreToolUse',
+    session_id: 's',
+    transcript_path: '',
+    cwd: process.cwd(),
+    tool_name: toolName,
+    tool_input: toolInput,
+    tool_use_id: toolUseId,
+    ...(agentId ? { agent_id: agentId } : {}),
+  };
+}
+
+test('N1: task-agent hook denial + success result (empty permission_denials) → blocked(policy_refused), not succeeded', async () => {
+  const seen: unknown[] = [];
+  const r = await executeBoardMissionViaSdk(params, {
+    loadSdk: gateDrivingSdk(async ({ hook }) => {
+      // Mirrors scen-spawn: the task agent's Read outside the roots and its Bash.
+      seen.push(await hook(preToolUse('Read', { file_path: 'C:/Windows/win.ini' }, 'toolu_s1', SUBAGENT), 'toolu_s1', { signal }));
+      seen.push(await hook(preToolUse('Bash', { command: 'echo hi' }, 'toolu_s2', SUBAGENT), 'toolu_s2', { signal }));
+    }, [successResult]),
+  });
+  // The gate really denied both natively (precondition for the regression).
+  for (const out of seen) {
+    assert.equal(
+      (out as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision,
+      'deny',
+    );
+  }
+  assert.equal(r.status, 'blocked');
+  assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
+  const detail = r.status === 'blocked' ? (r.reason.detail ?? '') : '';
+  assert.match(detail, /Read \[task agent a-task-agent-01\]/);
+  assert.match(detail, /Bash \[task agent a-task-agent-01\]/);
+  assert.match(r.status === 'blocked' ? r.reason.message : '', /denied 2 tool call\(s\).*2 in task agents/);
+  assert.equal(r.costUsd, 0.0004);
+});
+
+test('N1: task-agent canUseTool denial (agentID set) + success result → blocked(policy_refused)', async () => {
+  let behavior = '';
+  const r = await executeBoardMissionViaSdk(params, {
+    loadSdk: gateDrivingSdk(async ({ canUseTool }) => {
+      ({ behavior } = await canUseTool('Bash', { command: 'echo hi' }, { signal, toolUseID: 'toolu_c1', agentID: SUBAGENT }));
+    }, [successResult]),
+  });
+  assert.equal(behavior, 'deny');
+  assert.equal(r.status, 'blocked');
+  assert.equal(r.status === 'blocked' && r.reason.code, 'policy_refused');
+  assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /Bash \[task agent a-task-agent-01\]/);
+});
+
+test('N1: a denial reported by the hook, canUseTool AND permission_denials counts once (keyed by tool-use id)', async () => {
+  const r = await executeBoardMissionViaSdk(params, {
+    loadSdk: gateDrivingSdk(
+      async ({ hook, canUseTool }) => {
+        await hook(preToolUse('Read', { file_path: 'C:/Windows/win.ini' }, 'toolu_m1'), 'toolu_m1', { signal });
+        // Same call re-checked through canUseTool: still one denial.
+        await canUseTool('Read', { file_path: 'C:/Windows/win.ini' }, { signal, toolUseID: 'toolu_m1' });
+      },
+      [
+        {
+          ...successResult,
+          permission_denials: [
+            { tool_name: 'Read', tool_use_id: 'toolu_m1', tool_input: { file_path: 'C:/Windows/win.ini' } },
+          ],
+        },
+      ],
+    ),
+  });
+  assert.equal(r.status, 'blocked');
+  assert.match(r.status === 'blocked' ? r.reason.message : '', /denied 1 tool call\(s\)/);
+  assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /Denied by Skippy tool policy/);
+});
+
+test('N1: a task-agent denial followed by a stream with no result is blocked, keeping the no_terminal_result detail', async () => {
+  const r = await executeBoardMissionViaSdk(params, {
+    loadSdk: gateDrivingSdk(async ({ hook }) => {
+      await hook(preToolUse('Bash', { command: 'rm -rf /' }, 'toolu_x', SUBAGENT), 'toolu_x', { signal });
+    }, [{ type: 'assistant' }]),
+  });
+  assert.equal(r.status, 'blocked');
+  assert.match(r.status === 'blocked' ? (r.reason.detail ?? '') : '', /no_terminal_result/);
+});
+
+// ── N6: stop_reason, malformed permission_denials, summary shape ────────────
+
+test('N6a: stop_reason refusal on a "success" result → failed(model_refused)', async () => {
+  const r = await executeBoardMissionViaSdk(params, {
+    loadSdk: fakeSdk([
+      { type: 'result', subtype: 'success', is_error: false, result: 'I cannot help with that.', stop_reason: 'refusal' },
+    ]),
+  });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.status === 'failed' && r.reason.code, 'model_refused');
+});
+
+test('N6a: CLI refusal shape (is_error + refusal, then the SDK throws) → failed(model_refused), not provider_error', async () => {
+  const r = await executeBoardMissionViaSdk(params, {
+    loadSdk: fakeSdk(
+      [{ type: 'result', subtype: 'success', is_error: true, result: 'API Error: unable to respond', stop_reason: 'refusal' }],
+      new Error('Claude Code returned an error result: API Error: unable to respond'),
+    ),
+  });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.status === 'failed' && r.reason.code, 'model_refused');
+});
+
+test('N6a: abnormal stop_reason (max_tokens, pause_turn, tool_use, unknown) on a "success" result → failed(executor_error)', async () => {
+  for (const stop_reason of ['max_tokens', 'pause_turn', 'tool_use', 'model_context_window_exceeded', 'some_future_stop']) {
+    const r = await executeBoardMissionViaSdk(params, {
+      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, result: 'trunc', stop_reason }]),
+    });
+    assert.equal(r.status, 'failed', stop_reason);
+    assert.equal(r.status === 'failed' && r.reason.code, 'executor_error', stop_reason);
+    assert.match(r.status === 'failed' ? (r.reason.detail ?? '') : '', new RegExp(stop_reason), stop_reason);
+  }
+});
+
+test('N6a: normal stop_reason (end_turn, stop_sequence, null, absent) still succeeds', async () => {
+  for (const stop_reason of ['end_turn', 'stop_sequence', null, undefined]) {
+    const r = await executeBoardMissionViaSdk(params, {
+      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, result: 'ok', stop_reason }]),
+    });
+    assert.equal(r.status, 'succeeded', String(stop_reason));
+  }
+});
+
+test('N6b: non-array permission_denials ({}, string, null, number) → failed(executor_error), never "no denials"', async () => {
+  for (const permission_denials of [{}, { a: 1 }, 'Write', null, 1]) {
+    const r = await executeBoardMissionViaSdk(params, {
+      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, result: 'ok', permission_denials }]),
+    });
+    assert.equal(r.status, 'failed', JSON.stringify(permission_denials));
+    assert.equal(r.status === 'failed' && r.reason.code, 'executor_error');
+    assert.match(r.status === 'failed' ? r.reason.message : '', /malformed/);
+  }
+});
+
+test('N6c: success with a missing/non-string result → succeeded with a string summary', async () => {
+  for (const extra of [{}, { result: undefined }, { result: null }, { result: 42 }]) {
+    const r = await executeBoardMissionViaSdk(params, {
+      loadSdk: fakeSdk([{ type: 'result', subtype: 'success', is_error: false, ...extra }]),
+    });
+    assert.equal(r.status, 'succeeded', JSON.stringify(extra));
+    assert.equal(typeof (r.status === 'succeeded' ? r.summary : null), 'string', JSON.stringify(extra));
+  }
+});
