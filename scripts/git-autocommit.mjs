@@ -83,6 +83,21 @@
 //                           (nested repo, submodule pointer bump, D4); gitlinks
 //                           already in HEAD are left exactly as they are
 //        secret-filename    shared filename rules
+//        attributes-file    the path's last component names a
+//                           `.gitattributes`: any ASCII case, plus every NTFS
+//                           equivalent git itself treats as one (trailing
+//                           spaces / periods, a `:stream` suffix, the
+//                           `gitatt~N` / `gi7d29~N` 8.3 names; a port of
+//                           git's `is_ntfs_dotgitattributes`, applied on every
+//                           OS). Autocommit never adds, modifies or deletes an
+//                           attributes file, so an encoding or filter rule
+//                           reaches history only through a deliberate user
+//                           commit (M0-G12 residuals D1-D3): a rule committed
+//                           next to text stored without it would make every
+//                           clone decode that text on checkout (D1: UTF-8 CJK
+//                           text that UTF-16LE turns back into an ASCII key);
+//                           with the rule kept out of history, a clone checks
+//                           out exactly the stored bytes
 //        attributes-changed an attribute source changed during the tick
 //                           (A1 != A2, below): EVERY remaining candidate is
 //                           deferred to the next tick
@@ -145,16 +160,36 @@
 //      exactly as git applies them, and the blob they produce is what gets
 //      scanned.
 //      Attribute snapshots A1 (before the add) and A2 (after the scans and
-//      both check-attr runs) cover every source git reads: the in-tree
-//      `.gitattributes` at the repo root and anywhere under vault/ (walked
-//      without following links; nested repositories skipped),
-//      `$GIT_COMMON_DIR/info/attributes`, the global file (`git var
-//      GIT_ATTR_GLOBAL`: core.attributesFile or the XDG default) and the
-//      system file (`git var GIT_ATTR_SYSTEM`), each recorded as its path
-//      plus its full content (or absent / a link / unreadable). Only a flip
-//      AND flip-back entirely inside the window between two observations can
-//      go unseen (see OQ-19); a flip that is still in place at A2 defers the
-//      tick.
+//      both check-attr runs) cover every source git reads (M0-G13): every
+//      attributes file (the attributes-file names, any case, so the
+//      `.GitAttributes` git opens on a case-insensitive filesystem is seen)
+//      at the repo root and anywhere under vault/ (walked without following
+//      links; a directory holding a `.git` entry is skipped only if
+//      `rev-parse --show-cdup` run there says it is a real nested repository
+//      — `add` walks straight into one with a bogus `.git` — and that verdict
+//      is recorded), `$GIT_COMMON_DIR/info/attributes`, the global file
+//      (`git var GIT_ATTR_GLOBAL`: core.attributesFile or the XDG default)
+//      and the system file (`git var GIT_ATTR_SYSTEM`), a relative path
+//      resolved against the repository top level (where git itself opens it,
+//      not the process cwd), each recorded as its path plus its full content
+//      (or absent / a link / unreadable); plus `attr.tree` (every configured
+//      value and the tree the last one names: git reads attributes from that
+//      tree instead of the working tree) and GIT_ATTR_SOURCE (value and
+//      tree). Only a flip AND flip-back entirely inside the window between
+//      two observations can go unseen; a flip that is still in place at A2
+//      defers the tick.
+//      Residual (OQ-19, M0-G14): such an unseen flip can still store a
+//      re-encoded or filtered blob for a path (e.g. the CJK text a transient
+//      UTF-16LE rule makes of an ASCII key). Because autocommit never commits
+//      the rule, a clone or checkout without it writes exactly those stored
+//      bytes: the plaintext reappears only where a matching rule is active
+//      again (the attacker's own machine or attribute files, or a user who
+//      later commits such a rule by hand). The stored bytes are still a
+//      reversible transform of the secret that the scanner cannot judge, so
+//      anyone who knows the transform can decode them offline. Reaching this
+//      takes write access to an attribute source at the right instant, i.e.
+//      a local attacker who could equally write the secret into a note in
+//      any encoding no content scan recognizes.
 //      All are reported in `skipped` (byte order) and `skippedDetail`
 //      ({path, reason}).
 //   6. If nothing is left, no-op. Otherwise write-tree -> final tree.
@@ -184,8 +219,9 @@
 // blobs, and refuses every path whose committed bytes could differ from what
 // the user wrote or what a checkout writes back (filtered-path,
 // encoded-path) or could make `git push` upload something else
-// (lfs-pointer), so neither a clean filter, a working-tree-encoding nor
-// git-lfs can smuggle a secret into history.
+// (lfs-pointer), and never commits an attributes file (attributes-file), so
+// neither a clean filter, a working-tree-encoding nor git-lfs can smuggle a
+// secret into history beyond the flip-and-flip-back residual above.
 //
 // Test seam: `runAutocommit(root, now, { onPhase })` calls
 // `onPhase('added')` after step 4's add/write-tree and `onPhase('scanned')`
@@ -204,7 +240,6 @@ const VAULT_PATHSPEC = 'vault';
 const PENDING_MARKER_NAME = 'skippy-autocommit-pending';
 const PENDING_MARKER_VERSION = 2;
 const GITLINK_MODE = '160000';
-const GITATTRIBUTES = '.gitattributes';
 /** Name of every private temp dir a tick creates (and the sweep removes). */
 const TEMP_DIR_RE = /^skippy-ac-[0-9a-f]{16}$/;
 /** A `skippy-ac-*` dir untouched for this long belongs to a killed tick. */
@@ -558,6 +593,75 @@ function withheldAddCandidates(root, seedEnv) {
 }
 
 /**
+ * True if a path component (a byte string, latin1) names a `.gitattributes`
+ * file on ANY platform: a verbatim port of git's `is_ntfs_dotgitattributes`
+ * (`is_ntfs_dot_generic(name, "gitattributes", 13, "gi7d29")`, path.c) —
+ * `.gitattributes` in any ASCII case, optionally followed by trailing spaces
+ * / periods and an NTFS `:stream` suffix, plus the 8.3 short names
+ * `gitatt~1`..`gitatt~4` and the hashed `gi7d29~N` form. Case-insensitive
+ * everywhere (not just on Windows), so both engines agree on every OS.
+ */
+export function isAttributesFileName(name) {
+  const NAME = 'gitattributes';
+  const SHORT = 'gi7d29';
+  const lower = asciiLower(name);
+  const onlySpacesAndPeriods = (i) => {
+    for (; i < name.length; i++) {
+      const c = name[i];
+      if (c === ':') return true;
+      if (c !== ' ' && c !== '.') return false;
+    }
+    return true;
+  };
+  if (lower.startsWith(`.${NAME}`)) return onlySpacesAndPeriods(NAME.length + 1);
+  if (lower.startsWith(NAME.slice(0, 6)) && name[6] === '~' && name[7] >= '1' && name[7] <= '4') return onlySpacesAndPeriods(8);
+  let sawTilde = false;
+  for (let i = 0; i < 8; i++) {
+    if (i >= name.length) return false;
+    const c = name[i];
+    if (sawTilde) {
+      if (c < '0' || c > '9') return false;
+    } else if (c === '~') {
+      i++;
+      if (i >= name.length || name[i] < '1' || name[i] > '9') return false;
+      sawTilde = true;
+    } else if (i >= 6) return false;
+    else if (c.charCodeAt(0) & 0x80) return false;
+    else if (lower[i] !== SHORT[i]) return false;
+  }
+  return onlySpacesAndPeriods(8);
+}
+
+/** True if the last component of a repo-relative byte path names a `.gitattributes`. */
+export function isAttributesFilePath(bytePath) {
+  return isAttributesFileName(bytePath.slice(bytePath.lastIndexOf('/') + 1));
+}
+
+/** `.git` in any ASCII case (git refuses to track anything under it). */
+const isDotGitName = (name) => asciiLower(name) === '.git';
+
+/** Discovery variables that would make `rev-parse` ignore the directory it runs in. */
+const DISCOVERY_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE'];
+
+/**
+ * True iff `dir` (which holds a `.git` entry) is itself the top of a real
+ * repository: `rev-parse --show-cdup` run there, with the discovery
+ * variables removed, succeeds and prints nothing. A bogus `.git` (an invalid
+ * gitfile makes rev-parse die; an empty `.git` directory makes it find the
+ * superproject) is NOT a repository: `git add` walks into such a directory
+ * and reads its `.gitattributes`, so the snapshot must too (M0-G13).
+ */
+function isNestedRepository(dir) {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) if (!DISCOVERY_ENV.includes(k.toUpperCase())) env[k] = v;
+  try {
+    return execFileSync('git', ['-C', dir, 'rev-parse', '--show-cdup'], { env, stdio: ['ignore', 'pipe', 'pipe'] }).toString('utf8').trim() === '';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * State of one attribute file: its full content, or absent / a link /
  * another non-regular entry / unreadable. `followLinks` is false for in-tree
  * `.gitattributes` (git refuses to read those through a symlink) and true for
@@ -593,10 +697,13 @@ function attributeFileState(path, followLinks) {
 }
 
 /**
- * Every `.gitattributes` under `dir` (relative keys `vault/.../.gitattributes`
- * -> state), walked without following links; a directory holding `.git` (a
- * nested repository or the vault's own submodule checkout) is not entered —
- * git reads no superproject attributes there.
+ * Every attributes file under `dir` (keys `wt:vault/.../<name>` -> state):
+ * each entry whose name `isAttributesFileName` accepts (any case, so the
+ * `.GitAttributes` git reads on a case-insensitive filesystem is seen,
+ * M0-G13), walked without following links. A directory holding a `.git`
+ * entry is skipped only if it is a real nested repository (then `add` stages
+ * it as a gitlink and git reads no superproject attributes inside); the
+ * verdict is recorded, so a bogus `.git` turning real (or back) is a change.
  */
 function walkVaultAttributes(root, rel, out) {
   const dir = join(root, rel);
@@ -607,11 +714,16 @@ function walkVaultAttributes(root, rel, out) {
     out.set(`dir:${rel}`, `error:${e.code}`);
     return;
   }
-  if (entries.some((e) => e.name === '.git')) return;
+  if (entries.some((e) => isDotGitName(e.name))) {
+    const nested = isNestedRepository(dir);
+    out.set(`nested:${rel}`, nested ? 'repo' : 'not-a-repo');
+    if (nested) return;
+  }
   for (const e of entries) {
+    if (isDotGitName(e.name)) continue;
     const child = `${rel}/${e.name}`;
-    if (e.name === GITATTRIBUTES) out.set(`wt:${child}`, attributeFileState(join(root, child), false));
-    else if (e.isDirectory() && !e.isSymbolicLink()) walkVaultAttributes(root, child, out);
+    if (isAttributesFileName(toBytePath(e.name))) out.set(`wt:${child}`, attributeFileState(join(root, child), false));
+    if (e.isDirectory() && !e.isSymbolicLink()) walkVaultAttributes(root, child, out);
   }
 }
 
@@ -624,16 +736,60 @@ function gitVarPath(root, name) {
   }
 }
 
+/** The tree a tree-ish names (`rev-parse --verify <v>^{tree}`), or 'unresolved'. */
+function treeOf(root, treeish) {
+  try {
+    return git(root, ['rev-parse', '--verify', '-q', '--end-of-options', `${treeish}^{tree}`]) || 'unresolved';
+  } catch {
+    return 'unresolved';
+  }
+}
+
 /**
- * A1 / A2: every attribute source git reads for a vault path — the in-tree
- * `.gitattributes` at the root and anywhere under vault/, the repo's
- * info/attributes, and the global and system files (paths re-resolved on
- * every call, so a core.attributesFile change is seen too). Two snapshots
- * are equal iff no source changed.
+ * `attr.tree` (git 2.42+: read attributes from that tree INSTEAD of the
+ * working tree / index): every configured value in order (git uses the last;
+ * an empty value means the empty tree) plus the tree the last one resolves
+ * to, so both a config change and a move of the ref it names are seen.
+ */
+function attrTreeState(root) {
+  let listing;
+  try {
+    listing = gitRaw(root, ['config', '-l', '-z']).toString('latin1');
+  } catch (e) {
+    return `error:${e.message}`;
+  }
+  const values = [];
+  for (const rec of listing.split('\0')) {
+    const nl = rec.indexOf('\n');
+    const key = nl < 0 ? rec : rec.slice(0, nl);
+    if (key === 'attr.tree') values.push(nl < 0 ? null : rec.slice(nl + 1));
+  }
+  if (values.length === 0) return 'unset';
+  const last = values[values.length - 1];
+  const tree = last === null || last === '' ? 'empty' : treeOf(root, Buffer.from(last, 'latin1').toString('utf8'));
+  return `set:${values.map((v) => (v === null ? '\u0001' : v)).join('\0')}\0${tree}`;
+}
+
+/**
+ * A1 / A2: every attribute source git reads for a vault path — every
+ * attributes file (any case) at the root and anywhere under vault/, the
+ * repo's info/attributes, the global and system files (paths re-resolved on
+ * every call, so a core.attributesFile change is seen too; a relative path is
+ * resolved against the repository top level, where git itself opens it),
+ * `attr.tree` and `GIT_ATTR_SOURCE` (value + the tree they name). Two
+ * snapshots are equal iff no source changed.
  */
 function attributeSnapshot(root) {
   const snap = new Map();
-  snap.set(`wt:${GITATTRIBUTES}`, attributeFileState(join(root, GITATTRIBUTES), false));
+  let rootNames = [];
+  try {
+    rootNames = readdirSync(root);
+  } catch (e) {
+    snap.set('dir:.', `error:${e.code}`);
+  }
+  for (const name of rootNames) {
+    if (isAttributesFileName(toBytePath(name))) snap.set(`wt:${name}`, attributeFileState(join(root, name), false));
+  }
   const vault = join(root, VAULT_PATHSPEC);
   let vst = null;
   try {
@@ -651,10 +807,20 @@ function attributeSnapshot(root) {
     /* recorded as unresolved */
   }
   snap.set('info', info ? `${info}\0${attributeFileState(info, true)}` : 'unresolved');
+  let top = null;
+  try {
+    top = git(root, ['rev-parse', '--show-toplevel']) || null;
+  } catch {
+    /* recorded as unresolved */
+  }
   for (const name of ['GIT_ATTR_GLOBAL', 'GIT_ATTR_SYSTEM']) {
-    const p = gitVarPath(root, name);
+    const raw = gitVarPath(root, name);
+    const p = raw && top ? resolve(top, raw) : null;
     snap.set(name, p ? `${p}\0${attributeFileState(p, true)}` : 'unresolved');
   }
+  snap.set('attr.tree', attrTreeState(root));
+  const source = process.env.GIT_ATTR_SOURCE;
+  snap.set('GIT_ATTR_SOURCE', source === undefined ? 'unset' : `set:${source}\0${treeOf(root, source)}`);
   return snap;
 }
 
@@ -958,6 +1124,7 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
       else if (owned.has(p)) early.set(p, 'user-staged');
       else if (modeOf(headEntries, p) === GITLINK_MODE || modeOf(prelimEntries, p) === GITLINK_MODE) early.set(p, 'gitlink');
       else if (matchesSecretFilename(p)) early.set(p, 'secret-filename');
+      else if (isAttributesFilePath(p)) early.set(p, 'attributes-file');
     }
 
     // filtered-path / encoded-path: a `filter` / `working-tree-encoding`
