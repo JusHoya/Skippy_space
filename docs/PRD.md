@@ -340,6 +340,8 @@ Deliver vertical slices, not a simultaneous rewrite. UI fixtures remain labelled
 | OQ-13 | Validation disposition before tasks carry acceptance criteria (FR-RUN-01) | Until M1 adds criteria, a live executor's terminal success records `validation: not_defined` and may be `succeeded`; `failed` validation always forces nonsuccess. Demo (`SKIPPY_DEMO_MODE=1`) records are `simulated`, disabled/missing-key runs are `blocked`, and legacy `result: success` reads as `unverified` |
 | OQ-14 | Approval channel for `ask` charters (FR-SEC-01, FR-SEC-03) | Until FR-SEC-03 approval records exist, approval-required actions (write, exec, network outside allowlist, core-memory edits) are denied by the default approver; SDK boards can read, search and append to memory only |
 | OQ-15 | Is Obsidian Local REST ever a vault write path? (FR-WIKI-01/02) | No: REST is read/search only; all vault writes go through the local VaultBroker (lock, hash CAS, containment, append-only rules) |
+| OQ-16 | Reserved append-only paths and ingest limits (FR-WIKI-02/03) | Every `.md` under `40_Daily/` is reserved for `type: daily` and `50_Agents/<board>/agent_log.md` for `agent_log`; ingest rejects files over 64 MiB; rejection records for unsafe names go to `00_Inbox/_ingest-errors/` |
+| OQ-17 | Content-level secret exposure to boards (FR-SEC-02) | Credential paths are denied by name; a secret inside an ordinarily named file in an assigned worktree remains readable. Revisit with T10 executors (e.g. negative globs or content redaction) |
 
 ### Owner decisions, 2026-09-26
 
