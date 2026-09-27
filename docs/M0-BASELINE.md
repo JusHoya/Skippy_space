@@ -17,7 +17,8 @@ Recorded 2026-09-26 after the M0 targeted fix round 3 on branch `m0/foundation`.
 | pnpm | 9.15.0 |
 | rustc | 1.98.1 (48a229cea 2026-09-01) |
 | cargo | 1.98.1 (797e8a9bc 2026-08-05) |
-| git | 2.45.2.windows.1 |
+| git | 2.45.2.windows.1 (system config sets `core.symlinks=false`, `core.autocrlf=true`) |
+| git-lfs | 3.5.1 (used by the autocommit LFS tests; they skip if git-lfs is absent) |
 | tauri-cli | 2.11.1 |
 | Bundled Claude CLI (via `@anthropic-ai/claude-agent-sdk` 0.3.162) | 2.1.162 |
 
@@ -41,7 +42,7 @@ Skipped tests:
 - 2 in `packages/memory`: real file/dir symlink creation needs Developer Mode or SeCreateSymbolicLinkPrivilege. Junction tests cover the same reparse-point escape and pass.
 - 10 in `apps/agent-runtime` (`sdk-board.live-cli.test.ts`, `tool-authority-rtf2.live-cli.test.ts`): opt-in with `SKIPPY_LIVE_CLI_MOCK=1`. They run the real bundled Claude CLI against a local mock Anthropic API. The implementing agents ran them enabled, all passing; they were not enabled for this measurement.
 
-Test discovery: package `test` scripts glob `src/**/*.test.ts`, so new tests are picked up automatically. `scripts/*.test.mjs` run via `test:scripts`.
+Test discovery: `packages/memory` and `apps/agent-runtime` glob `src/**/*.test.ts`, so new tests there are picked up automatically; `scripts/*.test.mjs` run via `test:scripts`. `apps/ui`, `packages/shared`, `packages/otel` and `packages/sprite-kit` have no `test` script, so tests added there would not run. The autocommit long-path and LFS tests skip themselves when the temp path is too long or git-lfs is missing; neither skipped here.
 
 ### Lint warnings (10, all pre-existing, 0 errors)
 
@@ -66,6 +67,8 @@ The following were **not** run. No claim is made beyond what is stated.
 
 - **GitHub CI for this branch**: not executed. The fixed workflow will first run when a PR is opened.
 - **Linux execution**: the `ts` job targets ubuntu-latest; no Linux run has happened locally or on GitHub. All results above are Windows 11 only.
+- **Node 22**: CI pins Node 22; every result above was measured on Node 24.18.0 only.
+- **Lint coverage outside `src/`**: `pnpm lint` runs `eslint src` per package, so `scripts/*.mjs` (including the Node autocommit engine) and `tests/visual` are neither linted nor typechecked.
 - **Playwright visual tests (`pnpm test:visual`)**: the last attempt failed 4/4 because the local browser cache was stale (`chromium_headless_shell-1223` missing). `pnpm exec playwright install` was not run (network download, out of scope).
 - **Native PTY/sidecar/IPC/Channels tests**: need a running Tauri app. `cargo test` covers Rust unit tests only (git_autocommit, envelope, claude_spawn). Native desktop-boundary tests belong to T07/T17 (FR-OPS-03).
 - **Tauri app startup, `tauri build`, installer and clean-install**: not run.
