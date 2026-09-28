@@ -73,8 +73,10 @@
 //!    (`<tmp>/skippy-ac-<16 hex>/`, D1) — never under the git dir, so a long
 //!    repo/worktree path can't push `<index>.lock` past MAX_PATH — and the
 //!    directory (with any `.lock`) is removed in every case. It only ever
-//!    holds index files and pathspec lists (paths + object ids), never vault
-//!    file content. Every tick first sweeps `<tmp>/skippy-ac-<16 hex>`
+//!    holds index files and pathspec lists (paths + object ids) and the empty
+//!    clone-view repository (step 5: `HEAD`, `config`, an empty `refs/` and
+//!    an alternates file naming the object directory), never vault file
+//!    content. Every tick first sweeps `<tmp>/skippy-ac-<16 hex>`
 //!    directories older than one hour (left by a killed tick; exact name
 //!    match, real directories only, never through a symlink/junction, best
 //!    effort): [`sweep_stale_temp_dirs`].
@@ -90,11 +92,18 @@
 //!        (nested repo, submodule pointer bump, D4); gitlinks already in
 //!        HEAD are left exactly as they are;
 //!      * `secret-filename` — shared filename rules;
-//!      * `attributes-file` — the path's last component names a
-//!        `.gitattributes`: any ASCII case, plus every NTFS equivalent git
-//!        itself treats as one (trailing spaces / periods, a `:stream`
-//!        suffix, the `gitatt~N` / `gi7d29~N` 8.3 names; a port of git's
-//!        `is_ntfs_dotgitattributes`, applied on every OS). Autocommit never
+//!      * `attributes-file` — ANY component of the path names a
+//!        `.gitattributes` (the file itself, or anything under a directory so
+//!        named — DEF-4: restoring a committed `vault/.gitattributes` over a
+//!        directory `vault/.gitattributes/` would otherwise drop its notes
+//!        silently): any ASCII case, plus every NTFS equivalent git itself
+//!        treats as one (trailing spaces / periods, a `:stream` suffix, the
+//!        `gitatt~N` / `gi7d29~N` 8.3 names; a port of git's
+//!        `is_ntfs_dotgitattributes`) and every HFS+ one (the name with the
+//!        code points HFS+ ignores — U+200C..U+200F, U+202A..U+202E,
+//!        U+206A..U+206F, U+FEFF — removed; a port of git's
+//!        `is_hfs_dotgitattributes`, DEF-5), both applied on every OS.
+//!        Autocommit never
 //!        adds, modifies or deletes an attributes file, so an encoding or
 //!        filter rule reaches history only through a deliberate user commit
 //!        (M0-G12 residuals D1-D3): a rule committed next to text stored
@@ -106,16 +115,39 @@
 //!        (A1 != A2, below): EVERY remaining candidate is deferred to the
 //!        next tick;
 //!      * `filtered-path` — the path has a `filter` attribute (any value:
-//!        `lfs`, a custom driver, even an unconfigured one) in EITHER
-//!        evaluation — `check-attr` against the seed index (the pre-add
-//!        attribute state; the working-tree side is pinned by A1 == A2) or
-//!        against the post-add temp index. The vault is Markdown and needs no
-//!        clean filter; a filter can turn any content into bytes the blob
-//!        scan cannot judge (an LFS pointer, rot13), so filtered paths are
-//!        never autocommitted (OQ-19);
+//!        `lfs`, a custom driver, even an unconfigured one) in ANY view a
+//!        reader could apply (OQ-19, DEF-1), one batched `check-attr -z
+//!        --stdin` per view: (a) the working tree, against the seed index
+//!        (the pre-add state; the working-tree side is pinned by A1 == A2),
+//!        against the post-add temp index and against the user's real index
+//!        (a rule staged there, its working-tree file deleted, reaches the
+//!        user's next commit); (b) HEAD's committed attribute
+//!        files (`--source=HEAD`; skipped while HEAD is unborn); (c) the tree
+//!        the commit is built from (T0: the post-add tree with every
+//!        exclusion decided before this check applied, in a copy of the temp
+//!        index; later exclusions restore no attributes file, so the commit's
+//!        attribute files are exactly T0's, which are HEAD's), both with this
+//!        repository's info / global / system files (`--source=T0`: a
+//!        checkout here) and ALONE — the clone view: the same call run in an
+//!        empty bare repository that borrows the object store (alternates),
+//!        with the system file off, the global file pointed at nothing and
+//!        the discovery variables removed, so no `info/attributes`,
+//!        `attr.tree`, global or system rule can unset what a fresh clone
+//!        applies; and (d) for each committed attributes file under an alias
+//!        spelling (a case variant, an NTFS or HFS+ name: `--source` looks
+//!        `.gitattributes` up byte for byte, but a case-insensitive / NTFS /
+//!        HFS+ checkout writes the alias where git then opens
+//!        `.gitattributes`), the clone view of T0 with that blob as its
+//!        directory's `.gitattributes`. So a rule the working tree
+//!        neutralises (an uncommittable in-vault override, an edited
+//!        committed file, `info/attributes`, `attr.tree`) can no longer let a
+//!        note that a clone would decode reach history. The vault is Markdown
+//!        and needs no clean filter; a filter can turn any content into bytes
+//!        the blob scan cannot judge (an LFS pointer, rot13), so filtered
+//!        paths are never autocommitted (OQ-19);
 //!      * `encoded-path` — the path has a `working-tree-encoding` attribute
 //!        (any value but unspecified/unset: UTF-16LE, UTF-32, even UTF-8 or
-//!        an empty value) in EITHER evaluation, same `check-attr` call and
+//!        an empty value) in ANY view, same `check-attr` calls and
 //!        semantics as `filtered-path` (a path with both is
 //!        `filtered-path`). Re-encoding is a clean filter in all but name
 //!        (M0-G12): ASCII `AKIA...` bytes declared UTF-16LE are stored as CJK
@@ -135,7 +167,14 @@
 //!      * `secret-content` — shared content rules hit the exact blob the
 //!        commit would contain (`cat-file --batch`, fetched in batches of at
 //!        most `maxScanBytes`; one char per byte and again with NULs stripped
-//!        for UTF-16).
+//!        for UTF-16);
+//!      * `path-conflict` — decided last, after the exclusions above are
+//!        restored: a path that restoring one of them displaced (git holds no
+//!        entry under a path that is a file, e.g. a new `vault/a` note where
+//!        the excluded `vault/a/.env` goes back). The final tree is then
+//!        checked: every staged path is either committed exactly as staged or
+//!        reported, and no other vault path changes — otherwise the tick
+//!        fails explicitly and nothing is committed.
 //!
 //!    With filtered and encoded paths refused, every committed blob is
 //!    exactly the scanned blob: the scan needs no proof step. Mode-120000
@@ -160,14 +199,19 @@
 //!    scanned.
 //!
 //!    Attribute snapshots A1 (before the add) and A2 (after the scans and
-//!    both `check-attr` runs) cover every source git reads (M0-G13): every
+//!    every `check-attr` view) cover every source git reads (M0-G13): every
 //!    attributes file (the `attributes-file` names, any case, so the
 //!    `.GitAttributes` git opens on a case-insensitive filesystem is seen)
-//!    at the repo root and anywhere under `vault/` (walked without following
-//!    links; a directory holding a `.git` entry is skipped only if `rev-parse
-//!    --show-cdup` run there says it is a real nested repository — `add`
-//!    walks straight into one with a bogus `.git` — and that verdict is
-//!    recorded), `$GIT_COMMON_DIR/info/attributes`, the global file (`git
+//!    at the repo root and in every directory under `vault/` that `add`
+//!    visits — `vault` plus every ancestor of every path `ls-files --cached
+//!    --others --exclude-standard -- vault` lists against the seed index,
+//!    i.e. git's own walk: it descends into a directory junction on Windows
+//!    (DEF-2) but never into a symlinked directory on POSIX, enters a real
+//!    nested repository whose paths are tracked (DEF-3) or a directory with
+//!    a bogus `.git`, skips an untracked nested repository (a gitlink) and an
+//!    ignored directory, and is bounded and cycle-safe as git's walk is (a
+//!    junction cycle ends at git's path-length limit, and the add then fails
+//!    the tick) — `$GIT_COMMON_DIR/info/attributes`, the global file (`git
 //!    var GIT_ATTR_GLOBAL`: `core.attributesFile` or the XDG default) and
 //!    the system file (`git var GIT_ATTR_SYSTEM`), a relative path resolved
 //!    against the repository top level (where git itself opens it, not the
@@ -181,20 +225,28 @@
 //!
 //!    Residual (OQ-19, M0-G14): such an unseen flip can still store a
 //!    re-encoded or filtered blob for a path (e.g. the CJK text a transient
-//!    UTF-16LE rule makes of an ASCII key). Because autocommit never commits
-//!    the rule, a clone or checkout without it writes exactly those stored
-//!    bytes: the plaintext reappears only where a matching rule is active
-//!    again (the attacker's own machine or attribute files, or a user who
-//!    later commits such a rule by hand). The stored bytes are still a
-//!    reversible transform of the secret that the scanner cannot judge, so
-//!    anyone who knows the transform can decode them offline. Reaching this
-//!    takes write access to an attribute source at the right instant, i.e.
-//!    a local attacker who could equally write the secret into a note in
-//!    any encoding no content scan recognizes.
+//!    UTF-16LE rule makes of an ASCII key). It is not rare: under a toggler
+//!    flipping a working-tree rule every 2-32 ms, the M1 pre-flight verifier
+//!    saw one enter history roughly once every 3-12 committing ticks, and
+//!    once stored it stays in every later HEAD until the note changes (up to
+//!    27 of 50 new HEADs in the fix's race run).
+//!    The committed views make it harmless to clones: the rule was never
+//!    committed (else view b/c refuses the path), so a clone or checkout of
+//!    the commit writes exactly those stored bytes, never the plaintext; the
+//!    plaintext reappears only where a matching rule is active again (the
+//!    attacker's own machine or attribute files, or a user who later commits
+//!    such a rule by hand — the committed views then refuse every later
+//!    change of that path, but not the blob already in history). The stored
+//!    bytes are still a reversible transform of the secret that the scanner
+//!    cannot judge, so anyone who knows the transform can decode them
+//!    offline. Reaching this takes write access to an attribute source at
+//!    the right instant, i.e. a local attacker who could equally write the
+//!    secret into a note in any encoding no content scan recognizes.
 //!
 //!    All are reported back as `skipped` paths (byte order) plus
 //!    `skipped_detail` (path, reason).
-//! 6. If nothing is left, no-op. Otherwise `write-tree` -> final tree.
+//! 6. If nothing is left, no-op. Otherwise `write-tree` -> final tree (with
+//!    the `path-conflict` check of step 5).
 //! 7. `git commit-tree <tree> [-p HEAD] -m <msg>` builds the commit object.
 //!    `commit-tree` is plumbing: it never runs commit hooks, so a flaky
 //!    `pre-commit`/`commit-msg` hook (or a secret-scanning one) in the
@@ -240,11 +292,15 @@
 //! something else (`lfs-pointer`), and never commits an attributes file
 //! (`attributes-file`), so neither a clean filter, a
 //! `working-tree-encoding` nor git-lfs can smuggle a secret into history
-//! beyond the flip-and-flip-back residual above.
+//! beyond the flip-and-flip-back residual above; and because every view a
+//! reader could apply is evaluated (working tree, HEAD, the commit as a
+//! checkout here and as a fresh clone reads it), a clone never decodes
+//! autocommitted text into something the scanner did not see (FR-WIKI-06),
+//! except where the reader's own attribute files add a rule.
 //!
 //! Test seam: [`run_autocommit_report_with`] calls its hook with
 //! [`TickPhase::Added`] after step 4's add/write-tree and
-//! [`TickPhase::Scanned`] after the blob scan and both `check-attr` runs,
+//! [`TickPhase::Scanned`] after the blob scan and every `check-attr` view,
 //! before the closing attribute snapshot A2 (Node:
 //! `runAutocommit(root, now, { onPhase })`). Production passes `None`.
 
@@ -285,7 +341,7 @@ pub(crate) const STALE_TEMP_DIR_AGE: Duration = Duration::from_secs(60 * 60);
 pub(crate) enum TickPhase {
     /// Step 4's `add -A` / `write-tree` into the temp index are done.
     Added,
-    /// The blob scan and both `check-attr` runs are done; the closing
+    /// The blob scan and every `check-attr` view are done; the closing
     /// attribute snapshot (A2) has not been taken yet.
     Scanned,
 }
@@ -308,6 +364,7 @@ pub enum SkipReason {
     TooLargeToScan,
     LfsPointer,
     SecretContent,
+    PathConflict,
 }
 
 impl SkipReason {
@@ -324,6 +381,7 @@ impl SkipReason {
             SkipReason::TooLargeToScan => "too-large-to-scan",
             SkipReason::LfsPointer => "lfs-pointer",
             SkipReason::SecretContent => "secret-content",
+            SkipReason::PathConflict => "path-conflict",
         }
     }
 }
@@ -734,6 +792,33 @@ fn differing_paths(a: &Entries, b: &Entries) -> Vec<BPath> {
     out.into_iter().collect()
 }
 
+/// Restore `paths` in the index `env` names to their HEAD state (or remove
+/// them if HEAD lacks them) with ONE `update-index -z --index-info`.
+/// `oid_len` is the object id length (40 or 64) for the removal records.
+async fn restore_to_head(
+    root: &Path,
+    env: &[(&str, &OsStr)],
+    paths: &[BPath],
+    head_entries: &Entries,
+    oid_len: usize,
+) -> Result<()> {
+    let zero = "0".repeat(oid_len);
+    let mut info: Vec<u8> = Vec::new();
+    for p in paths {
+        match head_entries.get(p) {
+            Some(entry) => info.extend_from_slice(entry.as_bytes()),
+            None => info.extend_from_slice(format!("0 {zero}").as_bytes()),
+        }
+        info.push(b'\t');
+        info.extend_from_slice(p);
+        info.push(0);
+    }
+    git_raw(root, &["update-index", "-z", "--index-info"], env, Some(&info))
+        .await
+        .context("git update-index --index-info failed while restoring excluded vault paths")?;
+    Ok(())
+}
+
 /// Vault paths the user has staged something for (real index != HEAD).
 fn user_owned_paths(snap: &IndexSnapshot, head_entries: &Entries) -> BTreeSet<BPath> {
     let mut owned = snap.unmerged.clone();
@@ -920,28 +1005,196 @@ fn attr_is_set(value: &[u8]) -> bool {
     value != b"unspecified" && value != b"unset"
 }
 
+/// `check-attr` stdin: raw byte paths, each NUL-terminated.
+fn paths_input(paths: &[BPath]) -> Vec<u8> {
+    let mut input = Vec::new();
+    for p in paths {
+        input.extend_from_slice(p);
+        input.push(0);
+    }
+    input
+}
+
 /// The conversion attributes of `paths` (OQ-19): `filtered`, the subset with
 /// a `filter` attribute set to anything (`set` or any driver name, e.g.
 /// `lfs`, configured or not), and `encoded`, the subset with a
 /// `working-tree-encoding` attribute set to anything (`set`, any encoding
 /// name — even UTF-8, an unknown one or an empty value); `unspecified` /
 /// `unset` mean neither. One `check-attr -z --stdin` call, raw byte paths on
-/// stdin; `env` selects the index git falls back to for a `.gitattributes`
-/// missing from the working tree (the seed index = the pre-add state, or the
-/// temp index = the post-add state).
-async fn conversion_attributes(root: &Path, paths: &[BPath], env: &[(&str, &OsStr)]) -> Result<ConversionAttrs> {
-    let mut attrs = ConversionAttrs::default();
+/// stdin. Without `source`, git reads the working tree's attribute files and
+/// `env` selects the index it falls back to for one missing from the working
+/// tree (the seed index = the pre-add state, or the temp index = the post-add
+/// state). With `source` (a commit or tree id), git reads the attribute files
+/// of that tree instead (`--source`, which also overrides `attr.tree` and
+/// `GIT_ATTR_SOURCE`), plus this repository's info / global / system files.
+async fn conversion_attributes(
+    root: &Path,
+    paths: &[BPath],
+    env: &[(&str, &OsStr)],
+    source: Option<&str>,
+) -> Result<ConversionAttrs> {
     if paths.is_empty() {
-        return Ok(attrs);
+        return Ok(ConversionAttrs::default());
     }
-    let mut input = Vec::new();
-    for p in paths {
-        input.extend_from_slice(p);
-        input.push(0);
+    let mut args: Vec<String> = vec!["check-attr".into()];
+    if let Some(s) = source {
+        args.push(format!("--source={s}"));
     }
-    let out = git_raw(root, &["check-attr", "-z", "--stdin", "filter", "working-tree-encoding"], env, Some(&input))
+    args.extend(["-z", "--stdin", "filter", "working-tree-encoding"].map(String::from));
+    let out = git_raw(root, &args, env, Some(&paths_input(paths)))
         .await
         .context("git check-attr filter working-tree-encoding failed")?;
+    parse_conversion_attributes(&out, paths)
+}
+
+/// Variables that would point the clone view at this repository (or another
+/// attribute tree).
+const CLONE_VIEW_DROPPED_ENV: [&str; 6] =
+    ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_ATTR_SOURCE", "GIT_NAMESPACE"];
+
+/// The clone view (OQ-19): the conversion attributes of `paths` exactly as a
+/// fresh clone of `tree` reads them — that tree's attribute files ONLY. Runs
+/// `check-attr --source=<tree>` in `clone_dir`, an empty bare repository
+/// borrowing this repository's objects ([`clone_view_repository`]), with the
+/// system file off (`GIT_ATTR_NOSYSTEM`), the global file pointed at a path
+/// that does not exist, and the discovery variables removed, so neither this
+/// repository's `info/attributes` nor `attr.tree` nor any global or system
+/// rule can unset a rule the clone applies.
+async fn clone_view_attributes(clone_dir: &Path, paths: &[BPath], tree: &str) -> Result<ConversionAttrs> {
+    if paths.is_empty() {
+        return Ok(ConversionAttrs::default());
+    }
+    let mut git_dir = OsString::from("--git-dir=");
+    git_dir.push(clone_dir.as_os_str());
+    let mut no_attrs = OsString::from("core.attributesFile=");
+    no_attrs.push(clone_dir.join("no-attributes").as_os_str());
+    let mut cmd = Command::new("git");
+    cmd.arg(git_dir).arg("-c").arg(no_attrs);
+    cmd.args(["check-attr", &format!("--source={tree}"), "-z", "--stdin", "filter", "working-tree-encoding"]);
+    cmd.current_dir(clone_dir);
+    for (k, _) in std::env::vars_os() {
+        if CLONE_VIEW_DROPPED_ENV.iter().any(|d| k.to_string_lossy().eq_ignore_ascii_case(d)) {
+            cmd.env_remove(&k);
+        }
+    }
+    cmd.env("GIT_LITERAL_PATHSPECS", "1").env("GIT_ATTR_NOSYSTEM", "1");
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().context("failed to spawn git check-attr (clone view)")?;
+    let input = paths_input(paths);
+    let stdin = child.stdin.take();
+    let write = async move {
+        match stdin {
+            Some(mut s) => {
+                let r = s.write_all(&input).await;
+                drop(s);
+                r
+            }
+            None => Ok(()),
+        }
+    };
+    let (written, output) = tokio::join!(write, child.wait_with_output());
+    let output = output.context("failed to run git check-attr (clone view)")?;
+    if !output.status.success() {
+        bail!("git check-attr (clone view) failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    written.context("failed to write stdin of git check-attr (clone view)")?;
+    parse_conversion_attributes(&output.stdout, paths)
+}
+
+/// An empty bare repository at `<temp_dir>/clone-view.git` whose object store
+/// borrows this repository's (`objects/info/alternates`), in the repository's
+/// object format: nothing but a place to run the clone view.
+async fn clone_view_repository(root: &Path, temp_dir: &Path) -> Result<PathBuf> {
+    let dir = temp_dir.join("clone-view.git");
+    let format = git(root, &["rev-parse", "--show-object-format"], &[]).await?;
+    if format.is_empty() || !format.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+        bail!("unexpected object format {format:?}");
+    }
+    let mut objects = git_raw(root, &["rev-parse", "--path-format=absolute", "--git-path", "objects"], &[], None).await?;
+    if objects.last() == Some(&b'\n') {
+        objects.pop();
+    }
+    objects.push(b'\n');
+    let config = if format == "sha1" {
+        "[core]\n\trepositoryformatversion = 0\n\tbare = true\n".to_string()
+    } else {
+        format!("[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = {format}\n")
+    };
+    std::fs::create_dir_all(dir.join("objects").join("info")).context("failed to create the clone-view repository")?;
+    std::fs::create_dir(dir.join("refs")).context("failed to create the clone-view repository")?;
+    std::fs::write(dir.join("HEAD"), "ref: refs/heads/none\n").context("failed to create the clone-view repository")?;
+    std::fs::write(dir.join("config"), config).context("failed to create the clone-view repository")?;
+    std::fs::write(dir.join("objects").join("info").join("alternates"), objects)
+        .context("failed to create the clone-view repository")?;
+    Ok(dir)
+}
+
+/// A committed attribute file under a name other than exactly
+/// `.gitattributes`: its directory (empty = the root) and blob id.
+struct AliasAttributeFile {
+    dir: BPath,
+    oid: String,
+}
+
+/// The committed attribute files under a name other than exactly
+/// `.gitattributes` (a case variant, an NTFS or HFS+ spelling) that the
+/// commit holds at the root or under `vault/`. `--source` looks
+/// `.gitattributes` up in a tree byte for byte, but a checkout onto a
+/// case-insensitive, NTFS or HFS+ filesystem writes such a file where git
+/// then opens `.gitattributes`, so the clone view evaluates each one as its
+/// directory's `.gitattributes` too. Every attributes file the commit holds
+/// is HEAD's (autocommit never adds, changes or removes one), so HEAD's
+/// entries are the commit's; `head_vault` is HEAD's vault entries.
+async fn alias_attribute_files(root: &Path, head: Option<&str>, head_vault: &Entries) -> Result<Vec<AliasAttributeFile>> {
+    let Some(head) = head else { return Ok(Vec::new()) };
+    let mut out = Vec::new();
+    let listing = git_raw(root, &["ls-tree", "-z", head], &[], None)
+        .await
+        .context("git ls-tree HEAD (attribute aliases) failed")?;
+    for rec in split_z(&listing) {
+        let (meta, name) = split_record(rec).ok_or_else(|| anyhow!("malformed ls-tree record"))?;
+        if meta.len() < 3 {
+            bail!("malformed ls-tree record");
+        }
+        if meta[0] != GITLINK_MODE && meta[0] != "040000" && name != b".gitattributes" && is_attributes_file_name(&name) {
+            out.push(AliasAttributeFile { dir: Vec::new(), oid: meta[2].clone() });
+        }
+    }
+    for (p, v) in head_vault {
+        let Some((mode, oid)) = v.split_once(' ') else { continue };
+        let slash = p.iter().rposition(|&b| b == b'/').unwrap_or(0);
+        let name = &p[slash + 1..];
+        if mode != GITLINK_MODE && name != b".gitattributes" && is_attributes_file_name(name) {
+            out.push(AliasAttributeFile { dir: p[..slash].to_vec(), oid: oid.to_string() });
+        }
+    }
+    Ok(out)
+}
+
+/// `tree` with `<dir>/.gitattributes` replaced by the alias's blob (built in
+/// a scratch index under `temp_dir`): the tree a checkout that let the alias
+/// win would read attributes from.
+async fn tree_with_attributes_blob(root: &Path, temp_dir: &Path, tree: &str, alias: &AliasAttributeFile) -> Result<String> {
+    let index = temp_dir.join("alias-index");
+    let _ = std::fs::remove_file(&index);
+    let env = [("GIT_INDEX_FILE", index.as_os_str())];
+    git(root, &["read-tree", tree], &env).await.context("git read-tree (attribute alias) failed")?;
+    let mut info = format!("100644 {}\t", alias.oid).into_bytes();
+    if !alias.dir.is_empty() {
+        info.extend_from_slice(&alias.dir);
+        info.push(b'/');
+    }
+    info.extend_from_slice(b".gitattributes\0");
+    git_raw(root, &["update-index", "-z", "--index-info"], &env, Some(&info))
+        .await
+        .context("git update-index (attribute alias) failed")?;
+    git(root, &["write-tree"], &env).await.context("git write-tree (attribute alias) failed")
+}
+
+/// Parse `check-attr -z` output for `filter` + `working-tree-encoding`.
+fn parse_conversion_attributes(out: &[u8], paths: &[BPath]) -> Result<ConversionAttrs> {
+    let mut attrs = ConversionAttrs::default();
     let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
     if fields.len() != paths.len() * 6 + 1 || !fields[fields.len() - 1].is_empty() {
         bail!("check-attr: unexpected output");
@@ -992,7 +1245,7 @@ async fn withheld_add_candidates(root: &Path, seed_env: &[(&str, &OsStr)]) -> Re
         .filter(|p| !p.ends_with(b"/") && !deleted.contains(p.as_slice()))
         .cloned()
         .collect();
-    let attrs = conversion_attributes(root, &files, seed_env).await?;
+    let attrs = conversion_attributes(root, &files, seed_env, None).await?;
     let mut withheld = BTreeMap::new();
     for p in files {
         if attrs.filtered.contains(&p) {
@@ -1044,14 +1297,115 @@ fn attribute_file_state(path: &Path, follow_links: bool) -> Vec<u8> {
     }
 }
 
-/// True if a path component names a `.gitattributes` file on ANY platform: a
+/// True if a path component names a `.gitattributes` file on ANY platform:
+/// git's `is_ntfs_dotgitattributes` OR its `is_hfs_dotgitattributes`, both
+/// applied on every OS so the two engines agree everywhere
+/// ([`is_ntfs_dotgitattributes`], [`is_hfs_dotgitattributes`]).
+pub(crate) fn is_attributes_file_name(name: &[u8]) -> bool {
+    is_ntfs_dotgitattributes(name) || is_hfs_dotgitattributes(name)
+}
+
+/// The code points HFS+ ignores in a file name, so git ignores them when it
+/// compares a name against `.gitattributes` (`next_hfs_char`, `utf8.c`):
+/// U+200C..U+200F, U+202A..U+202E, U+206A..U+206F and U+FEFF.
+const HFS_IGNORABLE: [u32; 16] = [
+    0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x206a, 0x206b, 0x206c, 0x206d, 0x206e,
+    0x206f, 0xfeff,
+];
+
+/// One UTF-8 code point of `s` at `i`, as `(code point, next)`: a verbatim
+/// port of git's `pick_one_utf8_char` (`utf8.c`) on a NUL-terminated string
+/// — the end of `s` reads as NUL (code point 0), and a malformed, overlong,
+/// surrogate, U+FFFE/U+FFFF or > U+10FFFF sequence is `None`.
+fn pick_one_utf8_char(s: &[u8], i: usize) -> Option<(u32, usize)> {
+    let b = |k: usize| u32::from(s.get(k).copied().unwrap_or(0));
+    let (s0, s1, s2, s3) = (b(i), b(i + 1), b(i + 2), b(i + 3));
+    if s0 < 0x80 {
+        return Some((s0, i + 1));
+    }
+    if s0 & 0xe0 == 0xc0 {
+        if s1 & 0xc0 != 0x80 || s0 & 0xfe == 0xc0 {
+            return None;
+        }
+        return Some((((s0 & 0x1f) << 6) | (s1 & 0x3f), i + 2));
+    }
+    if s0 & 0xf0 == 0xe0 {
+        if s1 & 0xc0 != 0x80
+            || s2 & 0xc0 != 0x80
+            || (s0 == 0xe0 && s1 & 0xe0 == 0x80)
+            || (s0 == 0xed && s1 & 0xe0 == 0xa0)
+            || (s0 == 0xef && s1 == 0xbf && s2 & 0xfe == 0xbe)
+        {
+            return None;
+        }
+        return Some((((s0 & 0x0f) << 12) | ((s1 & 0x3f) << 6) | (s2 & 0x3f), i + 3));
+    }
+    if s0 & 0xf8 == 0xf0 {
+        if s1 & 0xc0 != 0x80
+            || s2 & 0xc0 != 0x80
+            || s3 & 0xc0 != 0x80
+            || (s0 == 0xf0 && s1 & 0xf0 == 0x80)
+            || (s0 == 0xf4 && s1 > 0x8f)
+            || s0 > 0xf4
+        {
+            return None;
+        }
+        return Some((((s0 & 0x07) << 18) | ((s1 & 0x3f) << 12) | ((s2 & 0x3f) << 6) | (s3 & 0x3f), i + 4));
+    }
+    None
+}
+
+/// True if a path component is `.gitattributes` as HFS+ compares names: a
+/// verbatim port of git's `is_hfs_dotgitattributes`
+/// (`is_hfs_dot_generic(path, "gitattributes", 13)`, `utf8.c`) — the UTF-8
+/// name with every [`HFS_IGNORABLE`] code point dropped is `.` plus
+/// `gitattributes` in any ASCII case, followed by the end of the name (or a
+/// malformed UTF-8 sequence, which git reads as the end), or a directory
+/// separator (`/`, or `\` as Git for Windows spells one).
+pub(crate) fn is_hfs_dotgitattributes(name: &[u8]) -> bool {
+    let mut pos: Option<usize> = Some(0);
+    let mut next = || -> u32 {
+        loop {
+            let Some(i) = pos else { return 0 };
+            match pick_one_utf8_char(name, i) {
+                Some((c, n)) if c != 0 => {
+                    pos = Some(n);
+                    if !HFS_IGNORABLE.contains(&c) {
+                        return c;
+                    }
+                }
+                _ => {
+                    pos = None;
+                    return 0;
+                }
+            }
+        }
+    };
+    if next() != u32::from(b'.') {
+        return false;
+    }
+    for &want in b"gitattributes" {
+        let c = next();
+        if c > 127 {
+            return false;
+        }
+        let lower = if (0x41..=0x5a).contains(&c) { c + 32 } else { c };
+        if lower != u32::from(want) {
+            return false;
+        }
+    }
+    let c = next();
+    c == 0 || c == u32::from(b'/') || c == u32::from(b'\\')
+}
+
+/// True if a path component is `.gitattributes` as NTFS compares names: a
 /// verbatim port of git's `is_ntfs_dotgitattributes`
 /// (`is_ntfs_dot_generic(name, "gitattributes", 13, "gi7d29")`, `path.c`) —
 /// `.gitattributes` in any ASCII case, optionally followed by trailing spaces
 /// / periods and an NTFS `:stream` suffix, plus the 8.3 short names
 /// `gitatt~1`..`gitatt~4` and the hashed `gi7d29~N` form. Case-insensitive
-/// everywhere (not just on Windows), so both engines agree on every OS.
-pub(crate) fn is_attributes_file_name(name: &[u8]) -> bool {
+/// everywhere (not just on Windows).
+pub(crate) fn is_ntfs_dotgitattributes(name: &[u8]) -> bool {
     const NAME: &[u8] = b"gitattributes";
     const SHORT: &[u8] = b"gi7d29";
     let only_spaces_and_periods = |from: usize| {
@@ -1094,76 +1448,100 @@ pub(crate) fn is_attributes_file_name(name: &[u8]) -> bool {
     only_spaces_and_periods(8)
 }
 
-/// True if the last component of a repo-relative path names a `.gitattributes`.
+/// True if ANY component of a repo-relative path names a `.gitattributes`:
+/// the attributes file itself, or anything under a directory with such a
+/// name (DEF-4: a committed `vault/.gitattributes` replaced by a directory
+/// `vault/.gitattributes/n.md` — restoring the file would silently drop the
+/// note from the commit).
 fn is_attributes_file_path(path: &[u8]) -> bool {
-    let start = path.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
-    is_attributes_file_name(&path[start..])
+    path.split(|&b| b == b'/').any(is_attributes_file_name)
 }
 
-/// `.git` in any ASCII case (git refuses to track anything under it).
-fn is_dot_git_name(name: &OsStr) -> bool {
-    name.to_string_lossy().eq_ignore_ascii_case(".git")
-}
-
-/// Discovery variables that would make `rev-parse` ignore the directory it
-/// runs in.
-const DISCOVERY_ENV: [&str; 4] = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"];
-
-/// True iff `dir` (which holds a `.git` entry) is itself the top of a real
-/// repository: `rev-parse --show-cdup` run there, with the discovery
-/// variables removed, succeeds and prints nothing. A bogus `.git` (an invalid
-/// gitfile makes rev-parse die; an empty `.git` directory makes it find the
-/// superproject) is NOT a repository: `git add` walks into such a directory
-/// and reads its `.gitattributes`, so the snapshot must too (M0-G13).
-fn is_nested_repository(dir: &Path) -> bool {
-    let mut cmd = std::process::Command::new("git");
-    cmd.arg("-C").arg(dir).args(["rev-parse", "--show-cdup"]);
-    for k in DISCOVERY_ENV {
-        cmd.env_remove(k);
+/// A repo-relative byte path as a filesystem path under `root` (git prints
+/// UTF-8 on Windows; raw bytes elsewhere).
+fn repo_path(root: &Path, rel: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        root.join(OsStr::from_bytes(rel))
     }
-    cmd.stdin(Stdio::null());
-    match cmd.output() {
-        Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim().is_empty(),
-        Err(_) => false,
+    #[cfg(not(unix))]
+    {
+        root.join(String::from_utf8_lossy(rel).as_ref())
     }
 }
 
-/// Every attributes file under `root/rel` (keys `wt:vault/.../<name>` ->
-/// state): each entry whose name [`is_attributes_file_name`] accepts (any
-/// case, so the `.GitAttributes` git reads on a case-insensitive filesystem
-/// is seen, M0-G13), walked without following links. A directory holding a
-/// `.git` entry is skipped only if it is a real nested repository (then
-/// `add` stages it as a gitlink and git reads no superproject attributes
-/// inside); the verdict is recorded, so a bogus `.git` turning real (or
-/// back) is a change.
-fn walk_vault_attributes(root: &Path, rel: &str, out: &mut AttrSnapshot) {
-    let dir = root.join(rel);
-    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd.flatten().collect(),
-        Err(e) => {
-            out.insert(format!("dir:{rel}"), format!("error:{:?}", e.kind()).into_bytes());
-            return;
-        }
-    };
-    if entries.iter().any(|e| is_dot_git_name(&e.file_name())) {
-        let nested = is_nested_repository(&dir);
-        out.insert(format!("nested:{rel}"), if nested { b"repo".to_vec() } else { b"not-a-repo".to_vec() });
-        if nested {
-            return;
+/// A file name as the bytes git records (UTF-8 on Windows; raw elsewhere).
+fn name_bytes(name: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        name.as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        name.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// Every directory under `vault/` that `add -A -- vault` visits, sorted:
+/// `vault` itself plus every ancestor directory of every path `ls-files
+/// --cached --others --exclude-standard -- vault` lists against `env` (the
+/// seed index) — git's own walk, so it follows exactly the directories git
+/// follows on this OS (Git for Windows descends into a directory junction,
+/// POSIX git never into a symlink; DEF-2), enters a real nested repository
+/// whose paths are tracked (DEF-3) and a directory with a bogus `.git`, and
+/// skips an untracked real nested repository (listed as `dir/`: `add` stages
+/// it as a gitlink and reads nothing inside) and an ignored directory.
+/// Bounded and cycle-safe because git's walk is (a junction cycle ends at
+/// git's path-length limit).
+async fn add_visited_directories(root: &Path, env: &[(&str, &OsStr)]) -> Result<Vec<BPath>> {
+    let listed = git_raw(
+        root,
+        &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", VAULT_PATHSPEC],
+        env,
+        None,
+    )
+    .await
+    .context("git ls-files (attribute snapshot) failed")?;
+    let mut dirs: BTreeSet<BPath> = BTreeSet::from([VAULT_PATHSPEC.as_bytes().to_vec()]);
+    for rec in split_z(&listed) {
+        let mut p = rec.strip_suffix(b"/").unwrap_or(rec);
+        while let Some(slash) = p.iter().rposition(|&b| b == b'/').filter(|&i| i > 0) {
+            p = &p[..slash];
+            if !dirs.insert(p.to_vec()) {
+                break;
+            }
         }
     }
-    for e in entries {
-        let name = e.file_name();
-        if is_dot_git_name(&name) {
-            continue;
-        }
-        let name = name.to_string_lossy();
-        let child = format!("{rel}/{name}");
-        if is_attributes_file_name(name.as_bytes()) {
-            out.insert(format!("wt:{child}"), attribute_file_state(&e.path(), false));
-        }
-        if e.file_type().is_ok_and(|t| t.is_dir() && !t.is_symlink()) {
-            walk_vault_attributes(root, &child, out);
+    Ok(dirs.into_iter().collect())
+}
+
+/// Every attributes file in `dirs` (keys `wt:vault/.../<name>` -> state):
+/// each entry whose name [`is_attributes_file_name`] accepts (any case, so
+/// the `.GitAttributes` git reads on a case-insensitive filesystem is seen,
+/// M0-G13). A directory that cannot be listed is recorded as its error
+/// (absent = nothing to record).
+fn vault_attribute_files(root: &Path, dirs: &[BPath], out: &mut AttrSnapshot) {
+    for rel in dirs {
+        let dir = repo_path(root, rel);
+        let rel = String::from_utf8_lossy(rel);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) => continue,
+            Err(e) => {
+                out.insert(format!("dir:{rel}"), format!("error:{:?}", e.kind()).into_bytes());
+                continue;
+            }
+        };
+        for e in entries.flatten() {
+            let name = name_bytes(&e.file_name());
+            if is_attributes_file_name(&name) {
+                out.insert(
+                    format!("wt:{rel}/{}", String::from_utf8_lossy(&name)),
+                    attribute_file_state(&e.path(), false),
+                );
+            }
         }
     }
 }
@@ -1224,13 +1602,17 @@ async fn attr_tree_state(root: &Path) -> Vec<u8> {
 }
 
 /// A1 / A2: every attribute source git reads for a vault path — every
-/// attributes file (any case) at the root and anywhere under `vault/`, the
-/// repo's `info/attributes`, the global and system files (paths re-resolved
-/// on every call, so a `core.attributesFile` change is seen too; a relative
-/// path is resolved against the repository top level, where git itself
-/// opens it), `attr.tree` and `GIT_ATTR_SOURCE` (value + the tree they
-/// name). Two snapshots are equal iff no source changed.
-async fn attribute_snapshot(root: &Path) -> AttrSnapshot {
+/// attributes file (any case) at the root and in every directory under
+/// `vault/` that `add` visits ([`add_visited_directories`], listed against
+/// `env`, the seed index), the repo's `info/attributes`, the global and
+/// system files (paths re-resolved on every call, so a `core.attributesFile`
+/// change is seen too; a relative path is resolved against the repository
+/// top level, where git itself opens it), `attr.tree` and `GIT_ATTR_SOURCE`
+/// (value + the tree they name). Two snapshots are equal iff no source
+/// changed. Errors if git cannot list the vault (the tick then fails
+/// explicitly).
+async fn attribute_snapshot(root: &Path, env: &[(&str, &OsStr)]) -> Result<AttrSnapshot> {
+    let vault_dirs = add_visited_directories(root, env).await?;
     let info = git(root, &["rev-parse", "--git-path", "info/attributes"], &[])
         .await
         .ok()
@@ -1277,17 +1659,7 @@ async fn attribute_snapshot(root: &Path) -> AttrSnapshot {
         }
         snap.insert("attr.tree".into(), attr_tree);
         snap.insert("GIT_ATTR_SOURCE".into(), attr_source);
-        match std::fs::symlink_metadata(root.join(VAULT_PATHSPEC)) {
-            Ok(m) if m.file_type().is_dir() && !m.file_type().is_symlink() => {
-                walk_vault_attributes(&root, VAULT_PATHSPEC, &mut snap)
-            }
-            Ok(_) => {
-                snap.insert("dir:vault".into(), b"not-a-directory".to_vec());
-            }
-            Err(_) => {
-                snap.insert("dir:vault".into(), b"absent".to_vec());
-            }
-        }
+        vault_attribute_files(&root, &vault_dirs, &mut snap);
         let with_path = |p: &Path| {
             let mut state = p.to_string_lossy().into_owned().into_bytes();
             state.push(0);
@@ -1309,9 +1681,9 @@ async fn attribute_snapshot(root: &Path) -> AttrSnapshot {
     .await;
     // A panicked walk is recorded as a unique state, so it never compares
     // equal to a real snapshot (fail closed: the tick is deferred).
-    snapshot.unwrap_or_else(|_| {
+    Ok(snapshot.unwrap_or_else(|_| {
         AttrSnapshot::from([("panic".to_string(), uuid::Uuid::new_v4().as_bytes().to_vec())])
-    })
+    }))
 }
 
 /// Effective `core.sparseCheckout` (default false).
@@ -1794,7 +2166,7 @@ async fn run_autocommit_inner(
             .await
             .context("failed to snapshot the seeded temp index")?;
     }
-    let attrs_before = attribute_snapshot(root).await; // A1
+    let attrs_before = attribute_snapshot(root, &seed_env).await?; // A1
     // path -> reason, withheld from the add (M0-G15).
     let mut withheld: BTreeMap<BPath, SkipReason> = BTreeMap::new();
     // -A so deletions are captured; .gitignore respected; vault/ only.
@@ -1898,9 +2270,13 @@ async fn run_autocommit_inner(
     }
 
     // filtered-path / encoded-path: a `filter` / `working-tree-encoding`
-    // attribute in the pre-add (seed index) OR the post-add (temp index)
-    // evaluation. Deletions carry no blob. Withheld paths keep the reason the
-    // fallback found.
+    // attribute in ANY view a reader could apply (DEF-1): the working tree
+    // before (seed index) and after (temp index) the add and against the
+    // user's real index (a staged rule); HEAD's committed
+    // attribute files and the tree about to be committed (T0), each with this
+    // repository's info / global / system files (a checkout here); and T0's
+    // attribute files alone (a fresh clone). Deletions carry no blob.
+    // Withheld paths keep the reason the fallback found.
     let mut late: BTreeMap<BPath, SkipReason> = BTreeMap::new();
     for (p, r) in &withheld {
         if !early.contains_key(p) {
@@ -1913,13 +2289,46 @@ async fn run_autocommit_inner(
         .filter_map(|p| blob_of(p).map(|oid| (p.clone(), oid)))
         .collect();
     let present_paths: Vec<BPath> = present.iter().map(|(p, _)| p.clone()).collect();
-    let before = conversion_attributes(root, &present_paths, &seed_env).await?;
-    let after = conversion_attributes(root, &present_paths, &env).await?;
-    for p in &present_paths {
-        if before.filtered.contains(p) || after.filtered.contains(p) {
-            late.insert(p.clone(), SkipReason::FilteredPath);
-        } else if before.encoded.contains(p) || after.encoded.contains(p) {
-            late.insert(p.clone(), SkipReason::EncodedPath);
+    if !present_paths.is_empty() {
+        // T0: every early exclusion applied (in a copy of the temp index).
+        // The late exclusions only restore paths that are not attributes
+        // files, so the commit's attribute files are exactly T0's (and
+        // HEAD's).
+        let mut t0 = preliminary_tree.clone();
+        if !early.is_empty() {
+            let t0_index = temp_dir.join("t0-index");
+            tokio::fs::copy(&temp_index, &t0_index)
+                .await
+                .context("failed to copy the temp index for the commit-view tree")?;
+            let t0_env = [("GIT_INDEX_FILE", t0_index.as_os_str())];
+            let early_paths: Vec<BPath> = early.keys().cloned().collect();
+            restore_to_head(root, &t0_env, &early_paths, &head_entries, preliminary_tree.len()).await?;
+            t0 = git(root, &["write-tree"], &t0_env)
+                .await
+                .context("git write-tree (commit-view tree) failed")?;
+        }
+        let clone_dir = clone_view_repository(root, temp_dir).await?;
+        let mut views = vec![
+            conversion_attributes(root, &present_paths, &seed_env, None).await?,
+            conversion_attributes(root, &present_paths, &env, None).await?,
+            // The user's real index: a staged rule.
+            conversion_attributes(root, &present_paths, &[], None).await?,
+        ];
+        if let Some(h) = head {
+            views.push(conversion_attributes(root, &present_paths, &seed_env, Some(h)).await?);
+        }
+        views.push(conversion_attributes(root, &present_paths, &seed_env, Some(&t0)).await?);
+        views.push(clone_view_attributes(&clone_dir, &present_paths, &t0).await?);
+        for alias in alias_attribute_files(root, head, &head_entries).await? {
+            let tree = tree_with_attributes_blob(root, temp_dir, &t0, &alias).await?;
+            views.push(clone_view_attributes(&clone_dir, &present_paths, &tree).await?);
+        }
+        for p in &present_paths {
+            if views.iter().any(|v| v.filtered.contains(p)) {
+                late.insert(p.clone(), SkipReason::FilteredPath);
+            } else if views.iter().any(|v| v.encoded.contains(p)) {
+                late.insert(p.clone(), SkipReason::EncodedPath);
+            }
         }
     }
 
@@ -1937,7 +2346,7 @@ async fn run_autocommit_inner(
     }
 
     // A2: any attribute source changed since A1 -> defer the whole tick.
-    let attrs_changed = attrs_before != attribute_snapshot(root).await;
+    let attrs_changed = attrs_before != attribute_snapshot(root, &seed_env).await?;
     // path -> reason; first match wins.
     let mut reasons: BTreeMap<BPath, SkipReason> = BTreeMap::new();
     for p in &all_changed {
@@ -1952,35 +2361,53 @@ async fn run_autocommit_inner(
             reasons.insert(p.clone(), r);
         }
     }
-    let excluded: Vec<BPath> = all_changed.iter().filter(|p| reasons.contains_key(*p)).cloned().collect();
-    let commit_paths: Vec<BPath> = all_changed.iter().filter(|p| !reasons.contains_key(*p)).cloned().collect();
-    let skipped: Vec<(String, SkipReason)> = excluded.iter().map(|p| (display_path(p), reasons[p])).collect();
+    let report = |reasons: &BTreeMap<BPath, SkipReason>| -> Vec<(String, SkipReason)> {
+        all_changed
+            .iter()
+            .filter_map(|p| reasons.get(p).map(|r| (display_path(p), *r)))
+            .collect()
+    };
+    let mut commit_paths: Vec<BPath> = all_changed.iter().filter(|p| !reasons.contains_key(*p)).cloned().collect();
+    if commit_paths.is_empty() {
+        return Ok((AutocommitOutcome::NoOp, report(&reasons)));
+    }
 
+    let tree = if reasons.is_empty() {
+        preliminary_tree
+    } else {
+        let excluded: Vec<BPath> = reasons.keys().cloned().collect();
+        restore_to_head(root, &env, &excluded, &head_entries, preliminary_tree.len()).await?;
+        let tree = git(root, &["write-tree"], &env)
+            .await
+            .context("git write-tree (post-exclusion) from temp index failed")?;
+        // path-conflict: a committed path that a restored exclusion displaced
+        // (git holds no file under a path that is a file). Then every staged
+        // path must be either committed exactly as staged or reported, and
+        // nothing else may change (DEF-4).
+        let final_entries = tree_entries(root, Some(&tree)).await?;
+        for p in &commit_paths {
+            if final_entries.get(p) != prelim_entries.get(p) && final_entries.get(p) == head_entries.get(p) {
+                reasons.insert(p.clone(), SkipReason::PathConflict);
+            }
+        }
+        commit_paths.retain(|p| !reasons.contains_key(p));
+        let committed: BTreeSet<&BPath> = commit_paths.iter().collect();
+        for p in differing_paths(&head_entries, &final_entries) {
+            if !committed.contains(&p) || final_entries.get(&p) != prelim_entries.get(&p) {
+                bail!("autocommit: the commit tree would change {} unexpectedly; nothing committed", display_path(&p));
+            }
+        }
+        for p in &commit_paths {
+            if final_entries.get(p) != prelim_entries.get(p) {
+                bail!("autocommit: {} would be silently dropped; nothing committed", display_path(p));
+            }
+        }
+        tree
+    };
+    let skipped = report(&reasons);
     if commit_paths.is_empty() {
         return Ok((AutocommitOutcome::NoOp, skipped));
     }
-
-    let tree = if excluded.is_empty() {
-        preliminary_tree
-    } else {
-        let zero = "0".repeat(preliminary_tree.len());
-        let mut info: Vec<u8> = Vec::new();
-        for p in &excluded {
-            match head_entries.get(p) {
-                Some(entry) => info.extend_from_slice(entry.as_bytes()),
-                None => info.extend_from_slice(format!("0 {zero}").as_bytes()),
-            }
-            info.push(b'\t');
-            info.extend_from_slice(p);
-            info.push(0);
-        }
-        git_raw(root, &["update-index", "-z", "--index-info"], &env, Some(&info))
-            .await
-            .context("git update-index --index-info failed while restoring excluded vault paths")?;
-        git(root, &["write-tree"], &env)
-            .await
-            .context("git write-tree (post-exclusion) from temp index failed")?
-    };
     let head_tree = match head {
         Some(h) => git(root, &["rev-parse", &format!("{h}^{{tree}}")], &[]).await?,
         None => EMPTY_TREE.to_string(),
@@ -3737,15 +4164,17 @@ mod r4_regression_tests {
         assert_eq!(rep.outcome, AutocommitOutcome::NoOp);
         assert!(!r.head_tree().contains(&"vault/s.txt".to_string()), "rot13 secret reached history via an attribute flip");
         assert_eq!(detail(&rep), one("vault/s.txt", SkipReason::AttributesChanged));
-        // Next tick: attributes are stable (no filter), so the raw key is scanned;
-        // the edited .gitattributes is never autocommitted (attributes-file).
+        // Next tick: the working tree has no filter, but HEAD (and so the
+        // commit and every clone of it) still carries the user-committed
+        // rule, so the path stays filtered-path (OQ-19 committed views); the
+        // edited .gitattributes is never autocommitted (attributes-file).
         let next = r.tick().await;
         assert_eq!(next.outcome, AutocommitOutcome::NoOp);
         assert_eq!(
             detail(&next),
             vec![
                 ("vault/.gitattributes".to_string(), SkipReason::AttributesFile.as_str()),
-                ("vault/s.txt".to_string(), SkipReason::SecretContent.as_str()),
+                ("vault/s.txt".to_string(), SkipReason::FilteredPath.as_str()),
             ]
         );
         assert_eq!(r.ok(&["show", "HEAD:vault/.gitattributes"]), "*.txt filter=rot");
@@ -4227,12 +4656,20 @@ mod r5_regression_tests {
         r.write("vault/a.md", "a\n");
         r.commit_all("init");
         r.write("vault/a.md", "private journal entry, edited\n");
+        fn walk(dir: &Path, rel: &str, out: &mut BTreeSet<String>) {
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = format!("{rel}{}", e.file_name().to_string_lossy());
+                if e.file_type().is_ok_and(|t| t.is_dir()) {
+                    out.insert(format!("dir:{name}"));
+                    walk(&e.path(), &format!("{name}/"), out);
+                } else {
+                    out.insert(format!("file:{name}"));
+                }
+            }
+        }
         let hook = |_: TickPhase| {
             for n in names(&tmp).difference(&before) {
-                for e in std::fs::read_dir(tmp.join(n)).into_iter().flatten().flatten() {
-                    let kind = if e.file_type().is_ok_and(|t| t.is_dir()) { "dir" } else { "file" };
-                    seen.lock().unwrap().insert(format!("{kind}:{}", e.file_name().to_string_lossy()));
-                }
+                walk(&tmp.join(n), "", &mut seen.lock().unwrap());
             }
         };
         let rep = run_autocommit_report_with(r.path(), Some(&hook)).await.expect("autocommit ok");
@@ -4259,9 +4696,34 @@ mod r5_regression_tests {
         assert!(!seen.is_empty(), "the tick must have created its own temp dir");
         // Other tests run concurrently: their ticks' dirs may also show up
         // (with the sync step's pathspec file, or a transient index.lock).
-        let allowed: BTreeSet<String> =
-            ["file:index", "file:seed-index", "file:pathspec", "file:index.lock"].iter().map(|s| s.to_string()).collect();
-        assert!(seen.is_subset(&allowed), "only index/pathspec files may live in a tick's temp dir: {seen:?}");
+        // Index/pathspec files plus the clone-view repository (HEAD, config,
+        // empty refs/, an alternates file naming the object directory),
+        // never vault content.
+        let allowed: BTreeSet<String> = [
+            "file:index",
+            "file:seed-index",
+            "file:t0-index",
+            "file:alias-index",
+            "file:pathspec",
+            "file:index.lock",
+            "file:t0-index.lock",
+            "file:alias-index.lock",
+            "dir:clone-view.git",
+            "dir:clone-view.git/objects",
+            "dir:clone-view.git/objects/info",
+            "dir:clone-view.git/refs",
+            "file:clone-view.git/HEAD",
+            "file:clone-view.git/config",
+            "file:clone-view.git/objects/info/alternates",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(seen.contains("file:clone-view.git/objects/info/alternates"), "the scan phase must see the clone-view repository");
+        assert!(
+            seen.is_subset(&allowed),
+            "only index/pathspec files and the clone-view repository may live in a tick's temp dir: {seen:?}"
+        );
     }
 }
 
@@ -4798,7 +5260,9 @@ mod g12_residual_tests {
             assert!(!is_attributes_file_name(n.as_bytes()), "{n}");
         }
         assert!(is_attributes_file_path(b"vault/a/.GitAttributes"));
-        assert!(!is_attributes_file_path(b"vault/.gitattributes/n.md"));
+        // Any component (OQ-19 DEF-4): a path under a directory named like one.
+        assert!(is_attributes_file_path(b"vault/.gitattributes/n.md"));
+        assert!(!is_attributes_file_path(b"vault/gitattributes/n.md"));
     }
 
     #[tokio::test]
@@ -4843,11 +5307,13 @@ mod g12_residual_tests {
         r.write("vault/n.md", "y\n");
         let rep = r.tick().await;
         assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        // k.txt: the working tree dropped the rule, HEAD still has it, so a
+        // clone would re-encode: encoded-path (OQ-19 committed views).
         assert_eq!(
             detail(&rep),
             d(&[
                 ("vault/.gitattributes", "attributes-file"),
-                ("vault/k.txt", "secret-content"),
+                ("vault/k.txt", "encoded-path"),
                 ("vault/old/.gitattributes", "attributes-file"),
                 ("vault/sub/.GitAttributes", "attributes-file"),
             ])
@@ -4977,9 +5443,11 @@ mod g12_residual_tests {
             || r.write("vault/sub/.GitAttributes", "# none\n"),
         )
         .await;
+        // The user-committed .GitAttributes still holds the rule, and a
+        // case-insensitive clone reads it as .gitattributes: encoded-path.
         assert_eq!(
             detail(&next),
-            d(&[("vault/sub/.GitAttributes", "attributes-file"), ("vault/sub/s.txt", "secret-content")])
+            d(&[("vault/sub/.GitAttributes", "attributes-file"), ("vault/sub/s.txt", "encoded-path")])
         );
     }
 
@@ -5042,9 +5510,10 @@ mod g12_residual_tests {
             || r.write("vault/sub/.gitattributes", "# none\n"),
         )
         .await;
+        // HEAD still carries the user-committed rule: encoded-path (OQ-19).
         assert_eq!(
             detail(&next),
-            d(&[("vault/sub/.gitattributes", "attributes-file"), ("vault/sub/s.txt", "secret-content")])
+            d(&[("vault/sub/.gitattributes", "attributes-file"), ("vault/sub/s.txt", "encoded-path")])
         );
     }
 
@@ -5073,5 +5542,518 @@ mod g12_residual_tests {
         assert_eq!(rep.outcome, AutocommitOutcome::Committed);
         assert_eq!(detail(&rep), d(&[("vault/nested", "gitlink")]));
         assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y");
+    }
+}
+
+/// M1 pre-flight OQ-19 (DEF-1..DEF-5, FR-WIKI-06): a conversion attribute is
+/// refused if ANY view a reader could apply sets it — the working tree,
+/// HEAD's committed attribute files, and the commit's own tree both as a
+/// checkout here reads it and as a fresh clone reads it (its attribute files
+/// alone); the attribute snapshot covers every directory `add` visits
+/// (junctions, tracked nested repositories); a path under a directory named
+/// like `.gitattributes` is `attributes-file`; a path a restored exclusion
+/// displaces is `path-conflict`; the predicate includes git's HFS+ rule.
+/// Mirrors the Node twin's `OQ-19` tests case for case. Every case fails on
+/// 4766ed3.
+#[cfg(test)]
+mod oq19_view_tests {
+    use super::{
+        is_attributes_file_name, is_attributes_file_path, run_autocommit_report, run_autocommit_report_with,
+        AutocommitOutcome, AutocommitReport, TickPhase,
+    };
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const KEY: &str = "aws AKIAABCDEFGHIJKLMNOP ok\n"; // 26 bytes: an even count
+    const ENC_RULE: &str = "*.txt working-tree-encoding=UTF-16LE\n";
+
+    /// UTF-8 text git would store for the ASCII key declared UTF-16LE.
+    fn cjk() -> Vec<u8> {
+        let units: Vec<u16> = KEY.as_bytes().chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        String::from_utf16(&units).unwrap().into_bytes()
+    }
+
+    fn temp_base() -> PathBuf {
+        let canon = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let canon = canon.to_string_lossy();
+        PathBuf::from(canon.strip_prefix(r"\\?\").unwrap_or(&canon))
+    }
+
+    struct Repo {
+        dir: PathBuf,
+    }
+
+    impl Repo {
+        fn new(name: &str) -> Self {
+            let dir = temp_base().join(format!("skippy-oq19-{name}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let r = Self { dir };
+            r.ok(&["init", "-q", "-b", "main"]);
+            r.ok(&["config", "user.name", "Skippy Test"]);
+            r.ok(&["config", "user.email", "skippy-test@example.invalid"]);
+            r.ok(&["config", "commit.gpgsign", "false"]);
+            r.ok(&["config", "core.hooksPath", ".no-hooks"]);
+            r.ok(&["config", "core.autocrlf", "false"]);
+            r
+        }
+
+        fn ok(&self, args: &[&str]) -> String {
+            git_ok(&self.dir, args, None)
+        }
+
+        fn write(&self, rel: &str, contents: impl AsRef<[u8]>) {
+            let p = self.dir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+
+        fn commit_all(&self, msg: &str) {
+            self.ok(&["add", "-A", "."]);
+            self.ok(&["commit", "-q", "-m", msg]);
+        }
+
+        fn head_tree(&self) -> Vec<String> {
+            self.ok(&["ls-tree", "-r", "-z", "--name-only", "HEAD"])
+                .split('\0')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+
+        async fn tick(&self) -> AutocommitReport {
+            run_autocommit_report(&self.dir).await.expect("autocommit ok")
+        }
+
+        /// A tick whose hook runs `flip` right after the add.
+        async fn tick_flipping_after_add(&self, flip: impl Fn() + Sync) -> AutocommitReport {
+            let hook = |phase: TickPhase| {
+                if phase == TickPhase::Added {
+                    flip();
+                }
+            };
+            run_autocommit_report_with(&self.dir, Some(&hook)).await.expect("autocommit ok")
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn git_ok(dir: &Path, args: &[&str], input: Option<&str>) -> String {
+        use std::io::Write;
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(dir).args(["-c", "core.quotepath=false"]).args(args);
+        cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("git spawn");
+        let mut stdin = child.stdin.take().unwrap();
+        if let Some(i) = input {
+            stdin.write_all(i.as_bytes()).unwrap();
+        }
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn detail(rep: &AutocommitReport) -> Vec<(String, &'static str)> {
+        rep.skipped_detail.iter().map(|(p, r)| (p.clone(), r.as_str())).collect()
+    }
+
+    fn d(pairs: &[(&str, &'static str)]) -> Vec<(String, &'static str)> {
+        pairs.iter().map(|(p, r)| (p.to_string(), *r)).collect()
+    }
+
+    fn strs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+
+    /// Every file of a checkout (skipping .git), as raw bytes.
+    fn checkout_files(dir: &Path, out: &mut Vec<Vec<u8>>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            if e.file_name() == ".git" {
+                continue;
+            }
+            if e.file_type().unwrap().is_dir() {
+                checkout_files(&e.path(), out);
+            } else {
+                out.push(std::fs::read(e.path()).unwrap());
+            }
+        }
+    }
+
+    /// Clone `dir` over file:// and return every checked-out file, plus the
+    /// exact bytes of `key_path` (if present).
+    fn clone_checkout(dir: &Path, key_path: &str) -> (Vec<Vec<u8>>, Option<Vec<u8>>) {
+        let clone = temp_base().join(format!("skippy-oq19-clone-{}", uuid::Uuid::new_v4()));
+        let url = format!("file:///{}", dir.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
+        let cloned = Command::new("git")
+            .args(["-c", "core.autocrlf=false", "clone", "-q", &url])
+            .arg(&clone)
+            .output()
+            .unwrap();
+        let mut files = Vec::new();
+        let mut key = None;
+        if cloned.status.success() {
+            checkout_files(&clone, &mut files);
+            key = std::fs::read(clone.join(key_path)).ok();
+        }
+        let _ = std::fs::remove_dir_all(&clone);
+        assert!(cloned.status.success(), "clone failed: {}", String::from_utf8_lossy(&cloned.stderr));
+        (files, key)
+    }
+
+    fn has_akia(files: &[Vec<u8>]) -> bool {
+        files.iter().any(|f| f.windows(4).any(|w| w == b"AKIA"))
+    }
+
+    fn empty_tree(r: &Repo) -> String {
+        git_ok(&r.dir, &["mktree"], Some(""))
+    }
+
+    /// DEF-1 and its variants: a user-committed rule would make a clone
+    /// decode the note (UTF-8 CJK text) into the ASCII key; `neutralise`
+    /// switches the rule off for the working tree only. `attr_file` is the
+    /// override's path when it is an (uncommittable) attributes file.
+    async fn def1(
+        name: &str,
+        key: &str,
+        commit: impl FnOnce(&Repo),
+        neutralise: impl FnOnce(&Repo),
+        attr_file: Option<&str>,
+    ) {
+        let r = Repo::new(name);
+        r.write("vault/n.md", "x\n");
+        commit(&r);
+        r.commit_all("user: a deliberate encoding rule");
+        neutralise(&r);
+        r.write(key, cjk()); // plain UTF-8 CJK text: no AKIA, no NUL
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        // The leak itself first: a fresh clone of the HEAD the tick made.
+        let (files, cloned_key) = clone_checkout(&r.dir, key);
+        assert!(!has_akia(&files), "a fresh clone decodes the committed note into the plaintext key");
+        assert_eq!(cloned_key, None, "the note reached history");
+        assert!(!r.head_tree().iter().any(|p| p == key));
+        let mut want = vec![(key.to_string(), "encoded-path")];
+        if let Some(a) = attr_file {
+            want.push((a.to_string(), "attributes-file"));
+        }
+        want.sort();
+        assert_eq!(detail(&rep), want);
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed, "the unrelated note still commits");
+        assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y");
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_an_in_vault_override_unsetting_a_committed_root_rule_is_encoded_path() {
+        def1(
+            "x8",
+            "vault/tools/x.txt",
+            |r| r.write(".gitattributes", "*.txt text working-tree-encoding=UTF-16LE eol=CRLF\n"),
+            |r| r.write("vault/.gitattributes", "*.txt -working-tree-encoding\n"),
+            Some("vault/.gitattributes"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_an_in_vault_override_making_a_committed_root_rule_unspecified_is_encoded_path() {
+        def1(
+            "unspec",
+            "vault/k.txt",
+            |r| r.write(".gitattributes", ENC_RULE),
+            |r| r.write("vault/.gitattributes", "*.txt !working-tree-encoding\n"),
+            Some("vault/.gitattributes"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_a_subdirectory_override_against_a_root_rule_is_encoded_path() {
+        def1(
+            "subdir",
+            "vault/sub/k.txt",
+            |r| r.write(".gitattributes", "vault/sub/*.txt working-tree-encoding=UTF-16LE\n"),
+            |r| r.write("vault/sub/.gitattributes", "*.txt -working-tree-encoding\n"),
+            Some("vault/sub/.gitattributes"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_a_user_committed_vault_gitattributes_edited_in_the_working_tree_is_encoded_path() {
+        def1(
+            "vaultedit",
+            "vault/k.txt",
+            |r| r.write("vault/.gitattributes", ENC_RULE),
+            |r| r.write("vault/.gitattributes", "# none\n"),
+            Some("vault/.gitattributes"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_a_user_committed_case_variant_gitattributes_edited_in_the_working_tree_is_encoded_path() {
+        // `--source` looks .gitattributes up byte for byte; a case-insensitive
+        // checkout writes .GitAttributes where git then opens .gitattributes.
+        def1(
+            "casevariant",
+            "vault/k.txt",
+            |r| r.write("vault/.GitAttributes", ENC_RULE),
+            |r| r.write("vault/.GitAttributes", "# none\n"),
+            Some("vault/.GitAttributes"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_the_root_gitattributes_edited_in_the_working_tree_is_encoded_path() {
+        def1(
+            "rootedit",
+            "vault/k.txt",
+            |r| r.write(".gitattributes", ENC_RULE),
+            |r| r.write(".gitattributes", "# none\n"),
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_info_attributes_unsetting_the_committed_rule_is_encoded_path() {
+        def1(
+            "info",
+            "vault/k.txt",
+            |r| r.write(".gitattributes", ENC_RULE),
+            |r| r.write(".git/info/attributes", "*.txt -working-tree-encoding\n"),
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_attr_tree_naming_the_empty_tree_over_the_committed_rule_is_encoded_path() {
+        def1(
+            "attrtree",
+            "vault/k.txt",
+            |r| r.write(".gitattributes", ENC_RULE),
+            |r| {
+                let empty = empty_tree(r);
+                r.ok(&["config", "attr.tree", &empty]);
+            },
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_a_rule_the_user_staged_with_its_working_tree_file_deleted_is_honoured() {
+        let r = Repo::new("staged");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/.gitattributes", ENC_RULE);
+        r.ok(&["add", "--", "vault/.gitattributes"]);
+        std::fs::remove_file(r.dir.join("vault/.gitattributes")).unwrap();
+        r.write("vault/k.txt", cjk());
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), d(&[("vault/k.txt", "encoded-path")]));
+        r.ok(&["commit", "-q", "-m", "user: the staged rule"]);
+        let (files, key) = clone_checkout(&r.dir, "vault/k.txt");
+        assert!(!has_akia(&files), "a clone decodes the autocommitted note through the rule the user committed");
+        assert_eq!(key, None);
+    }
+
+    #[tokio::test]
+    async fn oq19_def1_a_committed_filter_rule_unset_by_an_in_vault_override_is_filtered_path() {
+        let r = Repo::new("filter");
+        r.write("vault/n.md", "x\n");
+        r.write(".gitattributes", "*.txt filter=rot\n");
+        r.commit_all("user: a filter rule");
+        r.write("vault/.gitattributes", "*.txt -filter\n");
+        r.write("vault/k.txt", "plain monkeys\n");
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(
+            detail(&rep),
+            d(&[("vault/.gitattributes", "attributes-file"), ("vault/k.txt", "filtered-path")])
+        );
+        assert_eq!(strs(&r.head_tree()), vec![".gitattributes", "vault/n.md"]);
+    }
+
+    #[tokio::test]
+    async fn oq19_def2_the_snapshot_follows_what_add_reads_a_junction_is_walked_a_posix_dir_symlink_is_not() {
+        let r = Repo::new("link");
+        let ext = temp_base().join(format!("skippy-oq19-ext-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&ext).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(ext.clone());
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        std::fs::write(ext.join("s.txt"), KEY).unwrap();
+        std::fs::write(ext.join(".gitattributes"), ENC_RULE).unwrap();
+        r.write("vault/n.md", "y\n");
+        let attrs = ext.join(".gitattributes");
+        let flip_off = || std::fs::write(&attrs, "# none\n").unwrap();
+        let link = r.dir.join("vault").join("j");
+        #[cfg(windows)]
+        {
+            let made = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(&ext)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            assert!(made, "mklink /J failed");
+            // Git for Windows descends into the junction and reads
+            // vault/j/.gitattributes: add stores CJK text, then the rule goes.
+            let rep = r.tick_flipping_after_add(flip_off).await;
+            assert!(!r.head_tree().iter().any(|p| p == "vault/j/s.txt"), "the re-encoded key reached HEAD");
+            assert_eq!(rep.outcome, AutocommitOutcome::NoOp);
+            assert_eq!(
+                detail(&rep),
+                d(&[
+                    ("vault/j/.gitattributes", "attributes-file"),
+                    ("vault/j/s.txt", "attributes-changed"),
+                    ("vault/n.md", "attributes-changed"),
+                ])
+            );
+            assert_eq!(
+                detail(&r.tick().await),
+                d(&[("vault/j/.gitattributes", "attributes-file"), ("vault/j/s.txt", "secret-content")])
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&ext, &link).unwrap();
+            // POSIX git adds the link itself (mode 120000, blob = the target
+            // path) and reads no attributes through it, so the flip is no
+            // attribute source of any vault path and nothing is deferred.
+            let rep = r.tick_flipping_after_add(flip_off).await;
+            assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+            assert_eq!(detail(&rep), d(&[]));
+            assert!(r.ok(&["ls-tree", "HEAD", "--", "vault/j"]).starts_with("120000 "));
+            assert_eq!(r.ok(&["show", "HEAD:vault/n.md"]), "y");
+        }
+    }
+
+    #[tokio::test]
+    async fn oq19_def3_a_real_nested_repository_over_tracked_vault_paths_is_walked() {
+        let r = Repo::new("nestedtracked");
+        r.write("vault/n.md", "x\n");
+        r.write("vault/sub/s.txt", "clean monkeys\n");
+        r.commit_all("init");
+        git_ok(&r.dir.join("vault").join("sub"), &["init", "-q"], None); // `add -A` still walks the tracked paths
+        r.write("vault/sub/.gitattributes", ENC_RULE);
+        r.write("vault/sub/s.txt", KEY);
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick_flipping_after_add(|| r.write("vault/sub/.gitattributes", "# none\n")).await;
+        assert_eq!(r.ok(&["show", "HEAD:vault/sub/s.txt"]), "clean monkeys", "the re-encoded key reached HEAD");
+        assert_eq!(rep.outcome, AutocommitOutcome::NoOp);
+        assert_eq!(
+            detail(&rep),
+            d(&[
+                ("vault/n.md", "attributes-changed"),
+                ("vault/sub/.gitattributes", "attributes-file"),
+                ("vault/sub/s.txt", "attributes-changed"),
+            ])
+        );
+        assert_eq!(
+            detail(&r.tick().await),
+            d(&[("vault/sub/.gitattributes", "attributes-file"), ("vault/sub/s.txt", "secret-content")])
+        );
+    }
+
+    #[tokio::test]
+    async fn oq19_def4_a_committed_gitattributes_replaced_by_a_directory_reports_its_notes() {
+        let r = Repo::new("attrdir");
+        r.write("vault/n.md", "x\n");
+        r.write("vault/.gitattributes", "*.md text\n");
+        r.commit_all("init");
+        std::fs::remove_file(r.dir.join("vault/.gitattributes")).unwrap();
+        r.write("vault/.gitattributes/n.md", "monkeys note\n");
+        r.write("vault/other.md", "other\n");
+        for i in 0..2 {
+            let rep = r.tick().await;
+            let want = if i == 0 { AutocommitOutcome::Committed } else { AutocommitOutcome::NoOp };
+            assert_eq!(rep.outcome, want);
+            assert_eq!(
+                detail(&rep),
+                d(&[("vault/.gitattributes", "attributes-file"), ("vault/.gitattributes/n.md", "attributes-file")])
+            );
+        }
+        assert_eq!(strs(&r.head_tree()), vec!["vault/.gitattributes", "vault/n.md", "vault/other.md"]);
+    }
+
+    #[tokio::test]
+    async fn oq19_def4_a_committed_path_displaced_by_a_restored_exclusion_is_path_conflict() {
+        let r = Repo::new("displaced");
+        r.write("vault/n.md", "x\n");
+        r.write("vault/a/.env", "X=1\n"); // the user tracks it deliberately
+        r.commit_all("init");
+        std::fs::remove_dir_all(r.dir.join("vault/a")).unwrap();
+        r.write("vault/a", "now a note\n"); // restoring vault/a/.env (secret-filename) displaces it
+        r.write("vault/other.md", "other\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), d(&[("vault/a", "path-conflict"), ("vault/a/.env", "secret-filename")]));
+        assert_eq!(strs(&r.head_tree()), vec!["vault/a/.env", "vault/n.md", "vault/other.md"]);
+        assert_eq!(r.ok(&["diff", "--cached", "--name-only"]), "", "the real index must stay in line with HEAD");
+    }
+
+    #[test]
+    fn oq19_def5_predicate_includes_git_hfs_rule_and_any_path_component() {
+        let hfs_yes = [
+            ".git\u{200c}attributes",
+            "\u{200d}.gitattributes",
+            ".GIT\u{200e}ATTRIBUTES",
+            ".gitattributes\u{200f}",
+            ".g\u{202a}i\u{202b}t\u{202c}a\u{202d}t\u{202e}tributes",
+            ".gitattr\u{206a}\u{206b}\u{206c}\u{206d}\u{206e}\u{206f}ibutes",
+            ".gitattributes\u{feff}",
+            ".gitattributes\u{200c}\u{200c}",
+        ];
+        let no = [
+            ".git\u{200b}attributes",
+            ".gitattributes\u{200c}x",
+            ".gitattribute\u{17f}",
+            ".git\u{ad}attributes",
+            "x.gitattributes\u{200c}",
+            ".gitattributes\u{200c}.md",
+        ];
+        for n in hfs_yes {
+            assert!(is_attributes_file_name(n.as_bytes()), "{n:?}");
+        }
+        for n in no {
+            assert!(!is_attributes_file_name(n.as_bytes()), "{n:?}");
+        }
+        // A malformed UTF-8 sequence right after the name reads as its end
+        // (git's pick_one_utf8_char).
+        assert!(is_attributes_file_name(b".gitattributes\xff"));
+        assert!(!is_attributes_file_name(b".gitattr\xffibutes"));
+        assert!(is_attributes_file_path(b"vault/.gitattributes/n.md"));
+        assert!(is_attributes_file_path("vault/.git\u{200c}attributes/n.md".as_bytes()));
+        assert!(!is_attributes_file_path(b"vault/gitattributes/n.md"));
+    }
+
+    #[tokio::test]
+    async fn oq19_def5_an_hfs_spelling_of_gitattributes_is_attributes_file_never_committed() {
+        let r = Repo::new("hfs");
+        r.write("vault/n.md", "x\n");
+        r.commit_all("init");
+        r.write("vault/.git\u{200c}attributes", ENC_RULE);
+        r.write("vault/n.md", "y\n");
+        let rep = r.tick().await;
+        assert_eq!(rep.outcome, AutocommitOutcome::Committed);
+        assert_eq!(detail(&rep), d(&[("vault/.git\u{200c}attributes", "attributes-file")]));
+        assert_eq!(strs(&r.head_tree()), vec!["vault/n.md"]);
     }
 }
