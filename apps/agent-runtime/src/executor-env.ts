@@ -556,7 +556,9 @@ export function buildClaudeExecutorEnv(
   };
   if (overrides) {
     for (const [k, v] of Object.entries(overrides)) {
-      if (fold(k) === fold('CLAUDE_CONFIG_DIR')) continue;
+      // Case-insensitive on every OS: no spelling of CLAUDE_CONFIG_DIR may be
+      // supplied, even where env names are case-sensitive (POSIX).
+      if (k.toUpperCase() === 'CLAUDE_CONFIG_DIR') continue;
       env[k] = v;
     }
   }

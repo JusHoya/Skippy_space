@@ -283,8 +283,11 @@ test('D1: a root that is, contains or lies inside the executor state base is ref
     [base, /executor state directory may not be a root/],
     [path.join(base, 'run-abc123'), /executor state directory may not be a root/],
     [path.dirname(base), /ancestor of the executor state directory/],
-    [os.tmpdir(), /ancestor of the executor state directory/],
+    // Canonical long form: CI runners report os.tmpdir() as an 8.3 short path
+    // (RUNNER~1), which is refused earlier for that reason (asserted below).
+    [fs.realpathSync.native(os.tmpdir()), /ancestor of the executor state directory/],
   ];
+  assert.notEqual(toolPolicy.rootRejection(os.tmpdir()), null, 'the raw temp dir is refused whatever its spelling');
   for (const [root, re] of cases) {
     const why = toolPolicy.rootRejection(root);
     assert.match(why ?? '', re, `${root}: ${why}`);
