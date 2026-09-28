@@ -48,6 +48,7 @@ import { buildMcpServers } from './mcp-registry.js';
 import { getModelFor } from './modelRegistry.js';
 import { writeEnvelope } from './protocol.js';
 import { executeBoardMissionViaSdk } from './sdk-board.js';
+import { ownString, ownValue } from './tool-policy.js';
 import { resolveVaultRoot } from './vault-root.js';
 
 const tracer = trace.getTracer('skippy-board');
@@ -110,7 +111,10 @@ export type BoardExecutor = (req: {
  * widening it.
  */
 export function configuredProjectRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const raw = env.SKIPPY_PROJECT_ROOT;
+  // Own-property read (D-B2): `process.env` falls back to `Object.prototype`
+  // for an unset variable, so a polluted `SKIPPY_PROJECT_ROOT` would have
+  // become a read root.
+  const raw = ownValue(env, 'SKIPPY_PROJECT_ROOT');
   if (typeof raw !== 'string' || raw.trim() === '') return undefined;
   return raw.trim();
 }
@@ -124,7 +128,13 @@ export interface BoardDeps {
 }
 
 /** Production live executor: charter-scoped MCP servers + Claude Agent SDK. */
-const sdkExecutor: BoardExecutor = async ({ boardId, charter, missionBrief, worktreePath, projectRoot }) => {
+const sdkExecutor: BoardExecutor = async (req) => {
+  // Own-property reads (M1 pre-flight D-B2): the request carries
+  // `worktreePath` / `projectRoot` only when assigned, and destructuring an
+  // absent one read it from `Object.prototype`.
+  const { boardId, charter, missionBrief } = req;
+  const worktreePath = ownString(req, 'worktreePath');
+  const projectRoot = ownString(req, 'projectRoot');
   // Build this board's MCP servers (obsidian/letta) from its charter, so the
   // real agent can do surgical vault edits, semantic search, and archival
   // memory. Only happens on the live path — never when the gate is closed.
@@ -434,11 +444,13 @@ export class Board {
               ts: new Date().toISOString(),
             });
             const projectRoot = configuredProjectRoot();
+            // Own-property read (D-B2): an unassigned worktree stays unassigned.
+            const worktreePath = ownString(env, 'worktreePath');
             const terminal = await this.executeLive({
               boardId: this.boardId,
               charter: this.charter,
               missionBrief: env.missionBrief,
-              ...(env.worktreePath ? { worktreePath: env.worktreePath } : {}),
+              ...(worktreePath ? { worktreePath } : {}),
               ...(projectRoot ? { projectRoot } : {}),
             });
             // No acceptance criteria exist yet (pre-M1), so the validation

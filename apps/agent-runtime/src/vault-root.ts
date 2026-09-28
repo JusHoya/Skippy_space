@@ -9,7 +9,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export function resolveVaultRoot(): string {
-  const fromEnv = process.env.SKIPPY_VAULT_ROOT;
+  // Own-property read: process.env falls back to Object.prototype, and a
+  // polluted SKIPPY_VAULT_ROOT must never re-root vault writes (OQ-22).
+  const fromEnv = Object.hasOwn(process.env, 'SKIPPY_VAULT_ROOT')
+    ? process.env.SKIPPY_VAULT_ROOT
+    : undefined;
   if (fromEnv) return fromEnv;
   let dir = path.dirname(fileURLToPath(import.meta.url));
   for (let i = 0; i < 8; i++) {

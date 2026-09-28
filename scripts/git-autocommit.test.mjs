@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, existsSync, chmodSync, readFileSync, readdirSync, lstatSync, symlinkSync, utimesSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -1034,7 +1034,7 @@ test('F5 skip reasons are reported per path, in byte order', () => {
   const repo = makeRepo();
   try {
     const g = repo.git;
-    write(repo.dir, '.gitattributes', 'vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\n');
+    write(repo.dir, '.gitattributes', 'vault/rot/*.md filter=rot\nvault/pid/*.md filter=pid\nvault/*.txt working-tree-encoding=UTF-16LE\n');
     g('config', 'filter.rot.clean', 'tr A-Za-z N-ZA-Mn-za-m');
     g('config', 'filter.rot.smudge', 'tr A-Za-z N-ZA-Mn-za-m');
     // Non-deterministic clean filter (appends its own PID): refused like any
@@ -1053,6 +1053,7 @@ test('F5 skip reasons are reported per path, in byte order', () => {
     g('add', 'vault/mine.md');
     write(repo.dir, 'vault/.env', 'K=1\n');
     write(repo.dir, 'vault/leak.md', 'AKIAABCDEFGHIJKLMNOP\n');
+    write(repo.dir, 'vault/enc.txt', 'aws AKIAABCDEFGHIJKLMNOP ok\n'); // stored as CJK text without the rule
     write(repo.dir, 'vault/rot/leak.md', 'AKIAABCDEFGHIJKLMNOP\n');
     write(repo.dir, 'vault/pid/p.md', 'plain\n');
     write(repo.dir, 'vault/ptr.bin', LFS_POINTER);
@@ -1065,6 +1066,7 @@ test('F5 skip reasons are reported per path, in byte order', () => {
     const want = [
       ['vault/.env', 'secret-filename'],
       ['vault/big.bin', 'too-large-to-scan'],
+      ['vault/enc.txt', 'encoded-path'],
       ['vault/flag.md', 'flagged'],
       ['vault/leak.md', 'secret-content'],
       ['vault/mine.md', 'user-staged'],
@@ -1362,11 +1364,17 @@ test('EC5-DG a vault .gitattributes flip between add and check-attr defers the t
     assert.equal(res.status, 'noop');
     assert.ok(!r.headTree().includes('vault/s.txt'), 'rot13 secret reached history via an attribute flip');
     assert.deepEqual(res.skippedDetail, [{ path: 'vault/s.txt', reason: 'attributes-changed' }]);
-    // Next tick: attributes are stable (no filter), so the raw key is scanned.
+    // Next tick: the working tree has no filter, but HEAD (and so the commit
+    // and every clone of it) still carries the user-committed rule, so the
+    // path stays filtered-path (OQ-19 committed views); the edited
+    // .gitattributes is never autocommitted (attributes-file).
     const next = runAutocommit(r.dir);
-    assert.equal(next.status, 'committed');
-    assert.deepEqual(next.skippedDetail, [{ path: 'vault/s.txt', reason: 'secret-content' }]);
-    assert.equal(r.show('HEAD:vault/.gitattributes'), '# filter removed');
+    assert.equal(next.status, 'noop');
+    assert.deepEqual(next.skippedDetail, [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/s.txt', reason: 'filtered-path' },
+    ]);
+    assert.equal(r.show('HEAD:vault/.gitattributes'), '*.txt filter=rot');
     assert.ok(!r.headTree().includes('vault/s.txt'));
   }));
 
@@ -1540,9 +1548,15 @@ test('EC5-R5-3 a deleted .gitattributes still applied through the index during a
     rmSync(join(r.dir, 'vault/sub/.gitattributes'));
     r.write('vault/sub/s.txt', 'clean v1\n');
     const res = runAutocommit(r.dir);
-    assert.equal(res.status, 'committed');
-    assert.deepEqual(res.skippedDetail, [{ path: 'vault/sub/s.txt', reason: 'filtered-path' }]);
-    assert.ok(!r.headTree().includes('vault/sub/.gitattributes'), 'the .gitattributes deletion must commit');
+    assert.equal(res.status, 'noop');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/sub/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/sub/s.txt', reason: 'filtered-path' },
+    ]);
+    assert.ok(r.headTree().includes('vault/sub/.gitattributes'), 'autocommit must never commit a .gitattributes deletion');
+    // The user commits the deletion deliberately; then the note commits.
+    r.q('add', '--', 'vault/sub/.gitattributes');
+    r.q('commit', '-q', '-m', 'drop the rule');
     const next = runAutocommit(r.dir);
     assert.equal(next.status, 'committed');
     assert.deepEqual(next.skippedDetail, []);
@@ -1669,7 +1683,10 @@ test('EC5-R5-7 stale skippy-ac temp dirs are swept (exact name, real dirs, never
       const res = runAutocommit(r.dir, undefined, {
         onPhase: () => {
           for (const n of readdirSync(tmp).filter((x) => x.startsWith('skippy-ac-') && !before.has(x))) {
-            for (const e of readdirSync(join(tmp, n), { withFileTypes: true })) seen.push(`${e.isDirectory() ? 'dir' : 'file'}:${e.name}`);
+            for (const e of readdirSync(join(tmp, n), { withFileTypes: true, recursive: true })) {
+              const rel = join(e.parentPath ?? e.path, e.name).slice(join(tmp, n).length + 1).split('\\').join('/');
+              seen.push(`${e.isDirectory() ? 'dir' : 'file'}:${rel}`);
+            }
           }
         },
       });
@@ -1687,9 +1704,28 @@ test('EC5-R5-7 stale skippy-ac temp dirs are swept (exact name, real dirs, never
     assert.ok(seen.includes('file:seed-index'), 'the tick must have created its own temp dir');
     // Another process's tick may run concurrently (its dir can show the sync
     // step's pathspec file or a transient index.lock): same invariant as the
-    // Rust twin — index/pathspec files only, never a directory or content.
-    const allowed = new Set(['file:index', 'file:seed-index', 'file:pathspec', 'file:index.lock']);
-    assert.deepEqual(seen.filter((s) => !allowed.has(s)), [], 'only index/pathspec files may live in a tick\'s temp dir');
+    // Rust twin — index/pathspec files plus the clone-view repository
+    // (HEAD, config, empty refs/, an alternates file naming the object
+    // directory), never vault content.
+    const allowed = new Set([
+      'file:index',
+      'file:seed-index',
+      'file:t0-index',
+      'file:alias-index',
+      'file:pathspec',
+      'file:index.lock',
+      'file:t0-index.lock',
+      'file:alias-index.lock',
+      'dir:clone-view.git',
+      'dir:clone-view.git/objects',
+      'dir:clone-view.git/objects/info',
+      'dir:clone-view.git/refs',
+      'file:clone-view.git/HEAD',
+      'file:clone-view.git/config',
+      'file:clone-view.git/objects/info/alternates',
+    ]);
+    assert.ok(seen.includes('file:clone-view.git/objects/info/alternates'), 'the scan phase must see the clone-view repository');
+    assert.deepEqual(seen.filter((s) => !allowed.has(s)), [], 'only index/pathspec files and the clone-view repository may live in a tick\'s temp dir');
   } finally {
     for (const d of [stale, fresh, odd, target]) rmSync(d, { recursive: true, force: true });
     try {
@@ -1699,3 +1735,803 @@ test('EC5-R5-7 stale skippy-ac temp dirs are swept (exact name, real dirs, never
     }
   }
 });
+
+// =========================================================================
+// M0-G12 / M0-G15 (OQ-19): a `working-tree-encoding` is a clean filter in all
+// but name. Mirrors the Rust twin's `g12_regression_tests` case for case.
+// The smuggling and stall cases leak / fail on 10f6654. Fixtures live on the
+// canonical long temp path (the Windows runner's TEMP is an 8.3 alias).
+// =========================================================================
+
+const G12_KEY = 'aws AKIAABCDEFGHIJKLMNOP ok\n'; // 26 bytes: an even count
+
+function g12Repo() {
+  const dir = mkdtempSync(join(realpathSync.native(tmpdir()), 'skippy-g12-'));
+  const q = (...args) => execFileSync('git', ['-C', dir, '-c', 'core.quotepath=false', ...args], { encoding: 'utf8', stdio: 'pipe' });
+  q('init', '-q', '-b', 'main');
+  q('config', 'user.name', 'Skippy Test');
+  q('config', 'user.email', 'skippy-test@example.invalid');
+  q('config', 'commit.gpgsign', 'false');
+  q('config', 'core.hooksPath', '.no-hooks');
+  return {
+    dir,
+    q,
+    write: (rel, contents) => write(dir, rel, contents),
+    commitAll: (msg) => {
+      q('add', '-A', '.');
+      q('commit', '-q', '-m', msg);
+    },
+    headTree: () => q('ls-tree', '-r', '-z', '--name-only', 'HEAD').split('\0').filter(Boolean),
+    show: (spec) => q('show', spec).trim(),
+    status: () => q('status', '--porcelain', '-uno').trim(),
+  };
+}
+
+function withG12Repo(fn) {
+  const r = g12Repo();
+  try {
+    fn(r);
+  } finally {
+    rmSync(r.dir, { recursive: true, force: true });
+  }
+}
+
+/** Every file of a checkout (skipping .git), as latin1 text. */
+function checkoutText(dir) {
+  const out = [];
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === '.git') continue;
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...checkoutText(p));
+    else out.push(readFileSync(p).toString('latin1'));
+  }
+  return out;
+}
+
+for (const enc of ['UTF-16LE', 'UTF-16BE']) {
+  test(`M0-G12 an ASCII secret declared ${enc} is refused as encoded-path; it never reaches HEAD or a fresh clone`, () =>
+    withG12Repo((r) => {
+      r.write('vault/n.md', 'x\n');
+      r.commitAll('init');
+      r.write('vault/.gitattributes', `*.txt working-tree-encoding=${enc}\n`);
+      r.write('vault/note.txt', G12_KEY); // git would store it as CJK text: no AKIA, no NUL
+      r.write('vault/n.md', 'y\n');
+      const res = runAutocommit(r.dir);
+      // The leak itself first: a fresh clone (file://, reachable objects only).
+      const clone = mkdtempSync(join(realpathSync.native(tmpdir()), 'skippy-g12-clone-'));
+      try {
+        execFileSync('git', ['clone', '-q', pathToFileURL(r.dir).href, join(clone, 'c')], { stdio: 'pipe' });
+        assert.ok(!checkoutText(join(clone, 'c')).some((t) => t.includes('AKIA')), 'a fresh clone checks the secret out');
+        const objects = execFileSync('git', ['-C', join(clone, 'c'), 'rev-list', '--objects', '--all'], { encoding: 'utf8' });
+        assert.ok(!objects.includes('vault/note.txt'), 'history of a fresh clone names the encoded note');
+      } finally {
+        rmSync(clone, { recursive: true, force: true });
+      }
+      assert.throws(() => r.q('cat-file', '--filters', 'HEAD:vault/note.txt'), 'the encoded note reached HEAD');
+      const want = [
+        { path: 'vault/.gitattributes', reason: 'attributes-file' },
+        { path: 'vault/note.txt', reason: 'encoded-path' },
+      ];
+      assert.deepEqual(res.skippedDetail, want);
+      assert.equal(res.status, 'committed');
+      assert.deepEqual(r.headTree(), ['vault/n.md']);
+      assert.equal(r.show('HEAD:vault/n.md'), 'y', 'an unrelated note must still commit');
+      const again = runAutocommit(r.dir);
+      assert.equal(again.status, 'noop');
+      assert.deepEqual(again.skippedDetail, want);
+    }));
+}
+
+test('M0-G15 an unconvertible working-tree-encoding (UTF-32, valueless) or a failing required filter excludes only its own paths; other notes still commit', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.q('config', 'filter.bad.clean', 'exit 1');
+    r.q('config', 'filter.bad.smudge', 'cat');
+    r.q('config', 'filter.bad.required', 'true');
+    r.write('vault/n.md', 'x\n');
+    r.write('vault/gone.md', 'bye\n');
+    r.write('vault/old.u32', 'abc\n'); // committed before any rule: unchanged, now unconvertible
+    r.commitAll('init');
+    const oldBlob = r.q('rev-parse', 'HEAD:vault/old.u32').trim();
+    r.write(
+      'vault/.gitattributes',
+      [
+        '*.u32 working-tree-encoding=UTF-32', // BOM required: git dies on the add
+        '*.le working-tree-encoding=UTF-32LE', // 6 bytes: not a UTF-32 sequence
+        '*.set working-tree-encoding', // valueless: git dies ("true/false ...")
+        '*.off -working-tree-encoding', // unset: no conversion at all
+        '*.bad filter=bad',
+        '',
+      ].join('\n'),
+    );
+    r.write('vault/a.u32', 'abc\n');
+    r.write('vault/b.le', 'abcde\n');
+    r.write('vault/c.set', 'plain\n');
+    r.write('vault/d.off', 'plain note under an unset rule\n');
+    r.write('vault/e.bad', 'clean filter fails\n');
+    r.write('vault/n.md', 'y\n');
+    r.write('vault/new.md', 'the magnificent Skippy approves\n');
+    rmSync(join(r.dir, 'vault/gone.md'));
+    const want = [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/a.u32', reason: 'encoded-path' },
+      { path: 'vault/b.le', reason: 'encoded-path' },
+      { path: 'vault/c.set', reason: 'encoded-path' },
+      { path: 'vault/e.bad', reason: 'filtered-path' },
+      { path: 'vault/old.u32', reason: 'encoded-path' },
+    ];
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, want);
+    assert.deepEqual(r.headTree(), ['vault/d.off', 'vault/n.md', 'vault/new.md', 'vault/old.u32']);
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    assert.equal(r.q('rev-parse', 'HEAD:vault/old.u32').trim(), oldBlob, 'the unconvertible tracked note must be left as HEAD has it');
+    const again = runAutocommit(r.dir);
+    assert.equal(again.status, 'noop');
+    assert.deepEqual(again.skippedDetail, want);
+  }));
+
+test('M0-G15 a sparse checkout plus an unconvertible encoding: in-cone notes commit, out-of-cone paths stay flagged', () =>
+  withG12Repo((r) => {
+    r.write('vault/a/1.md', '1\n');
+    r.write('vault/b/2.md', '2\n');
+    r.commitAll('init');
+    r.q('sparse-checkout', 'set', 'vault/a');
+    r.write('vault/a/.gitattributes', '*.u32 working-tree-encoding=UTF-32\n');
+    r.write('vault/a/[x].u32', 'abc\n'); // glob-like name: excluded literally
+    r.write('vault/a/x.md', 'x\n');
+    r.write('vault/a/1.md', '1b\n');
+    r.write('vault/b/new.md', 'new outside the cone\n');
+    const want = [
+      { path: 'vault/a/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/a/[x].u32', reason: 'encoded-path' },
+      { path: 'vault/b/2.md', reason: 'flagged' },
+      { path: 'vault/b/new.md', reason: 'flagged' },
+    ];
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, want);
+    assert.deepEqual(r.headTree(), ['vault/a/1.md', 'vault/a/x.md', 'vault/b/2.md']);
+    assert.equal(r.show('HEAD:vault/a/1.md'), '1b');
+    const again = runAutocommit(r.dir);
+    assert.equal(again.status, 'noop');
+    assert.deepEqual(again.skippedDetail, want);
+  }));
+
+test('M0-G12 a legitimate working-tree-encoding rule on a genuinely UTF-16 note is refused too (fail closed); unrelated notes commit', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/.gitattributes', '*.u16 working-tree-encoding=UTF-16\n*.txt working-tree-encoding=UTF-16LE\n*.md8 working-tree-encoding=UTF-8\n');
+    r.write('vault/bom.u16', utf16leWithBom('The magnificent Skippy, in UTF-16 with a BOM\n'));
+    r.write('vault/le.txt', Buffer.from('Monkeys write UTF-16LE without a BOM\n', 'utf16le'));
+    r.write('vault/same.md8', 'declared UTF-8: a no-op for git, refused all the same\n');
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/bom.u16', reason: 'encoded-path' },
+      { path: 'vault/le.txt', reason: 'encoded-path' },
+      { path: 'vault/same.md8', reason: 'encoded-path' },
+    ]);
+    assert.deepEqual(r.headTree(), ['vault/n.md']);
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    assert.equal(r.status(), '');
+  }));
+
+test('M0-G12 a path with both a filter and a working-tree-encoding is filtered-path; notes without either are unaffected', () =>
+  withG12Repo((r) => {
+    r.q('config', 'filter.rot.clean', 'tr A-Za-z N-ZA-Mn-za-m');
+    r.q('config', 'filter.rot.smudge', 'tr A-Za-z N-ZA-Mn-za-m');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/.gitattributes', '*.both filter=rot working-tree-encoding=UTF-16LE\n*.enc working-tree-encoding=UTF-16LE\n');
+    r.write('vault/x.both', G12_KEY);
+    r.write('vault/y.enc', G12_KEY);
+    r.write('vault/z.md', 'plain\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/x.both', reason: 'filtered-path' },
+      { path: 'vault/y.enc', reason: 'encoded-path' },
+    ]);
+    assert.deepEqual(r.headTree(), ['vault/n.md', 'vault/z.md']);
+  }));
+
+test('M0-G12 audit: text/eol/ident are not excluded; the checkout differs from the scanned blob only by CRs before LFs and the $Id$ expansion', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.write('vault/.gitattributes', '*.md text eol=crlf ident\n');
+    r.write('vault/n.md', 'x\r\n');
+    r.commitAll('init');
+    r.write('vault/n.md', 'id $Id: dropped on add $\r\nline two\r\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, []);
+    const blob = r.q('cat-file', '-p', 'HEAD:vault/n.md');
+    assert.equal(blob, 'id $Id$\nline two\n', 'add drops the CRs and collapses $Id: ...$');
+    const oid = r.q('rev-parse', 'HEAD:vault/n.md').trim();
+    assert.equal(r.q('cat-file', '--filters', 'HEAD:vault/n.md'), `id $Id: ${oid} $\r\nline two\r\n`);
+  }));
+
+// =========================================================================
+// M0-G12 residuals / M0-G13 (OQ-19): autocommit never adds, modifies or
+// deletes a `.gitattributes` (`attributes-file`), so an encoding / filter
+// rule only enters history through a deliberate user commit; the attribute
+// snapshot sees case variants, a relative core.attributesFile, attr.tree and
+// directories holding a bogus `.git`. Mirrors the Rust twin's
+// `g12_residual_tests` case for case. The D1 case leaks on 2e9f778.
+// =========================================================================
+
+/** UTF-8 text git would store for the ASCII key declared UTF-16LE. */
+const G12_CJK = Buffer.from(Buffer.from(G12_KEY, 'latin1').toString('utf16le'), 'utf8');
+const G12_RESIDUAL_TICKS = Number(process.env.SKIPPY_G12_TICKS ?? 100);
+const G13_TOGGLER_TICKS = Number(process.env.SKIPPY_G13_TICKS ?? 30);
+
+/** Clone `dir` over file:// and return every checked-out file (latin1), plus k.txt's exact bytes. */
+function cloneCheckout(dir, keyPath) {
+  const clone = mkdtempSync(join(realpathSync.native(tmpdir()), 'skippy-g12-clone-'));
+  try {
+    execFileSync('git', ['-c', 'core.autocrlf=false', 'clone', '-q', pathToFileURL(dir).href, join(clone, 'c')], { stdio: 'pipe' });
+    const key = keyPath && existsSync(join(clone, 'c', keyPath)) ? readFileSync(join(clone, 'c', keyPath)) : null;
+    return { files: checkoutText(join(clone, 'c')), key };
+  } finally {
+    rmSync(clone, { recursive: true, force: true });
+  }
+}
+
+/** Every path any commit reachable from HEAD ever named. */
+const historyPaths = (r) => r.q('log', '--format=', '--name-only', 'HEAD').split('\n').filter(Boolean);
+
+test('M0-G12 predicate: every name git treats as .gitattributes (any case, NTFS trailing dots/spaces/streams, 8.3 short names) and nothing else', () => {
+  const yes = ['.gitattributes', '.GitAttributes', '.GITATTRIBUTES', '.gitattributes.', '.gitattributes . ', '.gitattributes:$DATA', 'gitatt~1', 'GITATT~4', 'gi7d29~1', 'GI7D2~12', 'gitatt~2. '];
+  const no = ['gitattributes', '.gitattribute', '.gitattributesx', 'x.gitattributes', '.gitignore', 'gitatt~5', 'gitatt~1x', 'gi7d29~0', 'gi7d29~', '.gitattributes.md', ''];
+  for (const n of yes) assert.equal(autocommit.isAttributesFileName(n), true, n);
+  for (const n of no) assert.equal(autocommit.isAttributesFileName(n), false, n);
+});
+
+test('M0-G12 D1: a pre-encoded note plus a later encoding rule: the .gitattributes is attributes-file, never in history, and a clone checks out the stored bytes', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/k.txt', G12_CJK); // plain UTF-8 CJK text: no AKIA, no NUL
+    const t1 = runAutocommit(r.dir);
+    assert.equal(t1.status, 'committed');
+    assert.deepEqual(t1.skippedDetail, []);
+    r.write('vault/.gitattributes', '*.txt working-tree-encoding=UTF-16LE\n');
+    r.write('vault/n.md', 'y\n');
+    const want = [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/k.txt', reason: 'encoded-path' },
+    ];
+    const t2 = runAutocommit(r.dir);
+    const t3 = runAutocommit(r.dir);
+    // The leak itself first: a fresh clone (file://, reachable objects only).
+    const { files, key } = cloneCheckout(r.dir, 'vault/k.txt');
+    assert.ok(!files.some((t) => t.includes('AKIA')), 'a fresh clone decodes the stored CJK text into the plaintext key');
+    assert.deepEqual(key, G12_CJK, 'a clone must check out exactly the stored bytes');
+    assert.deepEqual(t2.skippedDetail, want);
+    assert.equal(t2.status, 'committed', 'the unrelated note still commits');
+    assert.equal(t3.status, 'noop');
+    assert.deepEqual(t3.skippedDetail, want);
+    assert.deepEqual(r.headTree(), ['vault/k.txt', 'vault/n.md']);
+    assert.ok(!historyPaths(r).includes('vault/.gitattributes'), 'the .gitattributes reached history');
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+  }));
+
+test('M0-G12 attributes-file: case variants, edits and deletions of an attributes file are never autocommitted; HEAD keeps the user-committed rule', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.write('vault/.gitattributes', '*.txt working-tree-encoding=UTF-16LE\n');
+    r.write('vault/old/.gitattributes', '*.md text\n');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init'); // the user commits the rule deliberately
+    const rule = r.show('HEAD:vault/.gitattributes');
+    r.write('vault/sub/.GitAttributes', '*.txt filter=rot\n');
+    r.write('vault/.gitattributes', '# rule dropped in the working tree\n');
+    rmSync(join(r.dir, 'vault/old/.gitattributes'));
+    r.write('vault/k.txt', G12_KEY);
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    // k.txt: the working tree dropped the rule, HEAD still has it, so a clone
+    // would re-encode: encoded-path (OQ-19 committed views).
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/k.txt', reason: 'encoded-path' },
+      { path: 'vault/old/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/sub/.GitAttributes', reason: 'attributes-file' },
+    ]);
+    assert.deepEqual(r.headTree(), ['vault/.gitattributes', 'vault/n.md', 'vault/old/.gitattributes']);
+    assert.equal(r.show('HEAD:vault/.gitattributes'), rule);
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    // The user-committed rule is still respected once it is back in the working tree.
+    r.write('vault/.gitattributes', `${rule}\n`);
+    const again = runAutocommit(r.dir);
+    assert.deepEqual(
+      again.skippedDetail.filter((d) => d.path === 'vault/k.txt'),
+      [{ path: 'vault/k.txt', reason: 'encoded-path' }],
+    );
+  }));
+
+/** Flip `file` between `on` and `off` every 2-32 ms in a child process until killed. */
+function spawnToggler(file, on, off) {
+  const code =
+    "const fs=require('fs');const [f,on,off]=process.argv.slice(1);let i=0;" +
+    '(function t(){try{fs.writeFileSync(f,(i++%2)?on:off)}catch{}setTimeout(t,2+Math.random()*30)})()';
+  return spawn(process.execPath, ['-e', code, file, on, off], { stdio: 'ignore' });
+}
+
+async function togglerNeverLeaks(t, { attrFile, relConfig = false, ticks }) {
+  const r = g12Repo();
+  let tog = null;
+  try {
+    r.q('config', 'core.autocrlf', 'false');
+    if (relConfig) r.q('config', 'core.attributesFile', attrFile);
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/sub/s.txt', G12_KEY);
+    r.write(attrFile, '# none\n');
+    tog = spawnToggler(join(r.dir, attrFile), '*.txt working-tree-encoding=UTF-16LE\n', '# none\n');
+    const seen = new Set([r.q('rev-parse', 'HEAD').trim()]);
+    const reasons = {};
+    let failed = 0;
+    for (let i = 0; i < ticks; i++) {
+      try {
+        const res = runAutocommit(r.dir);
+        for (const d of res.skippedDetail) reasons[`${d.path}:${d.reason}`] = (reasons[`${d.path}:${d.reason}`] ?? 0) + 1;
+      } catch (e) {
+        // A file rewritten while `add` reads it ("short read while indexing")
+        // fails the tick explicitly, before any commit: allowed, but checked.
+        assert.match(e.message, /^git add -A/, `tick ${i}: unexpected failure`);
+        failed++;
+      }
+      const head = r.q('rev-parse', 'HEAD').trim();
+      if (seen.has(head)) continue;
+      seen.add(head);
+      assert.ok(!r.headTree().some((p) => autocommit.isAttributesFilePath(p)), `tick ${i}: an attributes file reached HEAD`);
+      const { files } = cloneCheckout(r.dir);
+      assert.ok(!files.some((x) => x.includes('AKIA')), `tick ${i}: a clone of HEAD checks the plaintext key out`);
+    }
+    t.diagnostic(`${ticks} ticks (${failed} failed in add), ${seen.size - 1} new HEADs, reasons ${JSON.stringify(reasons)}`);
+    assert.ok(failed < ticks / 2, 'most ticks must complete');
+  } finally {
+    if (tog) {
+      const exited = new Promise((res) => tog.once('exit', res));
+      tog.kill();
+      await exited;
+    }
+    rmSync(r.dir, { recursive: true, force: true });
+  }
+}
+
+test(`M0-G12 D2: a toggler flipping vault/sub/.gitattributes never yields a HEAD whose clone checks the key out (${G12_RESIDUAL_TICKS} ticks)`, (t) =>
+  togglerNeverLeaks(t, { attrFile: 'vault/sub/.gitattributes', ticks: G12_RESIDUAL_TICKS }));
+
+test(`M0-G13 D3: a toggler flipping a case-variant vault/sub/.GitAttributes never yields a leaking HEAD (${G13_TOGGLER_TICKS} ticks)`, (t) =>
+  togglerNeverLeaks(t, { attrFile: 'vault/sub/.GitAttributes', ticks: G13_TOGGLER_TICKS }));
+
+test(`M0-G13 D3: a toggler flipping a relative core.attributesFile never yields a leaking HEAD (${G13_TOGGLER_TICKS} ticks)`, (t) =>
+  togglerNeverLeaks(t, { attrFile: 'relattrs', relConfig: true, ticks: G13_TOGGLER_TICKS }));
+
+/**
+ * The M0-G13 blind spots, deterministically: `setup` installs an encoding
+ * rule for vault/sub/s.txt through one attribute source, `flip` removes it
+ * right after the add (so the add stored CJK text and both check-attr runs
+ * say "no encoding"). The snapshot must see the flip: attributes-changed.
+ */
+function flipDefersTick(r, setup, flip) {
+  r.q('config', 'core.autocrlf', 'false');
+  r.write('vault/n.md', 'x\n');
+  setup();
+  r.commitAll('init');
+  r.write('vault/sub/s.txt', G12_KEY);
+  r.write('vault/n.md', 'y\n');
+  const res = runAutocommit(r.dir, undefined, {
+    onPhase: (phase) => {
+      if (phase === 'added') flip();
+    },
+  });
+  assert.ok(!r.headTree().includes('vault/sub/s.txt'), 'the re-encoded key reached HEAD');
+  assert.equal(res.status, 'noop');
+  assert.deepEqual(res.skippedDetail, [
+    { path: 'vault/n.md', reason: 'attributes-changed' },
+    { path: 'vault/sub/s.txt', reason: 'attributes-changed' },
+  ]);
+  return runAutocommit(r.dir);
+}
+
+const ENC_RULE = '*.txt working-tree-encoding=UTF-16LE\n';
+
+test('M0-G13 a flip of a case-variant vault/sub/.GitAttributes defers the tick (attributes-changed)', () =>
+  withG12Repo((r) => {
+    const next = flipDefersTick(
+      r,
+      () => r.write('vault/sub/.GitAttributes', ENC_RULE),
+      () => r.write('vault/sub/.GitAttributes', '# none\n'),
+    );
+    // The user-committed .GitAttributes still holds the rule, and a
+    // case-insensitive clone reads it as .gitattributes: encoded-path.
+    assert.deepEqual(next.skippedDetail, [
+      { path: 'vault/sub/.GitAttributes', reason: 'attributes-file' },
+      { path: 'vault/sub/s.txt', reason: 'encoded-path' },
+    ]);
+  }));
+
+test('M0-G13 a flip of a relative core.attributesFile (resolved against the top level, not the cwd) defers the tick', () =>
+  withG12Repo((r) => {
+    const next = flipDefersTick(
+      r,
+      () => {
+        r.q('config', 'core.attributesFile', 'relattrs');
+        r.write('relattrs', ENC_RULE);
+      },
+      () => r.write('relattrs', '# none\n'),
+    );
+    assert.deepEqual(next.skippedDetail, [{ path: 'vault/sub/s.txt', reason: 'secret-content' }]);
+  }));
+
+/** A tree holding one root `.gitattributes` with `rule`, under `ref`. */
+function attrTree(r, ref, rule) {
+  const blob = execFileSync('git', ['-C', r.dir, 'hash-object', '-w', '--stdin'], { input: rule, encoding: 'utf8' }).trim();
+  const tree = execFileSync('git', ['-C', r.dir, 'mktree'], { input: `100644 blob ${blob}\t.gitattributes\n`, encoding: 'utf8' }).trim();
+  r.q('update-ref', ref, tree);
+}
+
+test('M0-G13 attr.tree: a move of the ref it names, or a change of the setting, defers the tick; a stable attr.tree rule is honoured', () =>
+  withG12Repo((r) => {
+    const next = flipDefersTick(
+      r,
+      () => {
+        attrTree(r, 'refs/skippy/attrs', ENC_RULE);
+        r.q('config', 'attr.tree', 'refs/skippy/attrs');
+      },
+      () => attrTree(r, 'refs/skippy/attrs', '# none\n'),
+    );
+    assert.deepEqual(next.skippedDetail, [{ path: 'vault/sub/s.txt', reason: 'secret-content' }]);
+    // A stable rule read from attr.tree is refused like any other source.
+    attrTree(r, 'refs/skippy/attrs', ENC_RULE);
+    assert.deepEqual(runAutocommit(r.dir).skippedDetail, [{ path: 'vault/sub/s.txt', reason: 'encoded-path' }]);
+    // Dropping the setting mid-tick defers too.
+    const res = runAutocommit(r.dir, undefined, {
+      onPhase: (phase) => {
+        if (phase === 'added') r.q('config', '--unset', 'attr.tree');
+      },
+    });
+    assert.deepEqual(res.skippedDetail, [{ path: 'vault/sub/s.txt', reason: 'attributes-changed' }]);
+  }));
+
+test('M0-G13 a directory holding a bogus .git is still walked: a flip of its .gitattributes defers the tick', () =>
+  withG12Repo((r) => {
+    const next = flipDefersTick(
+      r,
+      () => {
+        r.write('vault/sub/.git', 'gitdir: nowhere\n'); // not a repository: `add` walks straight in
+        r.write('vault/sub/.gitattributes', ENC_RULE);
+      },
+      () => r.write('vault/sub/.gitattributes', '# none\n'),
+    );
+    // HEAD still carries the user-committed rule: encoded-path (OQ-19).
+    assert.deepEqual(next.skippedDetail, [
+      { path: 'vault/sub/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/sub/s.txt', reason: 'encoded-path' },
+    ]);
+  }));
+
+test('M0-G13 a real nested repository is still skipped: its own .gitattributes changing mid-tick does not defer the tick', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    const nested = join(r.dir, 'vault', 'nested');
+    mkdirSync(nested, { recursive: true });
+    execFileSync('git', ['-C', nested, 'init', '-q']);
+    write(nested, '.gitattributes', '# nested v1\n');
+    execFileSync('git', ['-C', nested, '-c', 'user.name=n', '-c', 'user.email=n@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '-q', '--allow-empty', '-m', 'n']);
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir, undefined, {
+      onPhase: (phase) => {
+        if (phase === 'added') write(nested, '.gitattributes', '# nested v2\n');
+      },
+    });
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [{ path: 'vault/nested', reason: 'gitlink' }]);
+    assert.equal(r.show('HEAD:vault/n.md'), 'y');
+  }));
+
+// =========================================================================
+// M1 pre-flight OQ-19 (DEF-1..DEF-5, FR-WIKI-06): a conversion attribute is
+// refused if ANY view a reader could apply sets it — the working tree, HEAD's
+// committed attribute files, and the commit's own tree both as a checkout
+// here reads it and as a fresh clone reads it (its attribute files alone);
+// the attribute snapshot covers every directory `add` visits (junctions,
+// tracked nested repositories); a path under a directory named like
+// `.gitattributes` is attributes-file; a path a restored exclusion displaces
+// is path-conflict; the predicate includes git's HFS+ rule. Mirrors the Rust
+// twin's `oq19_view_tests` case for case. Every case fails on 4766ed3.
+// =========================================================================
+
+const OQ19_ENC = (glob) => `${glob} working-tree-encoding=UTF-16LE\n`;
+const emptyTree = (r) => execFileSync('git', ['-C', r.dir, 'mktree'], { input: '' }).toString().trim();
+
+/**
+ * DEF-1 and its variants: a user-committed rule would make a clone decode the
+ * note (UTF-8 CJK text) into the ASCII key; something outside the commit
+ * neutralises the rule for the working tree only. `key` is the note,
+ * `commit` writes the committed rule, `neutralise` the working-tree override,
+ * `attrFile` the override's path when it is an (uncommittable) attributes file.
+ */
+const OQ19_DEF1_VARIANTS = [
+  {
+    name: 'an in-vault override unsets a committed root rule (x8)',
+    key: 'vault/tools/x.txt',
+    commit: (r) => r.write('.gitattributes', `*.txt text working-tree-encoding=UTF-16LE eol=CRLF\n`),
+    neutralise: (r) => r.write('vault/.gitattributes', '*.txt -working-tree-encoding\n'),
+    attrFile: 'vault/.gitattributes',
+  },
+  {
+    name: 'an in-vault override makes a committed root rule unspecified',
+    key: 'vault/k.txt',
+    commit: (r) => r.write('.gitattributes', OQ19_ENC('*.txt')),
+    neutralise: (r) => r.write('vault/.gitattributes', '*.txt !working-tree-encoding\n'),
+    attrFile: 'vault/.gitattributes',
+  },
+  {
+    name: 'a subdirectory override against a root rule',
+    key: 'vault/sub/k.txt',
+    commit: (r) => r.write('.gitattributes', OQ19_ENC('vault/sub/*.txt')),
+    neutralise: (r) => r.write('vault/sub/.gitattributes', '*.txt -working-tree-encoding\n'),
+    attrFile: 'vault/sub/.gitattributes',
+  },
+  {
+    name: 'a user-committed vault/.gitattributes edited to "# none" in the working tree',
+    key: 'vault/k.txt',
+    commit: (r) => r.write('vault/.gitattributes', OQ19_ENC('*.txt')),
+    neutralise: (r) => r.write('vault/.gitattributes', '# none\n'),
+    attrFile: 'vault/.gitattributes',
+  },
+  {
+    // `--source` looks .gitattributes up byte for byte; a case-insensitive
+    // checkout writes .GitAttributes where git then opens .gitattributes.
+    name: 'a user-committed case-variant vault/.GitAttributes edited in the working tree',
+    key: 'vault/k.txt',
+    commit: (r) => r.write('vault/.GitAttributes', OQ19_ENC('*.txt')),
+    neutralise: (r) => r.write('vault/.GitAttributes', '# none\n'),
+    attrFile: 'vault/.GitAttributes',
+  },
+  {
+    name: 'the root .gitattributes edited in the working tree',
+    key: 'vault/k.txt',
+    commit: (r) => r.write('.gitattributes', OQ19_ENC('*.txt')),
+    neutralise: (r) => r.write('.gitattributes', '# none\n'),
+    attrFile: null,
+  },
+  {
+    name: 'info/attributes unsets the committed rule',
+    key: 'vault/k.txt',
+    commit: (r) => r.write('.gitattributes', OQ19_ENC('*.txt')),
+    neutralise: (r) => r.write('.git/info/attributes', '*.txt -working-tree-encoding\n'),
+    attrFile: null,
+  },
+  {
+    name: 'attr.tree names the empty tree over the committed rule',
+    key: 'vault/k.txt',
+    commit: (r) => r.write('.gitattributes', OQ19_ENC('*.txt')),
+    neutralise: (r) => r.q('config', 'attr.tree', emptyTree(r)),
+    attrFile: null,
+  },
+];
+
+for (const v of OQ19_DEF1_VARIANTS) {
+  test(`OQ-19 DEF-1 ${v.name}: the note is encoded-path and a clone never decodes the key`, () =>
+    withG12Repo((r) => {
+      r.q('config', 'core.autocrlf', 'false');
+      r.write('vault/n.md', 'x\n');
+      v.commit(r);
+      r.commitAll('user: a deliberate encoding rule');
+      v.neutralise(r);
+      r.write(v.key, G12_CJK); // plain UTF-8 CJK text: no AKIA, no NUL
+      r.write('vault/n.md', 'y\n');
+      const res = runAutocommit(r.dir);
+      // The leak itself first: a fresh clone of every HEAD the tick made.
+      const { files, key } = cloneCheckout(r.dir, v.key);
+      assert.ok(!files.some((t) => t.includes('AKIA')), 'a fresh clone decodes the committed note into the plaintext key');
+      assert.equal(key, null, 'the note reached history');
+      assert.ok(!r.headTree().includes(v.key));
+      const want = [...(v.attrFile ? [{ path: v.attrFile, reason: 'attributes-file' }] : []), { path: v.key, reason: 'encoded-path' }].sort((a, b) =>
+        a.path < b.path ? -1 : 1,
+      );
+      assert.deepEqual(res.skippedDetail, want);
+      assert.equal(res.status, 'committed', 'the unrelated note still commits');
+      assert.equal(r.show('HEAD:vault/n.md'), 'y');
+    }));
+}
+
+test('OQ-19 DEF-1 a rule the user staged (its working-tree file deleted) is honoured: the note is encoded-path, and the user\'s commit of the rule decodes nothing', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/.gitattributes', OQ19_ENC('*.txt'));
+    r.q('add', '--', 'vault/.gitattributes');
+    rmSync(join(r.dir, 'vault', '.gitattributes'));
+    r.write('vault/k.txt', G12_CJK);
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [{ path: 'vault/k.txt', reason: 'encoded-path' }]);
+    r.q('commit', '-q', '-m', 'user: the staged rule');
+    const { files, key } = cloneCheckout(r.dir, 'vault/k.txt');
+    assert.ok(!files.some((t) => t.includes('AKIA')), 'a clone decodes the autocommitted note through the rule the user committed');
+    assert.equal(key, null);
+  }));
+
+test('OQ-19 DEF-1 a committed filter rule unset by an in-vault override is filtered-path', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.write('.gitattributes', '*.txt filter=rot\n');
+    r.commitAll('user: a filter rule');
+    r.write('vault/.gitattributes', '*.txt -filter\n');
+    r.write('vault/k.txt', 'plain monkeys\n');
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/k.txt', reason: 'filtered-path' },
+    ]);
+    assert.deepEqual(r.headTree(), ['.gitattributes', 'vault/n.md']);
+  }));
+
+test('OQ-19 DEF-2 the snapshot follows what add reads: a directory junction is walked (Windows); a directory symlink is not (POSIX git never follows one)', (t) =>
+  withG12Repo((r) => {
+    const ext = mkdtempSync(join(realpathSync.native(tmpdir()), 'skippy-oq19-ext-'));
+    try {
+      r.q('config', 'core.autocrlf', 'false');
+      r.write('vault/n.md', 'x\n');
+      r.commitAll('init');
+      write(ext, 's.txt', G12_KEY);
+      write(ext, '.gitattributes', ENC_RULE);
+      const flipOff = {
+        onPhase: (phase) => {
+          if (phase === 'added') write(ext, '.gitattributes', '# none\n');
+        },
+      };
+      r.write('vault/n.md', 'y\n');
+      if (process.platform === 'win32') {
+        symlinkSync(ext, join(r.dir, 'vault', 'j'), 'junction');
+        // Git for Windows descends into the junction and reads
+        // vault/j/.gitattributes: add stores CJK text, then the rule goes.
+        const res = runAutocommit(r.dir, undefined, flipOff);
+        assert.ok(!r.headTree().includes('vault/j/s.txt'), 'the re-encoded key reached HEAD');
+        assert.equal(res.status, 'noop');
+        assert.deepEqual(res.skippedDetail, [
+          { path: 'vault/j/.gitattributes', reason: 'attributes-file' },
+          { path: 'vault/j/s.txt', reason: 'attributes-changed' },
+          { path: 'vault/n.md', reason: 'attributes-changed' },
+        ]);
+        assert.deepEqual(runAutocommit(r.dir).skippedDetail, [
+          { path: 'vault/j/.gitattributes', reason: 'attributes-file' },
+          { path: 'vault/j/s.txt', reason: 'secret-content' },
+        ]);
+      } else {
+        try {
+          symlinkSync(ext, join(r.dir, 'vault', 'j'), 'dir');
+        } catch (e) {
+          t.skip(`cannot create a directory symlink here (${e.code})`);
+          return;
+        }
+        // POSIX git adds the link itself (mode 120000, blob = the target
+        // path) and reads no attributes through it, so the flip is no
+        // attribute source of any vault path and nothing is deferred.
+        const res = runAutocommit(r.dir, undefined, flipOff);
+        assert.equal(res.status, 'committed');
+        assert.deepEqual(res.skippedDetail, []);
+        assert.equal(r.q('ls-tree', 'HEAD', '--', 'vault/j').split(' ')[0], '120000');
+        assert.equal(r.show('HEAD:vault/n.md'), 'y');
+      }
+    } finally {
+      rmSync(ext, { recursive: true, force: true });
+    }
+  }));
+
+test('OQ-19 DEF-3 a real nested repository over tracked vault paths is walked: a flip of its .gitattributes defers the tick', () =>
+  withG12Repo((r) => {
+    r.q('config', 'core.autocrlf', 'false');
+    r.write('vault/n.md', 'x\n');
+    r.write('vault/sub/s.txt', 'clean monkeys\n');
+    r.commitAll('init');
+    execFileSync('git', ['init', '-q', join(r.dir, 'vault', 'sub')]); // `add -A` still walks the tracked paths
+    r.write('vault/sub/.gitattributes', ENC_RULE);
+    r.write('vault/sub/s.txt', G12_KEY);
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir, undefined, {
+      onPhase: (phase) => {
+        if (phase === 'added') r.write('vault/sub/.gitattributes', '# none\n');
+      },
+    });
+    assert.equal(r.show('HEAD:vault/sub/s.txt'), 'clean monkeys', 'the re-encoded key reached HEAD');
+    assert.equal(res.status, 'noop');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/n.md', reason: 'attributes-changed' },
+      { path: 'vault/sub/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/sub/s.txt', reason: 'attributes-changed' },
+    ]);
+    assert.deepEqual(runAutocommit(r.dir).skippedDetail, [
+      { path: 'vault/sub/.gitattributes', reason: 'attributes-file' },
+      { path: 'vault/sub/s.txt', reason: 'secret-content' },
+    ]);
+  }));
+
+test('OQ-19 DEF-4 a committed vault/.gitattributes replaced by a directory: its notes are reported (attributes-file), never silently dropped', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.write('vault/.gitattributes', '*.md text\n');
+    r.commitAll('init');
+    rmSync(join(r.dir, 'vault', '.gitattributes'));
+    r.write('vault/.gitattributes/n.md', 'monkeys note\n');
+    r.write('vault/other.md', 'other\n');
+    for (let i = 0; i < 2; i++) {
+      const res = runAutocommit(r.dir);
+      assert.equal(res.status, i === 0 ? 'committed' : 'noop');
+      assert.deepEqual(res.skippedDetail, [
+        { path: 'vault/.gitattributes', reason: 'attributes-file' },
+        { path: 'vault/.gitattributes/n.md', reason: 'attributes-file' },
+      ]);
+    }
+    assert.deepEqual(r.headTree(), ['vault/.gitattributes', 'vault/n.md', 'vault/other.md']);
+  }));
+
+test('OQ-19 DEF-4 a committed path displaced by a restored exclusion is reported as path-conflict, never silently dropped', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.write('vault/a/.env', 'X=1\n'); // the user tracks it deliberately
+    r.commitAll('init');
+    rmSync(join(r.dir, 'vault', 'a'), { recursive: true });
+    r.write('vault/a', 'now a note\n'); // restoring vault/a/.env (secret-filename) displaces it
+    r.write('vault/other.md', 'other\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [
+      { path: 'vault/a', reason: 'path-conflict' },
+      { path: 'vault/a/.env', reason: 'secret-filename' },
+    ]);
+    assert.deepEqual(r.headTree(), ['vault/a/.env', 'vault/n.md', 'vault/other.md']);
+    assert.equal(r.q('diff', '--cached', '--name-only').trim(), '', 'the real index must stay in line with HEAD');
+  }));
+
+test('OQ-19 DEF-5 predicate: git\'s HFS+ rule (ignorable code points inside .gitattributes) as well as the NTFS one; any path component', () => {
+  const hfsYes = [
+    '.git‌attributes',
+    '‍.gitattributes',
+    '.GIT‎ATTRIBUTES',
+    '.gitattributes‏',
+    '.g‪i‫t‬a‭t‮tributes',
+    '.gitattr⁪⁫⁬⁭⁮⁯ibutes',
+    '.gitattributes﻿',
+    '.gitattributes‌‌',
+  ];
+  const no = ['.git​attributes', '.gitattributes‌x', '.gitattributeſ', '.git­attributes', 'x.gitattributes‌', '.gitattributes‌.md'];
+  const bytes = (s) => autocommit.toBytePath(s);
+  for (const n of hfsYes) assert.equal(autocommit.isAttributesFileName(bytes(n)), true, JSON.stringify(n));
+  for (const n of no) assert.equal(autocommit.isAttributesFileName(bytes(n)), false, JSON.stringify(n));
+  // A malformed UTF-8 sequence right after the name reads as its end (git's pick_one_utf8_char).
+  assert.equal(autocommit.isAttributesFileName('.gitattributes\xff'), true);
+  assert.equal(autocommit.isAttributesFileName('.gitattr\xffibutes'), false);
+  assert.equal(autocommit.isAttributesFilePath('vault/.gitattributes/n.md'), true);
+  assert.equal(autocommit.isAttributesFilePath(bytes('vault/.git‌attributes/n.md')), true);
+  assert.equal(autocommit.isAttributesFilePath('vault/gitattributes/n.md'), false);
+});
+
+test('OQ-19 DEF-5 an HFS+ spelling of .gitattributes in the vault is attributes-file, never committed', () =>
+  withG12Repo((r) => {
+    r.write('vault/n.md', 'x\n');
+    r.commitAll('init');
+    r.write('vault/.git‌attributes', ENC_RULE);
+    r.write('vault/n.md', 'y\n');
+    const res = runAutocommit(r.dir);
+    assert.equal(res.status, 'committed');
+    assert.deepEqual(res.skippedDetail, [{ path: 'vault/.git‌attributes', reason: 'attributes-file' }]);
+    assert.deepEqual(r.headTree(), ['vault/n.md']);
+  }));

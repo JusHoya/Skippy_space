@@ -45,6 +45,11 @@ Severity reflects the final adversarial verification. "Default config" means the
 | M0-G19 | Low | Cost | Task agents ignore the board's `maxTurns` (60 sub-turns seen against `maxTurns: 6`). | Enforce per-agent turn and budget caps (FR-COST, T12). |
 | M0-G20 | Resolved | EC6 | CI had never run green (26 historical runs failed). Resolved 2026-09-27: first green run at `3f70549` on ubuntu and windows, after test-portability fixes. | none |
 
+**Update, M1 pre-flight (`m1/preflight`):**
+- Closed: M0-G01, G02, G03, G05, G06 (git execution and config surface), G12, G13 and G15.
+- G07 is hardened: the decision surface is immune to prototype pollution.
+- New, narrower issues PF-01 … PF-15 are tracked in [M1-PREFLIGHT.md](M1-PREFLIGHT.md).
+
 Deferred by the PRD, not counted: OQ-13 validation disposition, OQ-14 approval channel, OQ-17 (secrets in ordinarily named files, hardlinks), no `cancelled` producer yet, the process-exit shutdown race and hung-provider timeout (T07), and the proper Claude CLI adapter (T10).
 
 ## Owner decisions pending

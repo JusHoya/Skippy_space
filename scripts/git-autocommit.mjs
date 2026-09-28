@@ -9,7 +9,8 @@
 // its output is handled as raw bytes (a "byte string": one JS char per byte,
 // latin1), so non-ASCII names are never C-quoted, never mangled, and round-
 // trip exactly into pathspec files / `update-index --index-info` stdin.
-// Every git call runs with GIT_LITERAL_PATHSPECS=1 (E5-4) and no user path is
+// Every git call runs with GIT_LITERAL_PATHSPECS=1 (E5-4; the M0-G15 add
+// fallback instead spells `:(literal)` on each entry) and no user path is
 // ever put on a command line (E5-5): per-path input goes through stdin or a
 // NUL-delimited --pathspec-from-file.
 //
@@ -43,13 +44,31 @@
 //      `add` refuses (and fails on) out-of-cone paths; if it fails while
 //      core.sparseCheckout is on, the throwaway index is reset to the seed
 //      and the add is redone with `--sparse`, so a sparse checkout never
-//      fails every tick (out-of-cone paths are then flagged, step 5). The
+//      fails every tick (out-of-cone paths are then flagged, step 5). git
+//      also dies on the whole add for ONE file it cannot convert (M0-G15: a
+//      UTF-32 or BOM-less UTF-16/UTF-32 `working-tree-encoding`, an odd byte
+//      count under UTF-16, an unknown encoding, a valueless
+//      `working-tree-encoding`, a failing required filter). So on any add
+//      failure the tick lists what add would visit (`ls-files --cached
+//      --others --exclude-standard` against the seed index), evaluates
+//      `filter` / `working-tree-encoding` for its present files against the
+//      seed index, and — if any has one (or the checkout is sparse) — resets
+//      to the seed and redoes `add -A [--sparse] -- vault` with each of them
+//      excluded (`:(literal)vault` plus one `:(exclude,literal)<path>` per
+//      file in a NUL-delimited `--pathspec-from-file`: the only git call run
+//      without GIT_LITERAL_PATHSPECS, and every entry is still literal).
+//      The withheld files are candidates excluded as `filtered-path` /
+//      `encoded-path` (step 5); since git cannot tell whether they changed,
+//      they are reported on every tick that needs this fallback. Any other
+//      add failure still fails the tick explicitly. The
 //      throwaway index lives in a fresh private directory in the OS temp dir
 //      (`<tmp>/skippy-ac-<16 hex>/`, D1) — never under the git dir, so a long
 //      repo/worktree path can't push `<index>.lock` past MAX_PATH — and the
 //      directory (with any `.lock`) is removed in every case. It only ever
-//      holds index files and pathspec lists (paths + object ids), never vault
-//      file content. Every tick first sweeps `<tmp>/skippy-ac-<16 hex>`
+//      holds index files and pathspec lists (paths + object ids) and the
+//      empty clone-view repository (step 5: HEAD, config, an empty refs/ and
+//      an alternates file naming the object directory), never vault file
+//      content. Every tick first sweeps `<tmp>/skippy-ac-<16 hex>`
 //      directories older than one hour (left by a killed tick; exact name
 //      match, real directories only, never through a symlink/junction, best
 //      effort).
@@ -66,19 +85,87 @@
 //                           (nested repo, submodule pointer bump, D4); gitlinks
 //                           already in HEAD are left exactly as they are
 //        secret-filename    shared filename rules
+//        attributes-file    ANY component of the path names a
+//                           `.gitattributes` (the file itself, or anything
+//                           under a directory so named — DEF-4: restoring a
+//                           committed `vault/.gitattributes` over a directory
+//                           `vault/.gitattributes/` would otherwise drop its
+//                           notes silently): any ASCII case, plus every NTFS
+//                           equivalent git itself treats as one (trailing
+//                           spaces / periods, a `:stream` suffix, the
+//                           `gitatt~N` / `gi7d29~N` 8.3 names; a port of
+//                           git's `is_ntfs_dotgitattributes`) and every HFS+
+//                           one (the name with the code points HFS+ ignores —
+//                           U+200C..U+200F, U+202A..U+202E, U+206A..U+206F,
+//                           U+FEFF — removed; a port of git's
+//                           `is_hfs_dotgitattributes`, DEF-5), both applied
+//                           on every OS. Autocommit never adds, modifies or deletes an
+//                           attributes file, so an encoding or filter rule
+//                           reaches history only through a deliberate user
+//                           commit (M0-G12 residuals D1-D3): a rule committed
+//                           next to text stored without it would make every
+//                           clone decode that text on checkout (D1: UTF-8 CJK
+//                           text that UTF-16LE turns back into an ASCII key);
+//                           with the rule kept out of history, a clone checks
+//                           out exactly the stored bytes
 //        attributes-changed an attribute source changed during the tick
 //                           (A1 != A2, below): EVERY remaining candidate is
 //                           deferred to the next tick
 //        filtered-path      the path has a `filter` attribute (any value:
 //                           `lfs`, a custom driver, even an unconfigured one)
-//                           in EITHER evaluation — `check-attr` against the
-//                           seed index (the pre-add attribute state; the
-//                           working-tree side is pinned by A1 == A2) or
-//                           against the post-add temp index. The vault is
+//                           in ANY view a reader could apply (OQ-19, DEF-1),
+//                           one batched `check-attr -z --stdin` per view:
+//                           (a) the working tree, against the seed index (the
+//                           pre-add state; the working-tree side is pinned by
+//                           A1 == A2), against the post-add temp index and
+//                           against the user's real index (a rule staged
+//                           there, its working-tree file deleted, reaches the
+//                           user's next commit);
+//                           (b) HEAD's committed attribute files
+//                           (`--source=HEAD`; skipped while HEAD is unborn);
+//                           (c) the tree the commit is built from (T0: the
+//                           post-add tree with every exclusion decided before
+//                           this check applied, in a copy of the temp index;
+//                           later exclusions restore no attributes file, so
+//                           the commit's attribute files are exactly T0's,
+//                           which are HEAD's), both with this repository's
+//                           info / global / system files (`--source=T0`: a
+//                           checkout here) and ALONE — the clone view: the
+//                           same call run in an empty bare repository that
+//                           borrows the object store (alternates), with the
+//                           system file off, the global file pointed at
+//                           nothing and the discovery variables removed, so
+//                           no `info/attributes`, `attr.tree`, global or
+//                           system rule can unset what a fresh clone applies;
+//                           and (d) for each committed attributes file under
+//                           an alias spelling (a case variant, an NTFS or
+//                           HFS+ name: `--source` looks `.gitattributes` up
+//                           byte for byte, but a case-insensitive / NTFS /
+//                           HFS+ checkout writes the alias where git then
+//                           opens `.gitattributes`), the clone view of T0
+//                           with that blob as its directory's
+//                           `.gitattributes`. So a rule the working tree
+//                           neutralises (an uncommittable in-vault override,
+//                           an edited committed file, `info/attributes`,
+//                           `attr.tree`) can no longer let a note that a
+//                           clone would decode reach history. The vault is
 //                           Markdown and needs no clean filter; a filter can
 //                           turn any content into bytes the blob scan cannot
 //                           judge (an LFS pointer, rot13), so filtered paths
 //                           are never autocommitted (OQ-19)
+//        encoded-path       the path has a `working-tree-encoding` attribute
+//                           (any value but unspecified/unset: UTF-16LE,
+//                           UTF-32, even UTF-8 or an empty value) in ANY
+//                           view, same `check-attr` calls and semantics
+//                           as filtered-path (a path with both is
+//                           filtered-path). Re-encoding is a clean filter in
+//                           all but name (M0-G12): ASCII `AKIA...` bytes
+//                           declared UTF-16LE are stored as CJK text holding
+//                           no `AKIA` and no NUL, which no blob view can
+//                           judge, and every checkout or clone turns the blob
+//                           back into the plaintext key. Fail closed: a
+//                           genuinely UTF-16 note under a legitimate rule is
+//                           refused too (the vault is UTF-8 Markdown) (OQ-19)
 //        too-large-to-scan  blob larger than limits.maxScanBytes (64 MiB, D3)
 //                           — never read, fail closed
 //        lfs-pointer        the blob holds a git-lfs pointer version line
@@ -94,28 +181,83 @@
 //                           would contain (`cat-file --batch`, fetched in
 //                           batches of at most maxScanBytes; latin1 and again
 //                           with NULs stripped for UTF-16)
-//      With filtered paths refused, every committed blob is exactly the
-//      scanned blob: the scan needs no proof step. Mode-120000 entries are
-//      scanned the same way (core.symlinks=false: the blob IS the file's
-//      bytes; a real symlink: the blob is the link target). eol/autocrlf,
-//      `working-tree-encoding` and `ident` stay exactly as git applies them:
-//      they are fixed, public transforms (CR/LF, re-encoding of the same
-//      characters, the blob's own id) that cannot turn a clean blob into a
-//      secret on checkout, and the blob they produce is what gets scanned.
+//        path-conflict      decided last, after the exclusions above are
+//                           restored: a path that restoring one of them
+//                           displaced (git holds no entry under a path that
+//                           is a file, e.g. a new `vault/a` note where the
+//                           excluded `vault/a/.env` goes back). The final
+//                           tree is then checked: every staged path is either
+//                           committed exactly as staged or reported, and no
+//                           other vault path changes — otherwise the tick
+//                           fails explicitly and nothing is committed
+//      With filtered and encoded paths refused, every committed blob is
+//      exactly the scanned blob: the scan needs no proof step. Mode-120000
+//      entries are scanned the same way (core.symlinks=false: the blob IS the
+//      file's bytes; a real symlink: the blob is the link target).
+//      Attribute audit (M0-G12; git's convert.c reads exactly `text`, `eol`,
+//      `crlf`, `ident`, `filter` and `working-tree-encoding`, plus
+//      core.autocrlf / core.eol / core.safecrlf): only `filter` and
+//      `working-tree-encoding` can make the checkout differ from the blob in
+//      anything but line endings, and both are refused. `text`/`eol`/`crlf`/
+//      core.autocrlf only add or drop a CR right before an LF (text=auto
+//      leaves binary and lone-CR files alone), and no shared content pattern
+//      can consume a CR that is followed by an LF, so the blob's verdict is
+//      the checkout's. `ident` only collapses `$Id: ...$` to `$Id$` on add
+//      (dropping bytes, never storing them) and expands `$Id$` to the blob's
+//      own object id on checkout, which the user cannot choose. `diff`,
+//      `merge`, `whitespace`, `encoding` (gitk/gui display), `binary`,
+//      `delta` and `conflict-marker-size` never touch blob content;
+//      `export-subst` / `export-ignore` act on `git archive` only. Those stay
+//      exactly as git applies them, and the blob they produce is what gets
+//      scanned.
 //      Attribute snapshots A1 (before the add) and A2 (after the scans and
-//      both check-attr runs) cover every source git reads: the in-tree
-//      `.gitattributes` at the repo root and anywhere under vault/ (walked
-//      without following links; nested repositories skipped),
-//      `$GIT_COMMON_DIR/info/attributes`, the global file (`git var
-//      GIT_ATTR_GLOBAL`: core.attributesFile or the XDG default) and the
-//      system file (`git var GIT_ATTR_SYSTEM`), each recorded as its path
-//      plus its full content (or absent / a link / unreadable). Only a flip
-//      AND flip-back entirely inside the window between two observations can
-//      go unseen (see OQ-19); a flip that is still in place at A2 defers the
-//      tick.
+//      every check-attr view) cover every source git reads (M0-G13): every
+//      attributes file (the attributes-file names, any case, so the
+//      `.GitAttributes` git opens on a case-insensitive filesystem is seen)
+//      at the repo root and in every directory under vault/ that `add`
+//      visits — `vault` plus every ancestor of every path `ls-files --cached
+//      --others --exclude-standard -- vault` lists against the seed index,
+//      i.e. git's own walk: it descends into a directory junction on Windows
+//      (DEF-2) but never into a symlinked directory on POSIX, enters a real
+//      nested repository whose paths are tracked (DEF-3) or a directory with
+//      a bogus `.git`, skips an untracked nested repository (a gitlink) and
+//      an ignored directory, and is bounded and cycle-safe as git's walk is
+//      (a junction cycle ends at git's path-length limit, and the add then
+//      fails the tick) — `$GIT_COMMON_DIR/info/attributes`, the global file
+//      (`git var GIT_ATTR_GLOBAL`: core.attributesFile or the XDG default)
+//      and the system file (`git var GIT_ATTR_SYSTEM`), a relative path
+//      resolved against the repository top level (where git itself opens it,
+//      not the process cwd), each recorded as its path plus its full content
+//      (or absent / a link / unreadable); plus `attr.tree` (every configured
+//      value and the tree the last one names: git reads attributes from that
+//      tree instead of the working tree) and GIT_ATTR_SOURCE (value and
+//      tree). Only a flip AND flip-back entirely inside the window between
+//      two observations can go unseen; a flip that is still in place at A2
+//      defers the tick.
+//      Residual (OQ-19, M0-G14): such an unseen flip can still store a
+//      re-encoded or filtered blob for a path (e.g. the CJK text a transient
+//      UTF-16LE rule makes of an ASCII key). It is not rare: under a toggler
+//      flipping a working-tree rule every 2-32 ms, the M1 pre-flight
+//      verifier saw one enter history roughly once every 3-12 committing
+//      ticks, and once stored it stays in every later HEAD until the note
+//      changes (up to 27 of 50 new HEADs in the fix's race run). The
+//      committed views make it harmless to clones: the rule was never
+//      committed (else view b/c refuses the path), so a
+//      clone or checkout of the commit writes exactly those stored bytes,
+//      never the plaintext; the plaintext reappears only where a matching
+//      rule is active again (the attacker's own machine or attribute files,
+//      or a user who later commits such a rule by hand — the committed views
+//      then refuse every later change of that path, but not the blob already
+//      in history). The stored bytes are still a reversible transform of the
+//      secret that the scanner cannot judge, so anyone who knows the
+//      transform can decode them offline. Reaching this takes write access to
+//      an attribute source at the right instant, i.e. a local attacker who
+//      could equally write the secret into a note in any encoding no content
+//      scan recognizes.
 //      All are reported in `skipped` (byte order) and `skippedDetail`
 //      ({path, reason}).
-//   6. If nothing is left, no-op. Otherwise write-tree -> final tree.
+//   6. If nothing is left, no-op. Otherwise write-tree -> final tree (with
+//      the path-conflict check of step 5).
 //   7. git commit-tree <tree> [-p HEAD] -m <msg> (plumbing: no hooks run).
 //   8. git update-ref HEAD <new> <old> — compare-and-swap; fails explicitly
 //      if HEAD moved, before the real index was touched.
@@ -140,18 +282,23 @@
 // pre-commit hook can never see (or block) this commit. The built-in guard
 // (step 5) is the only line of defense. It scans exactly the committed
 // blobs, and refuses every path whose committed bytes could differ from what
-// the user wrote (filtered-path) or could make `git push` upload something
-// else (lfs-pointer), so neither a clean filter nor git-lfs can smuggle a
-// secret into history.
+// the user wrote or what a checkout writes back (filtered-path,
+// encoded-path) or could make `git push` upload something else
+// (lfs-pointer), and never commits an attributes file (attributes-file), so
+// neither a clean filter, a working-tree-encoding nor git-lfs can smuggle a
+// secret into history beyond the flip-and-flip-back residual above; and
+// because every view a reader could apply is evaluated (working tree, HEAD,
+// the commit as a checkout here and as a fresh clone reads it), a clone never
+// decodes autocommitted text into something the scanner did not see
+// (FR-WIKI-06), except where the reader's own attribute files add a rule.
 //
 // Test seam: `runAutocommit(root, now, { onPhase })` calls
 // `onPhase('added')` after step 4's add/write-tree and `onPhase('scanned')`
-// after the blob scan and both `check-attr` runs, before the closing
+// after the blob scan and every `check-attr` view, before the closing
 // attribute snapshot (A2). Production callers pass nothing.
 
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, readFileSync, writeFileSync } from 'node:fs';import { tmpdir } from 'node:os';
 import { join, isAbsolute, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
@@ -161,7 +308,6 @@ const VAULT_PATHSPEC = 'vault';
 const PENDING_MARKER_NAME = 'skippy-autocommit-pending';
 const PENDING_MARKER_VERSION = 2;
 const GITLINK_MODE = '160000';
-const GITATTRIBUTES = '.gitattributes';
 /** Name of every private temp dir a tick creates (and the sweep removes). */
 const TEMP_DIR_RE = /^skippy-ac-[0-9a-f]{16}$/;
 /** A `skippy-ac-*` dir untouched for this long belongs to a killed tick. */
@@ -170,6 +316,8 @@ const SYNC_RETRY_ATTEMPTS = 3;
 const SYNC_RETRY_DELAY_MS = 20;
 const MAX_GIT_OUTPUT = 1024 * 1024 * 1024;
 const GIT_ENV = { GIT_LITERAL_PATHSPECS: '1' };
+/** The M0-G15 fallback add only: pathspec magic on, every entry `:(literal)`. */
+const MAGIC_PATHSPEC_ENV = { GIT_LITERAL_PATHSPECS: '0', GIT_GLOB_PATHSPECS: '0' };
 const OID_RE = /^([0-9a-f]{40}|[0-9a-f]{64})$/;
 
 // --- Secret guard (FR-WIKI-06), shared with the Rust twin ----------------
@@ -334,6 +482,17 @@ function byteOrder(x, y) {
   return x < y ? -1 : x > y ? 1 : 0;
 }
 
+/**
+ * Restore `paths` in the index `env` names to their HEAD state (or remove
+ * them if HEAD lacks them) with ONE `update-index -z --index-info`.
+ * `oidLength` is the object id length (40 or 64) for the removal records.
+ */
+function restoreToHead(root, env, paths, headEntries, oidLength) {
+  const zero = '0'.repeat(oidLength);
+  const info = paths.map((p) => (headEntries.has(p) ? `${headEntries.get(p)}\t${p}\0` : `0 ${zero}\t${p}\0`)).join('');
+  gitRaw(root, ['update-index', '-z', '--index-info'], { env, input: Buffer.from(info, 'latin1') });
+}
+
 /** Vault paths the user has staged something for (real index != HEAD). */
 function userOwnedPaths(snapshot, headEntries) {
   const owned = new Set(snapshot.unmerged);
@@ -450,35 +609,344 @@ function scanBlobsForSecrets(root, oids) {
   return verdicts;
 }
 
+/** A conversion attribute value that is set to anything but "off". */
+const attrIsSet = (v) => v !== 'unspecified' && v !== 'unset';
+
+/** The attributes `conversionAttributes` asks for, and its stdin (raw byte paths, NUL-terminated). */
+const CONVERSION_ATTRS = ['filter', 'working-tree-encoding'];
+const pathsInput = (paths) => Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1');
+
 /**
- * The subset of `paths` with a `filter` attribute set to anything (`set` or
- * any driver name, e.g. `lfs`, configured or not); `unspecified` / `unset`
- * mean no filter. One `check-attr -z --stdin` call, raw byte paths on stdin;
- * `env` selects the index git falls back to for a `.gitattributes` missing
- * from the working tree (the seed index = the pre-add state, or the temp
- * index = the post-add state).
+ * The conversion attributes of `paths` (OQ-19): `filtered`, the subset with a
+ * `filter` attribute set to anything (`set` or any driver name, e.g. `lfs`,
+ * configured or not), and `encoded`, the subset with a
+ * `working-tree-encoding` attribute set to anything (`set`, any encoding
+ * name — even UTF-8, an unknown one or an empty value); `unspecified` /
+ * `unset` mean neither. One `check-attr -z --stdin` call, raw byte paths on
+ * stdin. Without `source`, git reads the working tree's attribute files and
+ * `env` selects the index it falls back to for one missing from the working
+ * tree (the seed index = the pre-add state, or the temp index = the post-add
+ * state). With `source` (a commit or tree id), git reads the attribute files
+ * of that tree instead (`--source`, which also overrides `attr.tree` and
+ * `GIT_ATTR_SOURCE`), plus this repository's info / global / system files.
  */
-function filteredPaths(root, paths, env) {
-  if (paths.length === 0) return new Set();
-  const out = gitRaw(root, ['check-attr', '-z', '--stdin', 'filter'], {
-    env,
-    input: Buffer.from(paths.map((p) => `${p}\0`).join(''), 'latin1'),
-  });
-  const f = out.toString('latin1').split('\0');
-  if (f.length !== paths.length * 3 + 1 || f[f.length - 1] !== '') throw new Error('check-attr: unexpected output');
-  const filtered = new Set();
-  for (let i = 0; i + 2 < f.length; i += 3) {
-    if (f[i + 1] !== 'filter') throw new Error('check-attr: unexpected output');
-    if (f[i + 2] !== 'unspecified' && f[i + 2] !== 'unset') filtered.add(f[i]);
+function conversionAttributes(root, paths, env, source = null) {
+  if (paths.length === 0) return { filtered: new Set(), encoded: new Set() };
+  const src = source ? [`--source=${source}`] : [];
+  const out = gitRaw(root, ['check-attr', ...src, '-z', '--stdin', ...CONVERSION_ATTRS], { env, input: pathsInput(paths) });
+  return parseConversionAttributes(out, paths);
+}
+
+/**
+ * The clone view (OQ-19): the conversion attributes of `paths` exactly as a
+ * fresh clone of `tree` reads them — that tree's attribute files ONLY. Runs
+ * `check-attr --source=<tree>` in `cloneDir`, an empty bare repository
+ * borrowing this repository's objects (`cloneViewRepository`), with the
+ * system file off (`GIT_ATTR_NOSYSTEM`), the global file pointed at a path
+ * that does not exist, and the discovery variables removed, so neither this
+ * repository's `info/attributes` nor `attr.tree` nor any global or system
+ * rule can unset a rule the clone applies.
+ */
+function cloneViewAttributes(cloneDir, paths, tree) {
+  if (paths.length === 0) return { filtered: new Set(), encoded: new Set() };
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) if (!CLONE_VIEW_DROPPED_ENV.includes(k.toUpperCase())) env[k] = v;
+  const args = [
+    `--git-dir=${cloneDir}`,
+    '-c',
+    `core.attributesFile=${join(cloneDir, 'no-attributes')}`,
+    'check-attr',
+    `--source=${tree}`,
+    '-z',
+    '--stdin',
+    ...CONVERSION_ATTRS,
+  ];
+  let out;
+  try {
+    out = execFileSync('git', args, {
+      cwd: cloneDir,
+      env: { ...env, ...GIT_ENV, GIT_ATTR_NOSYSTEM: '1' },
+      input: pathsInput(paths),
+      maxBuffer: MAX_GIT_OUTPUT,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    throw new Error(`git check-attr (clone view) failed: ${e.stderr ? e.stderr.toString().trim() : e.message}`);
   }
-  return filtered;
+  return parseConversionAttributes(out, paths);
+}
+
+/** Variables that would point the clone view at this repository (or another attribute tree). */
+const CLONE_VIEW_DROPPED_ENV = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_ATTR_SOURCE', 'GIT_NAMESPACE'];
+
+/**
+ * An empty bare repository at `<tempDir>/clone-view.git` whose object store
+ * borrows this repository's (`objects/info/alternates`), in the repository's
+ * object format: nothing but a place to run the clone view.
+ */
+function cloneViewRepository(root, tempDir) {
+  const dir = join(tempDir, 'clone-view.git');
+  const format = git(root, ['rev-parse', '--show-object-format']);
+  if (!/^[a-z0-9]+$/.test(format)) throw new Error(`unexpected object format ${JSON.stringify(format)}`);
+  const objects = gitRaw(root, ['rev-parse', '--path-format=absolute', '--git-path', 'objects']);
+  const objectsDir = objects.subarray(0, objects.length - (objects[objects.length - 1] === 0x0a ? 1 : 0));
+  mkdirSync(join(dir, 'objects', 'info'), { recursive: true });
+  mkdirSync(join(dir, 'refs'));
+  writeFileSync(join(dir, 'HEAD'), 'ref: refs/heads/none\n');
+  writeFileSync(
+    join(dir, 'config'),
+    format === 'sha1'
+      ? '[core]\n\trepositoryformatversion = 0\n\tbare = true\n'
+      : `[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = ${format}\n`,
+  );
+  writeFileSync(join(dir, 'objects', 'info', 'alternates'), Buffer.concat([objectsDir, Buffer.from('\n')]));
+  return dir;
+}
+
+/**
+ * The committed attribute files under a name other than exactly
+ * `.gitattributes` (a case variant, an NTFS or HFS+ spelling) that `commit`
+ * holds at the root or under vault/, as [{dir, oid}] (dir '' = the root).
+ * `--source` looks `.gitattributes` up in a tree byte for byte, but a
+ * checkout onto a case-insensitive, NTFS or HFS+ filesystem writes such a
+ * file where git then opens `.gitattributes`, so the clone view evaluates
+ * each one as its directory's `.gitattributes` too. Every attributes file
+ * the commit holds is HEAD's (autocommit never adds, changes or removes
+ * one), so HEAD's entries are the commit's; `headVault` is HEAD's vault
+ * entries.
+ */
+function aliasAttributeFiles(root, head, headVault) {
+  if (!head) return [];
+  const out = [];
+  for (const rec of splitZ(gitRaw(root, ['ls-tree', '-z', head]))) {
+    const tab = rec.indexOf('\t');
+    const [mode, , oid] = rec.slice(0, tab).split(' ');
+    const name = rec.slice(tab + 1);
+    if (mode !== GITLINK_MODE && mode !== '040000' && name !== '.gitattributes' && isAttributesFileName(name)) out.push({ dir: '', oid });
+  }
+  for (const [p, v] of headVault) {
+    const [mode, oid] = v.split(' ');
+    const slash = p.lastIndexOf('/');
+    const name = p.slice(slash + 1);
+    if (mode !== GITLINK_MODE && name !== '.gitattributes' && isAttributesFileName(name)) out.push({ dir: p.slice(0, slash), oid });
+  }
+  return out;
+}
+
+/**
+ * `tree` with `<dir>/.gitattributes` replaced by blob `oid` (built in a
+ * scratch index under `tempDir`): the tree a checkout that let `alias` win
+ * would read attributes from.
+ */
+function treeWithAttributesBlob(root, tempDir, tree, alias) {
+  const index = join(tempDir, 'alias-index');
+  rmSync(index, { force: true });
+  const env = { GIT_INDEX_FILE: index };
+  git(root, ['read-tree', tree], { env });
+  const target = alias.dir ? `${alias.dir}/.gitattributes` : '.gitattributes';
+  gitRaw(root, ['update-index', '-z', '--index-info'], { env, input: Buffer.from(`100644 ${alias.oid}\t${target}\0`, 'latin1') });
+  return git(root, ['write-tree'], { env });
+}
+
+/** Parse `check-attr -z` output for `CONVERSION_ATTRS` into {filtered, encoded}. */
+function parseConversionAttributes(out, paths) {
+  const filtered = new Set();
+  const encoded = new Set();
+  const f = out.toString('latin1').split('\0');
+  if (f.length !== paths.length * 6 + 1 || f[f.length - 1] !== '') throw new Error('check-attr: unexpected output');
+  for (let i = 0; i + 5 < f.length; i += 6) {
+    if (f[i + 1] !== 'filter' || f[i + 3] !== f[i] || f[i + 4] !== 'working-tree-encoding') {
+      throw new Error('check-attr: unexpected output');
+    }
+    if (attrIsSet(f[i + 2])) filtered.add(f[i]);
+    if (attrIsSet(f[i + 5])) encoded.add(f[i]);
+  }
+  return { filtered, encoded };
+}
+
+/**
+ * M0-G15 fallback, only after `add -A -- vault` failed: of every path that
+ * add would visit (`ls-files --cached --others --exclude-standard` against
+ * the seed index; a nested repository shows as `dir/`), the ones it must not
+ * be asked to convert — present files (not directories, not deleted from the
+ * working tree) whose pre-add evaluation has a `filter` (`filtered-path`) or
+ * a `working-tree-encoding` (`encoded-path`), as path -> reason. git dies on
+ * the whole add for one file it cannot convert (UTF-32 or a BOM-less
+ * UTF-16/UTF-32 rule, an odd byte count under UTF-16, an unknown encoding, a
+ * valueless `working-tree-encoding`, a failing required filter), so those are
+ * withheld from the redone add.
+ */
+function withheldAddCandidates(root, seedEnv) {
+  const candidates = [
+    ...new Set(splitZ(gitRaw(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', VAULT_PATHSPEC], { env: seedEnv }))),
+  ].sort(byteOrder);
+  const deleted = new Set(splitZ(gitRaw(root, ['ls-files', '-z', '--deleted', '--', VAULT_PATHSPEC], { env: seedEnv })));
+  const files = candidates.filter((p) => !p.endsWith('/') && !deleted.has(p));
+  const { filtered, encoded } = conversionAttributes(root, files, seedEnv);
+  /** @type {Map<string, string>} */
+  const withheld = new Map();
+  for (const p of files) {
+    if (filtered.has(p)) withheld.set(p, 'filtered-path');
+    else if (encoded.has(p)) withheld.set(p, 'encoded-path');
+  }
+  return withheld;
+}
+
+/**
+ * True if a path component (a byte string, latin1) names a `.gitattributes`
+ * file on ANY platform: git's `is_ntfs_dotgitattributes` OR its
+ * `is_hfs_dotgitattributes`, both applied on every OS so the two engines
+ * agree everywhere (`isNtfsDotGitattributes`, `isHfsDotGitattributes`).
+ */
+export function isAttributesFileName(name) {
+  return isNtfsDotGitattributes(name) || isHfsDotGitattributes(name);
+}
+
+/**
+ * The code points HFS+ ignores in a file name, so git ignores them when it
+ * compares a name against `.gitattributes` (`next_hfs_char`, utf8.c):
+ * U+200C..U+200F, U+202A..U+202E, U+206A..U+206F and U+FEFF.
+ */
+const HFS_IGNORABLE = new Set([
+  0x200c, 0x200d, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x206a, 0x206b, 0x206c, 0x206d, 0x206e, 0x206f, 0xfeff,
+]);
+
+/**
+ * One UTF-8 code point of byte string `s` at `i`, as [codePoint, next]: a
+ * verbatim port of git's `pick_one_utf8_char` (utf8.c) on a NUL-terminated
+ * string — the end of `s` reads as NUL (code point 0), and a malformed,
+ * overlong, surrogate, U+FFFE/U+FFFF or > U+10FFFF sequence is [0, -1].
+ */
+function pickOneUtf8Char(s, i) {
+  const b = (k) => (k < s.length ? s.charCodeAt(k) & 0xff : 0);
+  const s0 = b(i);
+  const s1 = b(i + 1);
+  const s2 = b(i + 2);
+  const s3 = b(i + 3);
+  if (s0 < 0x80) return [s0, i + 1];
+  if ((s0 & 0xe0) === 0xc0) {
+    if ((s1 & 0xc0) !== 0x80 || (s0 & 0xfe) === 0xc0) return [0, -1];
+    return [((s0 & 0x1f) << 6) | (s1 & 0x3f), i + 2];
+  }
+  if ((s0 & 0xf0) === 0xe0) {
+    if (
+      (s1 & 0xc0) !== 0x80 ||
+      (s2 & 0xc0) !== 0x80 ||
+      (s0 === 0xe0 && (s1 & 0xe0) === 0x80) ||
+      (s0 === 0xed && (s1 & 0xe0) === 0xa0) ||
+      (s0 === 0xef && s1 === 0xbf && (s2 & 0xfe) === 0xbe)
+    ) {
+      return [0, -1];
+    }
+    return [((s0 & 0x0f) << 12) | ((s1 & 0x3f) << 6) | (s2 & 0x3f), i + 3];
+  }
+  if ((s0 & 0xf8) === 0xf0) {
+    if (
+      (s1 & 0xc0) !== 0x80 ||
+      (s2 & 0xc0) !== 0x80 ||
+      (s3 & 0xc0) !== 0x80 ||
+      (s0 === 0xf0 && (s1 & 0xf0) === 0x80) ||
+      (s0 === 0xf4 && s1 > 0x8f) ||
+      s0 > 0xf4
+    ) {
+      return [0, -1];
+    }
+    return [((s0 & 0x07) << 18) | ((s1 & 0x3f) << 12) | ((s2 & 0x3f) << 6) | (s3 & 0x3f), i + 4];
+  }
+  return [0, -1];
+}
+
+/**
+ * True if a path component (a byte string, latin1) is `.gitattributes` as
+ * HFS+ compares names: a verbatim port of git's `is_hfs_dotgitattributes`
+ * (`is_hfs_dot_generic(path, "gitattributes", 13)`, utf8.c) — the UTF-8
+ * name with every `HFS_IGNORABLE` code point dropped is `.` plus
+ * `gitattributes` in any ASCII case, followed by the end of the name (or a
+ * malformed UTF-8 sequence, which git reads as the end), or a directory
+ * separator (`/`, or `\` as Git for Windows spells one).
+ */
+export function isHfsDotGitattributes(name) {
+  let pos = 0;
+  const next = () => {
+    for (;;) {
+      if (pos < 0) return 0;
+      const [c, n] = pickOneUtf8Char(name, pos);
+      pos = n;
+      if (c === 0) {
+        pos = -1;
+        return 0;
+      }
+      if (!HFS_IGNORABLE.has(c)) return c;
+    }
+  };
+  if (next() !== 0x2e) return false;
+  for (const ch of 'gitattributes') {
+    const c = next();
+    if (c > 127) return false;
+    const lower = c >= 0x41 && c <= 0x5a ? c + 32 : c;
+    if (lower !== ch.charCodeAt(0)) return false;
+  }
+  const c = next();
+  return c === 0 || c === 0x2f || c === 0x5c;
+}
+
+/**
+ * True if a path component (a byte string, latin1) is `.gitattributes` as
+ * NTFS compares names: a verbatim port of git's `is_ntfs_dotgitattributes`
+ * (`is_ntfs_dot_generic(name, "gitattributes", 13, "gi7d29")`, path.c) —
+ * `.gitattributes` in any ASCII case, optionally followed by trailing spaces
+ * / periods and an NTFS `:stream` suffix, plus the 8.3 short names
+ * `gitatt~1`..`gitatt~4` and the hashed `gi7d29~N` form. Case-insensitive
+ * everywhere (not just on Windows).
+ */
+export function isNtfsDotGitattributes(name) {
+  const NAME = 'gitattributes';
+  const SHORT = 'gi7d29';
+  const lower = asciiLower(name);
+  const onlySpacesAndPeriods = (i) => {
+    for (; i < name.length; i++) {
+      const c = name[i];
+      if (c === ':') return true;
+      if (c !== ' ' && c !== '.') return false;
+    }
+    return true;
+  };
+  if (lower.startsWith(`.${NAME}`)) return onlySpacesAndPeriods(NAME.length + 1);
+  if (lower.startsWith(NAME.slice(0, 6)) && name[6] === '~' && name[7] >= '1' && name[7] <= '4') return onlySpacesAndPeriods(8);
+  let sawTilde = false;
+  for (let i = 0; i < 8; i++) {
+    if (i >= name.length) return false;
+    const c = name[i];
+    if (sawTilde) {
+      if (c < '0' || c > '9') return false;
+    } else if (c === '~') {
+      i++;
+      if (i >= name.length || name[i] < '1' || name[i] > '9') return false;
+      sawTilde = true;
+    } else if (i >= 6) return false;
+    else if (c.charCodeAt(0) & 0x80) return false;
+    else if (lower[i] !== SHORT[i]) return false;
+  }
+  return onlySpacesAndPeriods(8);
+}
+
+/**
+ * True if ANY component of a repo-relative byte path names a
+ * `.gitattributes`: the attributes file itself, or anything under a
+ * directory with such a name (DEF-4: a committed `vault/.gitattributes`
+ * replaced by a directory `vault/.gitattributes/n.md` — restoring the file
+ * would silently drop the note from the commit).
+ */
+export function isAttributesFilePath(bytePath) {
+  return bytePath.split('/').some(isAttributesFileName);
 }
 
 /**
  * State of one attribute file: its full content, or absent / a link /
  * another non-regular entry / unreadable. `followLinks` is false for in-tree
  * `.gitattributes` (git refuses to read those through a symlink) and true for
- * the info/global/system files (git opens them normally).
+ * the info/global/system files (git opens them normally). `path` may be a
+ * string or a Buffer (raw bytes).
  */
 function attributeFileState(path, followLinks) {
   let st;
@@ -510,25 +978,54 @@ function attributeFileState(path, followLinks) {
 }
 
 /**
- * Every `.gitattributes` under `dir` (relative keys `vault/.../.gitattributes`
- * -> state), walked without following links; a directory holding `.git` (a
- * nested repository or the vault's own submodule checkout) is not entered —
- * git reads no superproject attributes there.
+ * Every directory under vault/ that `add -A -- vault` visits, as byte-string
+ * repo-relative paths, sorted: `vault` itself plus every ancestor directory
+ * of every path `ls-files --cached --others --exclude-standard -- vault`
+ * lists against `env` (the seed index) — git's own walk, so it follows
+ * exactly the directories git follows on this OS (Git for Windows descends
+ * into a directory junction, POSIX git never into a symlink; DEF-2), enters
+ * a real nested repository whose paths are tracked (DEF-3) and a directory
+ * with a bogus `.git`, and skips an untracked real nested repository (listed
+ * as `dir/`: `add` stages it as a gitlink and reads nothing inside) and an
+ * ignored directory. Bounded and cycle-safe because git's walk is (a
+ * junction cycle ends at git's path-length limit).
  */
-function walkVaultAttributes(root, rel, out) {
-  const dir = join(root, rel);
-  let entries;
-  try {
-    entries = readdirSync(dir, { withFileTypes: true });
-  } catch (e) {
-    out.set(`dir:${rel}`, `error:${e.code}`);
-    return;
+function addVisitedDirectories(root, env) {
+  const dirs = new Set([VAULT_PATHSPEC]);
+  for (const listed of splitZ(gitRaw(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', VAULT_PATHSPEC], { env }))) {
+    let p = listed.endsWith('/') ? listed.slice(0, -1) : listed;
+    for (let slash = p.lastIndexOf('/'); slash > 0; slash = p.lastIndexOf('/')) {
+      p = p.slice(0, slash);
+      if (dirs.has(p)) break;
+      dirs.add(p);
+    }
   }
-  if (entries.some((e) => e.name === '.git')) return;
-  for (const e of entries) {
-    const child = `${rel}/${e.name}`;
-    if (e.name === GITATTRIBUTES) out.set(`wt:${child}`, attributeFileState(join(root, child), false));
-    else if (e.isDirectory() && !e.isSymbolicLink()) walkVaultAttributes(root, child, out);
+  return [...dirs].sort(byteOrder);
+}
+
+/**
+ * Every attributes file in the directories `add` visits (keys
+ * `wt:vault/.../<name>` -> state, byte-string names): each entry whose name
+ * `isAttributesFileName` accepts (any case, so the `.GitAttributes` git
+ * reads on a case-insensitive filesystem is seen, M0-G13). A directory that
+ * cannot be listed is recorded as its error (absent = nothing to record).
+ */
+function vaultAttributeFiles(root, env, out) {
+  const rootBytes = Buffer.from(`${root}/`);
+  for (const rel of addVisitedDirectories(root, env)) {
+    const dir = Buffer.concat([rootBytes, Buffer.from(rel, 'latin1')]);
+    let names;
+    try {
+      names = readdirSync(dir, { encoding: 'buffer' });
+    } catch (e) {
+      if (e.code !== 'ENOENT' && e.code !== 'ENOTDIR') out.set(`dir:${rel}`, `error:${e.code}`);
+      continue;
+    }
+    for (const nameBuf of names) {
+      const name = nameBuf.toString('latin1');
+      if (!isAttributesFileName(name)) continue;
+      out.set(`wt:${rel}/${name}`, attributeFileState(Buffer.concat([dir, Buffer.from('/'), nameBuf]), false));
+    }
   }
 }
 
@@ -541,25 +1038,63 @@ function gitVarPath(root, name) {
   }
 }
 
-/**
- * A1 / A2: every attribute source git reads for a vault path — the in-tree
- * `.gitattributes` at the root and anywhere under vault/, the repo's
- * info/attributes, and the global and system files (paths re-resolved on
- * every call, so a core.attributesFile change is seen too). Two snapshots
- * are equal iff no source changed.
- */
-function attributeSnapshot(root) {
-  const snap = new Map();
-  snap.set(`wt:${GITATTRIBUTES}`, attributeFileState(join(root, GITATTRIBUTES), false));
-  const vault = join(root, VAULT_PATHSPEC);
-  let vst = null;
+/** The tree a tree-ish names (`rev-parse --verify <v>^{tree}`), or 'unresolved'. */
+function treeOf(root, treeish) {
   try {
-    vst = lstatSync(vault);
+    return git(root, ['rev-parse', '--verify', '-q', '--end-of-options', `${treeish}^{tree}`]) || 'unresolved';
   } catch {
-    /* absent */
+    return 'unresolved';
   }
-  if (vst && vst.isDirectory() && !vst.isSymbolicLink()) walkVaultAttributes(root, VAULT_PATHSPEC, snap);
-  else snap.set('dir:vault', vst ? 'not-a-directory' : 'absent');
+}
+
+/**
+ * `attr.tree` (git 2.42+: read attributes from that tree INSTEAD of the
+ * working tree / index): every configured value in order (git uses the last;
+ * an empty value means the empty tree) plus the tree the last one resolves
+ * to, so both a config change and a move of the ref it names are seen.
+ */
+function attrTreeState(root) {
+  let listing;
+  try {
+    listing = gitRaw(root, ['config', '-l', '-z']).toString('latin1');
+  } catch (e) {
+    return `error:${e.message}`;
+  }
+  const values = [];
+  for (const rec of listing.split('\0')) {
+    const nl = rec.indexOf('\n');
+    const key = nl < 0 ? rec : rec.slice(0, nl);
+    if (key === 'attr.tree') values.push(nl < 0 ? null : rec.slice(nl + 1));
+  }
+  if (values.length === 0) return 'unset';
+  const last = values[values.length - 1];
+  const tree = last === null || last === '' ? 'empty' : treeOf(root, Buffer.from(last, 'latin1').toString('utf8'));
+  return `set:${values.map((v) => (v === null ? '\u0001' : v)).join('\0')}\0${tree}`;
+}
+
+/**
+ * A1 / A2: every attribute source git reads for a vault path — every
+ * attributes file (any case) at the root and in every directory under vault/
+ * that `add` visits (`vaultAttributeFiles`, listed against `env`, the seed
+ * index), the repo's info/attributes, the global and system files (paths
+ * re-resolved on every call, so a core.attributesFile change is seen too; a
+ * relative path is resolved against the repository top level, where git
+ * itself opens it), `attr.tree` and `GIT_ATTR_SOURCE` (value + the tree they
+ * name). Two snapshots are equal iff no source changed. Throws if git cannot
+ * list the vault (the tick then fails explicitly).
+ */
+function attributeSnapshot(root, env) {
+  const snap = new Map();
+  let rootNames = [];
+  try {
+    rootNames = readdirSync(root);
+  } catch (e) {
+    snap.set('dir:.', `error:${e.code}`);
+  }
+  for (const name of rootNames) {
+    if (isAttributesFileName(toBytePath(name))) snap.set(`wt:${name}`, attributeFileState(join(root, name), false));
+  }
+  vaultAttributeFiles(root, env, snap);
   let info = null;
   try {
     const p = git(root, ['rev-parse', '--git-path', 'info/attributes']);
@@ -568,10 +1103,20 @@ function attributeSnapshot(root) {
     /* recorded as unresolved */
   }
   snap.set('info', info ? `${info}\0${attributeFileState(info, true)}` : 'unresolved');
+  let top = null;
+  try {
+    top = git(root, ['rev-parse', '--show-toplevel']) || null;
+  } catch {
+    /* recorded as unresolved */
+  }
   for (const name of ['GIT_ATTR_GLOBAL', 'GIT_ATTR_SYSTEM']) {
-    const p = gitVarPath(root, name);
+    const raw = gitVarPath(root, name);
+    const p = raw && top ? resolve(top, raw) : null;
     snap.set(name, p ? `${p}\0${attributeFileState(p, true)}` : 'unresolved');
   }
+  snap.set('attr.tree', attrTreeState(root));
+  const source = process.env.GIT_ATTR_SOURCE;
+  snap.set('GIT_ATTR_SOURCE', source === undefined ? 'unset' : `set:${source}\0${treeOf(root, source)}`);
   return snap;
 }
 
@@ -817,6 +1362,7 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
   // git reads as an empty index): the pre-add attribute evaluation uses it.
   const seedIndex = join(tempDir, 'seed-index');
   const env = { GIT_INDEX_FILE: indexFile };
+  const seedEnv = { GIT_INDEX_FILE: seedIndex };
   try {
     const headEntries = treeEntries(root, head);
     const snapshot = realIndexSnapshot(root);
@@ -826,23 +1372,42 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
       git(root, ['read-tree', head], { env });
       copyFileSync(indexFile, seedIndex);
     }
-    const attrsBefore = attributeSnapshot(root); // A1
+    const attrsBefore = attributeSnapshot(root, seedEnv); // A1
+    /** @type {Map<string, string>} path -> reason, withheld from the add (M0-G15). */
+    let withheld = new Map();
     // -A so deletions are captured; .gitignore respected; vault/ only.
     try {
       git(root, ['add', '-A', '--', VAULT_PATHSPEC], { env });
     } catch (e) {
       // A sparse checkout makes `add` refuse (and fail on) out-of-cone
-      // paths: redo it from the seed with --sparse; those paths are then
-      // flagged below, so the tick never fails for that reason.
-      if (!sparseCheckoutEnabled(root)) throw e;
+      // paths, and a file git cannot convert (M0-G15) makes it die: redo it
+      // from the seed, with --sparse (those paths are then flagged below)
+      // and without the filtered / encoded files, so the tick never fails
+      // for either reason.
+      const sparse = sparseCheckoutEnabled(root);
+      withheld = withheldAddCandidates(root, seedEnv);
+      if (!sparse && withheld.size === 0) throw e;
       if (head) copyFileSync(seedIndex, indexFile);
       else rmSync(indexFile, { force: true });
-      git(root, ['add', '-A', '--sparse', '--', VAULT_PATHSPEC], { env });
+      const sparseArg = sparse ? ['--sparse'] : [];
+      if (withheld.size === 0) {
+        git(root, ['add', '-A', ...sparseArg, '--', VAULT_PATHSPEC], { env });
+      } else {
+        // `add -A -- vault` minus each withheld file: the one call that runs
+        // with pathspec magic, and every pathspec is still `literal`.
+        const specs = [`:(literal)${VAULT_PATHSPEC}`, ...[...withheld.keys()].map((p) => `:(exclude,literal)${p}`)];
+        const specFile = join(tempDir, 'pathspec');
+        writeFileSync(specFile, Buffer.from(specs.map((s) => `${s}\0`).join(''), 'latin1'));
+        git(root, ['add', '-A', ...sparseArg, `--pathspec-from-file=${specFile}`, '--pathspec-file-nul'], {
+          env: { ...env, ...MAGIC_PATHSPEC_ENV },
+        });
+      }
     }
     const preliminaryTree = git(root, ['write-tree'], { env });
     onPhase?.('added');
     const prelimEntries = treeEntries(root, preliminaryTree);
-    const allChanged = differingPaths(headEntries, prelimEntries);
+    // Withheld paths are candidates too: they are excluded (and reported) below.
+    const allChanged = [...new Set([...differingPaths(headEntries, prelimEntries), ...withheld.keys()])].sort(byteOrder);
 
     const modeOf = (entries, p) => (entries.has(p) ? entries.get(p).split(' ')[0] : null);
     const blobOf = (p) => prelimEntries.get(p).split(' ')[1];
@@ -855,16 +1420,47 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
       else if (owned.has(p)) early.set(p, 'user-staged');
       else if (modeOf(headEntries, p) === GITLINK_MODE || modeOf(prelimEntries, p) === GITLINK_MODE) early.set(p, 'gitlink');
       else if (matchesSecretFilename(p)) early.set(p, 'secret-filename');
+      else if (isAttributesFilePath(p)) early.set(p, 'attributes-file');
     }
 
-    // filtered-path: a `filter` attribute in the pre-add (seed index) OR the
-    // post-add (temp index) evaluation. Deletions carry no blob.
+    // filtered-path / encoded-path: a `filter` / `working-tree-encoding`
+    // attribute in ANY view a reader could apply (DEF-1): the working tree
+    // before (seed index) and after (temp index) the add and against the
+    // user's real index (a staged rule); HEAD's committed
+    // attribute files and the tree about to be committed (T0), each with this
+    // repository's info / global / system files (a checkout here); and T0's
+    // attribute files alone (a fresh clone). Deletions carry no blob.
+    // Withheld paths keep the reason the fallback found.
     /** @type {Map<string, string>} */
     const late = new Map();
-    const present = allChanged.filter((p) => !early.has(p) && prelimEntries.has(p));
-    const filteredBefore = filteredPaths(root, present, { GIT_INDEX_FILE: seedIndex });
-    const filteredAfter = filteredPaths(root, present, env);
-    for (const p of present) if (filteredBefore.has(p) || filteredAfter.has(p)) late.set(p, 'filtered-path');
+    for (const [p, r] of withheld) if (!early.has(p)) late.set(p, r);
+    const present = allChanged.filter((p) => !early.has(p) && !withheld.has(p) && prelimEntries.has(p));
+    if (present.length > 0) {
+      // T0: every early exclusion applied (in a copy of the temp index). The
+      // late exclusions only restore paths that are not attributes files, so
+      // the commit's attribute files are exactly T0's (and HEAD's).
+      let t0 = preliminaryTree;
+      if (early.size > 0) {
+        const t0Index = join(tempDir, 't0-index');
+        copyFileSync(indexFile, t0Index);
+        restoreToHead(root, { GIT_INDEX_FILE: t0Index }, [...early.keys()], headEntries, preliminaryTree.length);
+        t0 = git(root, ['write-tree'], { env: { GIT_INDEX_FILE: t0Index } });
+      }
+      const cloneDir = cloneViewRepository(root, tempDir);
+      const views = [
+        conversionAttributes(root, present, seedEnv),
+        conversionAttributes(root, present, env),
+        conversionAttributes(root, present, {}), // the user's real index: a staged rule
+        ...(head ? [conversionAttributes(root, present, seedEnv, head)] : []),
+        conversionAttributes(root, present, seedEnv, t0),
+        cloneViewAttributes(cloneDir, present, t0),
+        ...aliasAttributeFiles(root, head, headEntries).map((a) => cloneViewAttributes(cloneDir, present, treeWithAttributesBlob(root, tempDir, t0, a))),
+      ];
+      for (const p of present) {
+        if (views.some((v) => v.filtered.has(p))) late.set(p, 'filtered-path');
+        else if (views.some((v) => v.encoded.has(p))) late.set(p, 'encoded-path');
+      }
+    }
 
     // The exact blobs the commit would contain: size cap, LFS pointer, secrets.
     const toScan = present.filter((p) => !late.has(p));
@@ -876,29 +1472,48 @@ export function runAutocommit(root, now = () => new Date().toISOString(), { onPh
     onPhase?.('scanned');
 
     // A2: any attribute source changed since A1 -> defer the whole tick.
-    const attrsChanged = !sameSnapshot(attrsBefore, attributeSnapshot(root));
+    const attrsChanged = !sameSnapshot(attrsBefore, attributeSnapshot(root, seedEnv));
     /** @type {Map<string, string>} path -> reason; first match wins. */
     const reasons = new Map();
     for (const p of allChanged) {
       const r = early.get(p) ?? (attrsChanged ? 'attributes-changed' : late.get(p));
       if (r) reasons.set(p, r);
     }
-    const excluded = allChanged.filter((p) => reasons.has(p));
-    const commitPaths = allChanged.filter((p) => !reasons.has(p));
-    const skipped = excluded.map(toDisplayPath);
-    const skippedDetail = excluded.map((p) => ({ path: toDisplayPath(p), reason: reasons.get(p) }));
-
-    if (commitPaths.length === 0) return { status: 'noop', skipped, skippedDetail, recovered };
+    const report = () => {
+      const excluded = allChanged.filter((p) => reasons.has(p));
+      return {
+        skipped: excluded.map(toDisplayPath),
+        skippedDetail: excluded.map((p) => ({ path: toDisplayPath(p), reason: reasons.get(p) })),
+      };
+    };
+    let commitPaths = allChanged.filter((p) => !reasons.has(p));
+    if (commitPaths.length === 0) return { status: 'noop', ...report(), recovered };
 
     let tree = preliminaryTree;
-    if (excluded.length > 0) {
-      const zero = '0'.repeat(preliminaryTree.length);
-      const info = excluded
-        .map((p) => (headEntries.has(p) ? `${headEntries.get(p)}\t${p}\0` : `0 ${zero}\t${p}\0`))
-        .join('');
-      gitRaw(root, ['update-index', '-z', '--index-info'], { env, input: Buffer.from(info, 'latin1') });
+    if (reasons.size > 0) {
+      restoreToHead(root, env, [...reasons.keys()], headEntries, preliminaryTree.length);
       tree = git(root, ['write-tree'], { env });
+      // path-conflict: a committed path that a restored exclusion displaced
+      // (git holds no file under a path that is a file). Then every staged
+      // path must be either committed exactly as staged or reported, and
+      // nothing else may change (DEF-4).
+      const finalEntries = treeEntries(root, tree);
+      for (const p of commitPaths) {
+        if (finalEntries.get(p) !== prelimEntries.get(p) && finalEntries.get(p) === headEntries.get(p)) reasons.set(p, 'path-conflict');
+      }
+      commitPaths = commitPaths.filter((p) => !reasons.has(p));
+      const committed = new Set(commitPaths);
+      for (const p of differingPaths(headEntries, finalEntries)) {
+        if (!committed.has(p) || finalEntries.get(p) !== prelimEntries.get(p)) {
+          throw new Error(`autocommit: the commit tree would change ${toDisplayPath(p)} unexpectedly; nothing committed`);
+        }
+      }
+      for (const p of commitPaths) {
+        if (finalEntries.get(p) !== prelimEntries.get(p)) throw new Error(`autocommit: ${toDisplayPath(p)} would be silently dropped; nothing committed`);
+      }
     }
+    const { skipped, skippedDetail } = report();
+    if (commitPaths.length === 0) return { status: 'noop', skipped, skippedDetail, recovered };
     const headTree = head ? git(root, ['rev-parse', `${head}^{tree}`]) : EMPTY_TREE;
     if (tree === headTree) return { status: 'noop', skipped, skippedDetail, recovered };
 

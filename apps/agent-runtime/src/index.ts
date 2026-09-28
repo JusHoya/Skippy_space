@@ -16,6 +16,7 @@ import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
+import { sweepExecutorState } from './executor-env.js';
 import { logger } from './logger.js';
 import { startMemoryJobs, type MemoryJobsHandle } from './memory-jobs.js';
 import { setModelFor, type ScopeId } from './modelRegistry.js';
@@ -51,6 +52,10 @@ async function main(): Promise<void> {
   setupGracefulShutdown();
 
   logger.info({ msg: 'agent-runtime starting', node: process.version });
+  // Leftovers of crashed executor runs and the legacy persistent executor
+  // directories (M0-G06, OQ-22; executor-env.ts). Best effort, never throws.
+  const swept = sweepExecutorState();
+  if (swept.removed.length > 0) logger.info({ msg: 'executor state swept at startup', removed: swept.removed });
   writeEnvelope({
     type: 'log',
     level: 'info',

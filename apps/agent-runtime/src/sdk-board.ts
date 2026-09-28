@@ -30,9 +30,17 @@
 // `projectRoot` = an extra read-only root); the sidecar's ambient
 // `process.cwd()` is never consulted (red-team N2). Without either, the board
 // has NO read roots: every built-in filesystem read is denied and the CLI runs
-// in a dedicated empty scratch directory.
-
-import { mkdirSync } from 'node:fs';
+// in a fresh, empty, per-execution directory inside the executor state base
+// (`noRootWorkingDirectory`, executor-env.ts), gone after the run.
+//
+// PROTOTYPE POLLUTION (M1 pre-flight D-B2, OQ-22): the run parameters, deps
+// and enforcement hooks are captured once, as own properties, into frozen
+// null-prototype records (`captureMissionParams`); every `query()` option the
+// SDK reads is an own property (`hardenedQueryOptions`); hook matchers carry
+// own `matcher`/`timeout` (`hookMatcher`); the CLI is spawned with a
+// null-prototype env (`spawnExecutorProcess`: Node's spawn enumerates `env`
+// with for…in); and every stream message is captured as own data before it
+// is mapped. An absent field is absent — never an inherited value.
 
 import type { ExecutorTerminal, ModelId } from '@skippy/shared';
 import { isNormalStopReason, TRUNCATED_STREAM_DETAIL } from '@skippy/shared';
@@ -43,21 +51,40 @@ import type {
   HookEvent,
   McpServerConfig,
   SDKResultMessage,
+  SpawnedProcess,
+  SpawnOptions,
 } from '@anthropic-ai/claude-agent-sdk';
+import { spawn, type SpawnOptions as NodeSpawnOptions } from 'node:child_process';
 
 import { loadCharter, type Charter, type CharterAgentId } from './charter.js';
 import { resolveExecutionGate } from './execution-gate.js';
+import {
+  buildClaudeExecutorEnv,
+  createExecutorConfigDir,
+  noRootWorkingDirectory,
+  removeExecutorConfigDir,
+  sweepExecutorState,
+} from './executor-env.js';
 import { logger } from './logger.js';
 import {
   CLAUDE_AGENT_SDK_CAPABILITIES,
   ToolPolicyError,
   assertExecutorEligible,
   buildClaudeSdkPermissionOptions,
+  captureOwnData,
   derivePolicy,
+  failClosedHookOutput,
+  failClosedPermissionResult,
   filterMcpServers,
+  hookMatcher,
+  nullRecord,
+  ownString,
+  ownValue,
   parseMcpToolName,
+  resolveEnforcementHooks,
   type ClaudeSdkPermissionOptions,
   type ExecutionPolicy,
+  type ResolvedEnforcementHooks,
   type SdkEnforcementHooks,
 } from './tool-policy.js';
 
@@ -76,6 +103,10 @@ export type ClaudeAgentSdkModule = Pick<typeof import('@anthropic-ai/claude-agen
 export interface ExecuteBoardMissionDeps {
   /** Defaults to a dynamic import of `@anthropic-ai/claude-agent-sdk`. */
   loadSdk?: () => Promise<ClaudeAgentSdkModule>;
+  /** TEST-ONLY: applied over the executor's scrubbed environment
+   * (executor-env.ts). Production never passes it. It cannot set
+   * `CLAUDE_CONFIG_DIR`: the per-execution directory is forced after it. */
+  executorEnvOverrides?: Readonly<Record<string, string>>;
 }
 
 function loadClaudeAgentSdk(): Promise<ClaudeAgentSdkModule> {
@@ -108,21 +139,79 @@ export interface ExecuteBoardMissionParams {
  * Derive the enforced policy for a board mission and prove this adapter can
  * enforce it. Throws ToolPolicyError (the mission must be refused). No
  * ambient `process.cwd()` is ever used: roots are exactly the ones the caller
- * assigned; with none, the read roots are empty and the executor's cwd is the
- * dedicated no-root scratch directory (created here so the CLI can start).
+ * assigned; with none, the read roots are empty and the executor's cwd is
+ * `noRootCwd` — the per-execution no-root directory the executor created
+ * (`noRootWorkingDirectory(configDir)`) — or, when none is handed in, a
+ * placeholder inside the executor state base that is never created.
  */
-export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Promise<ExecutionPolicy> {
-  const charter =
-    params.charter ?? (await loadCharter(`board.${params.boardId}` as CharterAgentId));
+export async function resolveBoardPolicy(params: ExecuteBoardMissionParams, noRootCwd?: string): Promise<ExecutionPolicy> {
+  return resolveCapturedPolicy(captureMissionParams(params), noRootCwd);
+}
+
+async function resolveCapturedPolicy(p: CapturedMission, noRootCwd?: string): Promise<ExecutionPolicy> {
+  const charter = p.charter ?? (await loadCharter(`board.${p.boardId}` as CharterAgentId));
   const policy = derivePolicy(charter, {
-    ...(params.worktreePath ? { worktreePath: params.worktreePath } : {}),
-    ...(params.projectRoot ? { projectRoot: params.projectRoot } : {}),
+    // Validated by derivePolicy (a non-string / relative root is refused).
+    ...(p.worktreePath !== undefined ? { worktreePath: p.worktreePath as string } : {}),
+    ...(p.projectRoot !== undefined ? { projectRoot: p.projectRoot as string } : {}),
+    ...(noRootCwd !== undefined ? { noRootCwd } : {}),
   });
   assertExecutorEligible(policy, CLAUDE_AGENT_SDK_CAPABILITIES);
-  if (policy.readRoots.length === 0) {
-    mkdirSync(policy.cwd, { recursive: true });
-  }
   return policy;
+}
+
+/**
+ * The mission parameters, captured ONCE at run start as OWN properties into
+ * a frozen null-prototype record (M1 pre-flight D-B2). Production callers
+ * (board.ts) omit `enforcement` and, without an assignment, `worktreePath` /
+ * `projectRoot`; those absences must stay absences — before this, each was
+ * read through the prototype chain, so a polluted `Object.prototype
+ * .enforcement = { approver }` approved a later run's Bash and a polluted
+ * `projectRoot` / `worktreePath` / `charter` broadened its roots and grants.
+ * The enforcement hooks are resolved here too (`resolveEnforcementHooks`:
+ * own properties, once), so nothing read later can substitute them.
+ */
+interface CapturedMission {
+  readonly boardId: string;
+  readonly systemPrompt: string;
+  readonly model: ModelId;
+  readonly missionBrief: string;
+  readonly mcpServers: Record<string, McpServerConfig> | undefined;
+  readonly maxTurns: number;
+  readonly charter: Charter | undefined;
+  readonly worktreePath: unknown;
+  readonly projectRoot: unknown;
+  readonly enforcement: ResolvedEnforcementHooks;
+}
+
+function captureMissionParams(params: unknown): CapturedMission {
+  const text = (k: string): string => {
+    const v = ownValue(params, k);
+    return typeof v === 'string' ? v : '';
+  };
+  const servers = ownValue(params, 'mcpServers');
+  const maxTurns = ownValue(params, 'maxTurns');
+  const charter = ownValue(params, 'charter');
+  // An empty / absent root is "not assigned" (as before); anything else is
+  // handed to `derivePolicy`, which validates it (non-string => refused).
+  const root = (k: 'worktreePath' | 'projectRoot'): unknown => {
+    const v = ownValue(params, k);
+    return v === undefined || v === null || v === '' ? undefined : v;
+  };
+  return nullRecord({
+    boardId: text('boardId'),
+    systemPrompt: text('systemPrompt'),
+    model: text('model') as ModelId,
+    missionBrief: text('missionBrief'),
+    mcpServers: servers && typeof servers === 'object' ? (servers as Record<string, McpServerConfig>) : undefined,
+    maxTurns: typeof maxTurns === 'number' ? maxTurns : 8,
+    // A present-but-malformed charter is handed on as is: `derivePolicy`
+    // refuses it (charter_not_loaded); only an ABSENT one is loaded from disk.
+    charter: charter === undefined ? undefined : (charter as Charter),
+    worktreePath: root('worktreePath'),
+    projectRoot: root('projectRoot'),
+    enforcement: resolveEnforcementHooks(ownValue(params, 'enforcement') as SdkEnforcementHooks | undefined),
+  });
 }
 
 /**
@@ -181,7 +270,9 @@ export async function resolveBoardPolicy(params: ExecuteBoardMissionParams): Pro
  * (null from the real API), so they are not a signal on their own. Earlier
  * main-thread turns judged truncated when a later turn superseded them (a
  * background wake-up segment needs no `result` in between) are applied on top
- * — see {@link TruncatedTurnLedger}.
+ * — see {@link TruncatedTurnLedger}. Superseded turns that ended abnormally
+ * and main-thread terminal errors inside a result-less segment (M0-G01) are
+ * applied through the {@link RunFailureLedger}.
  *
  * A succeeded result's `summary` is always a non-blank string (`result` when
  * it is one, otherwise {@link NO_SUMMARY}) so the emitted `delegation_complete`
@@ -248,7 +339,7 @@ function mapSdkResultMessage(
       reason: {
         code: 'provider_error',
         message: `Board ${boardId} executor hit a provider API error (status ${msg.api_error_status}).`,
-        detail: String(msg.api_error_status),
+        detail: plainText(msg.api_error_status),
       },
     });
   }
@@ -353,7 +444,7 @@ function mapSdkResultMessage(
   const detail =
     msg.subtype === 'success'
       ? `success result ${msg.is_error === false ? 'ended abnormally' : 'flagged is_error'}: ${resultText ?? NO_SUMMARY}${suffix ? ` (${suffix})` : ''}`
-      : [msg.subtype, terminalReason, abnormalStop ? `stop_reason: ${describeValue(stopReason)}` : '', ...errors.map(String)]
+      : [msg.subtype, terminalReason, abnormalStop ? `stop_reason: ${describeValue(stopReason)}` : '', ...errors.map(plainText)]
           .filter(Boolean)
           .join(': ');
   return withCost({
@@ -378,6 +469,12 @@ function describeValue(v: unknown): string {
   if (Array.isArray(v)) return 'array';
   if (typeof v === 'string') return JSON.stringify(v.length > 80 ? `${v.slice(0, 80)}…` : v);
   return typeof v;
+}
+
+/** `String(v)` for primitives; a short description for objects (a captured
+ * message's objects have no prototype, so `String()` would throw). */
+function plainText(v: unknown): string {
+  return v !== null && (typeof v === 'object' || typeof v === 'function') ? describeValue(v) : String(v);
 }
 
 function denialToolName(d: unknown): string {
@@ -476,47 +573,79 @@ export class DenialLedger {
 /** Deny reason carried by a permission-hook output, or null when it allows. */
 function hookOutputDenial(event: string, out: unknown): { reason?: string } | null {
   if (!out || typeof out !== 'object') return null;
-  const o = out as Record<string, unknown>;
-  const hso = o.hookSpecificOutput && typeof o.hookSpecificOutput === 'object'
-    ? (o.hookSpecificOutput as Record<string, unknown>)
-    : undefined;
+  // Own-property reads only (D-B2): what the CLI acts on is the JSON of the
+  // output's OWN properties, so that is all the accounting may look at.
+  const hsoRaw = ownValue(out, 'hookSpecificOutput');
+  const hso = hsoRaw && typeof hsoRaw === 'object' ? hsoRaw : undefined;
   if (event === 'PreToolUse') {
-    if (hso?.permissionDecision === 'deny') {
-      const r = hso.permissionDecisionReason;
-      return typeof r === 'string' ? { reason: r } : {};
+    if (ownValue(hso, 'permissionDecision') === 'deny') {
+      const r = ownString(hso, 'permissionDecisionReason');
+      return r !== undefined ? { reason: r } : {};
     }
-    if (o.decision === 'block') return typeof o.reason === 'string' ? { reason: o.reason } : {};
+    if (ownValue(out, 'decision') === 'block') {
+      const r = ownString(out, 'reason');
+      return r !== undefined ? { reason: r } : {};
+    }
   }
-  if (event === 'PermissionRequest' && hso?.decision && typeof hso.decision === 'object') {
-    const dec = hso.decision as { behavior?: unknown; message?: unknown };
-    if (dec.behavior === 'deny') return typeof dec.message === 'string' ? { reason: dec.message } : {};
+  const dec = ownValue(hso, 'decision');
+  if (event === 'PermissionRequest' && dec && typeof dec === 'object') {
+    if (ownValue(dec, 'behavior') === 'deny') {
+      const m = ownString(dec, 'message');
+      return m !== undefined ? { reason: m } : {};
+    }
   }
   return null;
 }
 
-function instrumentHook(cb: HookCallback, ledger: DenialLedger): HookCallback {
+/** `String(err)` that cannot itself throw. */
+function describeError(err: unknown): string {
+  try {
+    return String(err);
+  } catch {
+    return '(unprintable error)';
+  }
+}
+
+/** Own-property string read that cannot throw (hostile getters, non-objects,
+ * inherited values). */
+function safeString(o: unknown, k: string): string | undefined {
+  return ownString(o, k);
+}
+
+/**
+ * Wrap one hook so every deny it returns is recorded, and so that NOTHING
+ * escapes it (M0-G07 D3): the whole body — the input reads for accounting
+ * included — runs inside one try, and any exception (the inner hook's, or a
+ * hostile input's getter) yields the fail-closed output for the event
+ * (`failClosedHookOutput`: PreToolUse deny, PermissionRequest deny,
+ * PostToolUse withheld) instead of the `{}` the CLI makes of a throw.
+ */
+function instrumentHook(event: HookEvent, cb: HookCallback, ledger: DenialLedger): HookCallback {
+  const gates = event === 'PreToolUse' || event === 'PermissionRequest';
   return async (input, toolUseID, options) => {
-    const event = input.hook_event_name;
-    const rec = input as unknown as Record<string, unknown>;
-    const toolName = typeof rec.tool_name === 'string' ? rec.tool_name : `(${event} hook)`;
-    const id = typeof rec.tool_use_id === 'string' ? rec.tool_use_id : toolUseID;
-    const base: ObservedDenial = {
-      toolName,
-      source: event === 'PermissionRequest' ? 'PermissionRequest' : 'PreToolUse',
-    };
-    if (typeof rec.agent_id === 'string') base.agentId = rec.agent_id;
-    const gates = event === 'PreToolUse' || event === 'PermissionRequest';
-    let out: Awaited<ReturnType<HookCallback>>;
+    let base: ObservedDenial = { toolName: `(${event} hook)`, source: event === 'PermissionRequest' ? 'PermissionRequest' : 'PreToolUse' };
+    let id: string | undefined = typeof toolUseID === 'string' ? toolUseID : undefined;
     try {
-      out = await cb(input, toolUseID, options);
+      const toolName = safeString(input, 'tool_name');
+      if (toolName !== undefined) base = { ...base, toolName };
+      const agentId = safeString(input, 'agent_id');
+      if (agentId !== undefined) base.agentId = agentId;
+      id = safeString(input, 'tool_use_id') ?? id;
+      if (!input || typeof input !== 'object') throw new Error('hook input is not an object');
+      const out = await cb(input, toolUseID, options);
+      const denied = gates ? hookOutputDenial(event, out) : null;
+      if (denied) ledger.record(id, denied.reason !== undefined ? { ...base, reason: denied.reason } : base);
+      return out;
     } catch (err) {
-      // A policy gate that throws is never an allow for accounting purposes.
-      if (gates) ledger.record(id, { ...base, reason: `policy hook threw: ${String(err)}` });
-      throw err;
+      // A gate that throws is a deny — for accounting AND for the CLI.
+      const reason = `policy hook failed closed: ${describeError(err)}`;
+      try {
+        if (gates) ledger.record(id, { ...base, reason });
+      } catch {
+        /* accounting must not stop the deny */
+      }
+      return failClosedHookOutput(event, input, err) as Awaited<ReturnType<HookCallback>>;
     }
-    const denied = gates ? hookOutputDenial(event, out) : null;
-    if (denied) ledger.record(id, denied.reason !== undefined ? { ...base, reason: denied.reason } : base);
-    return out;
   };
 }
 
@@ -524,7 +653,9 @@ function instrumentHook(cb: HookCallback, ledger: DenialLedger): HookCallback {
  * Wrap the policy gate's `canUseTool` and permission hooks so that every
  * deny outcome — including those for calls inside spawned task agents
  * (`agentID` / `agent_id` set) — is recorded in `ledger`. The gate's
- * decisions and return values are passed through unchanged.
+ * decisions and return values are passed through unchanged; a wrapper that
+ * cannot complete (an exception anywhere, hostile inputs) returns an explicit
+ * deny, never throws (M0-G07 D3).
  */
 export function instrumentPermissionOptions(
   permission: ClaudeSdkPermissionOptions,
@@ -532,27 +663,41 @@ export function instrumentPermissionOptions(
 ): ClaudeSdkPermissionOptions {
   const inner = permission.canUseTool;
   const canUseTool: CanUseTool = async (toolName, input, options) => {
-    const base: ObservedDenial = { toolName, source: 'canUseTool' };
-    if (typeof options.agentID === 'string') base.agentId = options.agentID;
-    let result: Awaited<ReturnType<CanUseTool>>;
+    let base: ObservedDenial = { toolName: '(tool)', source: 'canUseTool' };
+    let toolUseID: string | undefined;
     try {
-      result = await inner(toolName, input, options);
+      base = { toolName: typeof toolName === 'string' ? toolName : '(tool)', source: 'canUseTool' };
+      const agentID = safeString(options, 'agentID');
+      if (agentID !== undefined) base.agentId = agentID;
+      toolUseID = safeString(options, 'toolUseID');
+      const result = await inner(toolName, input, options);
+      if (!result || typeof result !== 'object') throw new Error('permission callback returned a non-object');
+      if (ownValue(result, 'behavior') !== 'allow') {
+        const message = ownString(result, 'message');
+        ledger.record(toolUseID, message !== undefined ? { ...base, reason: message } : base);
+      }
+      return result;
     } catch (err) {
-      ledger.record(options.toolUseID, { ...base, reason: `permission callback threw: ${String(err)}` });
-      throw err;
+      try {
+        ledger.record(toolUseID, { ...base, reason: `permission callback failed closed: ${describeError(err)}` });
+      } catch {
+        /* accounting must not stop the deny */
+      }
+      return failClosedPermissionResult(options, err);
     }
-    if (result.behavior !== 'allow') {
-      const message = (result as { message?: unknown }).message;
-      ledger.record(options.toolUseID, typeof message === 'string' ? { ...base, reason: message } : base);
-    }
-    return result;
   };
   const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = {};
   for (const [event, matchers] of Object.entries(permission.hooks) as Array<
     [HookEvent, HookCallbackMatcher[] | undefined]
   >) {
     if (!matchers) continue;
-    hooks[event] = matchers.map((m) => ({ ...m, hooks: m.hooks.map((cb) => instrumentHook(cb, ledger)) }));
+    // Rebuilt with `hookMatcher`: `matcher`/`timeout` stay OWN properties (D-B2).
+    hooks[event] = matchers.map((m) =>
+      hookMatcher(
+        m.hooks.map((cb) => instrumentHook(event, cb, ledger)),
+        ownString(m, 'matcher'),
+      ),
+    );
   }
   return { ...permission, canUseTool, hooks };
 }
@@ -604,6 +749,20 @@ function applyRunDenials(base: SdkBoardResult, ledger: DenialLedger, boardId: st
 // sub turn that hit `max_tokens` and was recovered by the CLI is forwarded
 // with `null`), so only `refusal` or an `error` flag count — a recovered
 // truncation is not a failure.
+//
+// The board's MAIN thread uses the same ledger (M0-G01). While a background
+// task agent runs, CLI 2.1.162 emits no `result` between the board's
+// segments, so a main-thread request that fails terminally there is reported
+// ONLY by (a) a main-thread `<synthetic>` assistant message with the typed
+// `error` field and (b) a main-thread `StopFailure` hook (no `agent_id`); the
+// next segment can still end with `result: success`. Verified live
+// (m_bgMid401/400/500/Destroy/Refusal/MaxTokAll): both signals appear for
+// every terminal failure. A retry the CLI recovers from (529/500/ECONNRESET
+// with CLAUDE_CODE_MAX_RETRIES>0, or the non-streaming fallback) emits only
+// `system/api_retry` — never a synthetic message or `StopFailure` — so only
+// terminal failures are recorded. When the same segment ends with an error
+// `result`, that result already reports the failure and the main-thread
+// entries of the segment are dropped (no doubled reason).
 
 type RunFailureCode = 'provider_error' | 'model_refused' | 'executor_error';
 
@@ -619,9 +778,13 @@ interface ObservedFailure {
   code: RunFailureCode;
   /** Human label for the task agent (id + type + description when known). */
   agent: string;
+  /** `main`: the board's own main thread failed (M0-G01), not a task agent. */
+  scope?: 'main';
   /** Structured signals that reported it (deduplicated, in arrival order). */
   signals: string[];
 }
+
+const failureSubject = (f: ObservedFailure): string => (f.scope === 'main' ? 'main thread' : `task agent ${f.agent}`);
 
 const MAX_FAILURES_IN_DETAIL = 10;
 
@@ -636,10 +799,12 @@ function classifyTaskAgentError(error: unknown, stopReason?: unknown): RunFailur
 }
 
 /**
- * Every task-agent (subagent) failure observed during one SDK run (EC1 D1).
- * Keyed by task-agent id (the CLI's `task_id` == hook `agent_id`), so the hook
- * and the forwarded message for the same agent count once, keeping the most
- * specific reason code. Any entry fails the run (see {@link applyRunFailures}).
+ * Every task-agent (subagent) failure observed during one SDK run (EC1 D1),
+ * plus main-thread failures that no `result` reports (M0-G01). Keyed by
+ * task-agent id (the CLI's `task_id` == hook `agent_id`) or by a main-thread
+ * failure key, so the hook and the stream message for the same failure count
+ * once, keeping the most specific reason code. Any entry fails the run (see
+ * {@link applyRunFailures}).
  */
 export class RunFailureLedger {
   private readonly byKey = new Map<string, ObservedFailure>();
@@ -653,7 +818,14 @@ export class RunFailureLedger {
     const code = FAILURE_PRIORITY[f.code] > FAILURE_PRIORITY[prev.code] ? f.code : prev.code;
     const signals = [...prev.signals];
     for (const s of f.signals) if (!signals.includes(s)) signals.push(s);
-    this.byKey.set(key, { code, agent: prev.agent, signals });
+    const merged: ObservedFailure = { code, agent: prev.agent, signals };
+    if (prev.scope) merged.scope = prev.scope;
+    this.byKey.set(key, merged);
+  }
+
+  /** Drop an entry another signal already reports (an error `result`). */
+  delete(key: string): void {
+    this.byKey.delete(key);
   }
 
   list(): ObservedFailure[] {
@@ -662,6 +834,14 @@ export class RunFailureLedger {
 
   get size(): number {
     return this.byKey.size;
+  }
+
+  /** Who failed, for "… also failed" details. */
+  subjects(): string {
+    const all = this.list();
+    const main = all.some((f) => f.scope === 'main');
+    const task = all.some((f) => f.scope !== 'main');
+    return main && task ? 'main thread and task agents' : main ? 'main thread' : 'task agents';
   }
 
   toReason(boardId: string): { code: RunFailureCode; message: string; detail: string } {
@@ -674,13 +854,12 @@ export class RunFailureLedger {
     };
     const shown = all
       .slice(0, MAX_FAILURES_IN_DETAIL)
-      .map((f) => `${f.code} [task agent ${f.agent}]: ${f.signals.join('; ')}`);
+      .map((f) => `${f.code} [${failureSubject(f)}]: ${f.signals.join('; ')}`);
     if (all.length > shown.length) shown.push(`…and ${all.length - shown.length} more`);
+    const count = all.every((f) => f.scope !== 'main') ? `${all.length} task agents failed` : `${all.length} failures`;
     return {
       code: first.code,
-      message:
-        `Board ${boardId} task agent ${first.agent} ${what[first.code]}` +
-        (all.length > 1 ? ` (${all.length} task agents failed).` : '.'),
+      message: `Board ${boardId} ${failureSubject(first)} ${what[first.code]}` + (all.length > 1 ? ` (${count}).` : '.'),
       detail: shown.join(' | '),
     };
   }
@@ -731,14 +910,25 @@ interface MainTurn {
   content: number;
   /** Indexes of streamed content blocks started but never stopped. */
   openBlocks: Set<number>;
-  /** tool_use ids of this turn's closed (forwarded) tool_use blocks. */
+  /** tool_use ids of this turn's closed (forwarded) tool_use blocks — streamed
+   * or non-streamed (M0-G02). */
   toolUseIds: Set<string>;
   /** The CLI returned a main-thread tool_result for one of `toolUseIds`. */
+  ranTools: boolean;
+  /** …and at least one of them was not `is_error` (M0-G03): a call the CLI
+   * rejected (invalid input, unknown tool, denial) proves nothing about the
+   * rest of a cut turn. */
   executed: boolean;
   /** A new main-thread API request began (`system/status: requesting`) after
    * this turn's `message_start` — the turn can no longer be completed by the
    * non-streaming fallback of its own request. */
   requestAfter: boolean;
+  /** A new segment began (`system/init`, e.g. a background-task wake-up)
+   * after this turn: the CLI's own query loop ended without continuing it. */
+  segmentAfter: boolean;
+  /** Ledger key of a main-thread terminal failure (synthetic error message)
+   * the CLI reported for this turn's own request (M0-G01). */
+  failureKey?: string;
   /** `message_start`'s own stop_reason (null from the real API). The CLI copies
    * it into the turn's streamed assistant messages (verified live,
    * `t_startStopEndTrunc`), so it is never a completion signal. */
@@ -758,22 +948,34 @@ function newMainTurn(
     content: 0,
     openBlocks: new Set(),
     toolUseIds: new Set(),
+    ranTools: false,
     executed: false,
     requestAfter: false,
+    segmentAfter: false,
     startStop,
   };
 }
 
 const stopReasonOf = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
 
+function addToolUseIds(turn: MainTurn, content: unknown): void {
+  if (!Array.isArray(content)) return;
+  for (const b of content as unknown[]) {
+    const block = asRecord(b);
+    if (block?.type === 'tool_use' && typeof block.id === 'string') turn.toolUseIds.add(block.id);
+  }
+}
+
 /**
  * Why a main-thread turn is truncated (OQ-20), or undefined when complete.
  * A turn is complete when it got a stop reason with every streamed content
  * block closed, or — lacking a stop reason — when every block it opened was
- * closed and the CLI executed one of its tool_use blocks (the CLI accepted
- * the turn and continued; verified live, `t_toolBlockCut`). A block left open
- * means content was lost even if an earlier tool ran (`t_twoToolsCutMid1`: the
- * CLI ran tool #0 and silently dropped the half-streamed tool #1).
+ * closed and the CLI executed one of its tool_use blocks without error (the
+ * CLI accepted the turn and continued; verified live, `t_toolBlockCut`,
+ * `z_nsToolNullStop` for a non-streamed turn). A block left open means
+ * content was lost even if an earlier tool ran (`t_twoToolsCutMid1`: the CLI
+ * ran tool #0 and silently dropped the half-streamed tool #1). A tool_use the
+ * CLI rejected with an `is_error` result (`x_invalidToolCut`) is no evidence.
  */
 function truncationOf(t: MainTurn): string | undefined {
   const open = t.openBlocks.size;
@@ -790,6 +992,38 @@ function truncationOf(t: MainTurn): string | undefined {
     return `ended (stop_reason ${JSON.stringify(t.stopReason)}) with ${openNote}`;
   }
   return undefined;
+}
+
+/**
+ * A superseded main-thread turn that got a stop reason but did not end
+ * normally (OQ-20, M0-G01), or undefined. Judged only after
+ * {@link truncationOf} found the turn complete:
+ *
+ *   - `end_turn` / `stop_sequence` ({@link isNormalStopReason}): normal.
+ *   - `tool_use`: normal when the CLI returned a tool_result (error or not)
+ *     for one of the turn's tool_use blocks, or the turn had none (nothing to
+ *     run; the CLI simply continued). A tool_use turn whose tools never ran
+ *     was abandoned → `executor_error`.
+ *   - `refusal` → `model_refused`.
+ *   - anything else (`max_tokens`, `pause_turn`,
+ *     `model_context_window_exceeded`, unknown): normal only when the CLI
+ *     continued it inside the same segment (its max_tokens recovery; verified
+ *     live, `mainmaxtok`, `m_bgMidMaxTokAll` turns 1–3). Superseded across a
+ *     segment boundary (a background wake-up) the CLI never recovered it →
+ *     `executor_error` (`m_bgMidPause`). A recovery the CLI gives up on is
+ *     also reported by its synthetic error message (`max_output_tokens`).
+ */
+function abnormalStopOf(t: MainTurn): { code: RunFailureCode; why: string } | undefined {
+  const stop = t.stopReason;
+  if (stop === null || isNormalStopReason(stop)) return undefined;
+  const tag = `stop_reason ${JSON.stringify(stop)}`;
+  if (stop === 'tool_use') {
+    if (t.ranTools || t.toolUseIds.size === 0) return undefined;
+    return { code: 'executor_error', why: `ended with ${tag} but none of its tool calls ran` };
+  }
+  if (stop === 'refusal') return { code: 'model_refused', why: `was refused (${tag})` };
+  if (!t.segmentAfter) return undefined;
+  return { code: 'executor_error', why: `ended with ${tag} and the CLI did not continue it before the next segment` };
 }
 
 const MAX_TRUNCATIONS_IN_DETAIL = 10;
@@ -837,6 +1071,16 @@ export class RunStreamObserver {
   private mainTurn: MainTurn | null = null;
   /** Main-thread `stream_event`s seen, i.e. partial messages are flowing. */
   private streamEvents = false;
+  /** Main-thread terminal failures reported by synthetic error messages and
+   * by `StopFailure` hooks so far (M0-G01). The CLI reports each one once by
+   * each signal, in order, so the n-th of either shares one ledger key. */
+  private mainErrorMessages = 0;
+  private mainStopFailures = 0;
+  /** Main-thread failure keys recorded in the current segment; dropped when
+   * the segment's own `result` reports an error (it already carries it). */
+  private readonly segmentMainKeys = new Set<string>();
+  /** Turns without a message id judged abnormal (unique ledger keys). */
+  private anonTurns = 0;
 
   constructor(
     private readonly policy: Pick<ExecutionPolicy, 'allowedTools' | 'mcpServers'>,
@@ -884,6 +1128,75 @@ export class RunStreamObserver {
     else if (msg.type === 'assistant') this.observeAssistant(msg);
     else if (msg.type === 'user') this.observeUser(msg);
     else if (msg.type === 'stream_event') this.observeStreamEvent(msg);
+    else if (msg.type === 'result') this.observeResult(msg);
+  }
+
+  /**
+   * A main-thread `StopFailure` hook call (no `agent_id`): the CLI gave up on
+   * a main-thread request (M0-G01). Recorded whether or not a `result`
+   * follows; see {@link observeResult} for the dedupe.
+   */
+  recordMainStopFailure(error: unknown, lastAssistantMessage: unknown): void {
+    const code = classifyTaskAgentError(error);
+    const signals = [`StopFailure error=${describeValue(error)}`];
+    const ex = code === 'provider_error' ? excerpt(lastAssistantMessage) : undefined;
+    if (ex) signals.push(`cli: ${ex}`);
+    this.recordMain(`main:failure#${++this.mainStopFailures}`, code, signals);
+  }
+
+  private recordMain(key: string, code: RunFailureCode, signals: string[]): void {
+    this.failures.record(key, { code, agent: 'main thread', scope: 'main', signals });
+    this.segmentMainKeys.add(key);
+  }
+
+  /**
+   * A `result` that itself reports a failure (error subtype, `is_error`, an
+   * API error status, an abnormal/missing stop reason or terminal reason) is
+   * always mapped non-success, and a non-success result is never overridden
+   * by a later success; the main-thread failures of its segment are then
+   * already reported and are dropped so the reason is not doubled. After a
+   * clean result they stay: a later segment cannot un-fail them.
+   */
+  private observeResult(msg: Record<string, unknown>): void {
+    const tr = msg.terminal_reason;
+    const reportsFailure =
+      msg.subtype !== 'success' ||
+      msg.is_error !== false ||
+      (msg.api_error_status !== undefined && msg.api_error_status !== null) ||
+      !isNormalStopReason(msg.stop_reason) ||
+      (tr !== undefined && tr !== 'completed');
+    if (reportsFailure) for (const key of this.segmentMainKeys) this.failures.delete(key);
+    this.segmentMainKeys.clear();
+  }
+
+  /** A main-thread assistant message carrying the typed `error` field: the
+   * CLI's synthetic terminal error message (M0-G01). */
+  private observeMainError(msg: Record<string, unknown>, message: Record<string, unknown> | undefined): void {
+    const error = msg.error;
+    if (error === undefined || error === null) return;
+    const key = `main:failure#${++this.mainErrorMessages}`;
+    // The failed request's own streamed turn (e.g. a refusal, or the last of
+    // the CLI's max_tokens recoveries) shares the key when it is judged later.
+    const turn = this.mainTurn;
+    if (turn && !turn.requestAfter && turn.failureKey === undefined) turn.failureKey = key;
+    const stopReason = message?.stop_reason;
+    const signals = [
+      [
+        'assistant',
+        `error=${describeValue(error)}`,
+        typeof stopReason === 'string' ? `stop_reason=${stopReason}` : '',
+        message?.model === '<synthetic>' ? 'model=<synthetic>' : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
+    ];
+    if (message?.model === '<synthetic>') {
+      const content = Array.isArray(message.content) ? (message.content as unknown[]) : [];
+      const text = content.map((b) => asRecord(b)).find((b) => b?.type === 'text' && typeof b.text === 'string')?.text;
+      const ex = excerpt(text);
+      if (ex) signals.push(`cli: ${ex}`);
+    }
+    this.recordMain(key, classifyTaskAgentError(error, stopReason), signals);
   }
 
   /**
@@ -905,12 +1218,27 @@ export class RunStreamObserver {
    * Judge the tracked main-thread turn now that it is superseded by `next`
    * (OQ-20). Only a turn's own non-streaming fallback may replace it without
    * a stop reason; that case never reaches here (see observeMainAssistant).
+   * A truncated turn goes to the truncation ledger; a complete turn that
+   * ended abnormally (see {@link abnormalStopOf}) to the failure ledger.
    */
   private supersede(next: string): void {
     const turn = this.mainTurn;
-    const why = turn ? truncationOf(turn) : undefined;
-    if (turn && why) {
-      this.truncations.record(`main-thread turn ${turn.id ?? '(no id)'} ${why}, superseded by ${next}`);
+    if (!turn) return;
+    const label = `main-thread turn ${turn.id ?? '(no id)'}`;
+    const why = truncationOf(turn);
+    if (why) {
+      this.truncations.record(`${label} ${why}, superseded by ${next}`);
+      return;
+    }
+    const abnormal = abnormalStopOf(turn);
+    if (abnormal) {
+      const key = turn.failureKey ?? `main:turn:${turn.id ?? `#${++this.anonTurns}`}`;
+      this.failures.record(key, {
+        code: abnormal.code,
+        agent: 'main thread',
+        scope: 'main',
+        signals: [`${label} ${abnormal.why}, superseded by ${next}`],
+      });
     }
   }
 
@@ -966,9 +1294,10 @@ export class RunStreamObserver {
    * right after the dropped stream, with no `system/status: requesting` in
    * between, under a new id or the same one): it completes that turn with its
    * own `stop_reason` (D2). If a new API request began since the tracked
-   * turn's `message_start`, that turn was abandoned and is judged first. The
-   * CLI's `<synthetic>` error messages are left to the result mapping (they
-   * come with an `is_error` result).
+   * turn's `message_start`, that turn was abandoned and is judged first. A
+   * non-streamed turn's tool_use ids are tracked like a streamed turn's
+   * (M0-G02). The CLI's `<synthetic>` error messages are not turns; the ones
+   * carrying `error` are recorded by {@link observeMainError}.
    */
   private observeMainAssistant(message: Record<string, unknown> | undefined): void {
     if (!this.streamEvents || !message || message.model === '<synthetic>') return;
@@ -977,17 +1306,20 @@ export class RunStreamObserver {
     const turn = this.mainTurn;
     if (turn?.source === 'stream' && id === turn.id && (stop === null || stop === turn.startStop)) {
       turn.content++;
-      const content = Array.isArray(message.content) ? (message.content as unknown[]) : [];
-      for (const b of content) {
-        const block = asRecord(b);
-        if (block?.type === 'tool_use' && typeof block.id === 'string') turn.toolUseIds.add(block.id);
-      }
+      addToolUseIds(turn, message.content);
+      return;
+    }
+    // Another content message of the same non-streamed response.
+    if (turn?.source === 'non-streamed' && id !== undefined && id === turn.id && !turn.requestAfter && stop === turn.stopReason) {
+      turn.content++;
+      addToolUseIds(turn, message.content);
       return;
     }
     if (turn?.requestAfter) {
       this.supersede(`non-streamed main-thread message ${id ?? '(no id)'} of a later request`);
     }
     this.mainTurn = newMainTurn(id, 'non-streamed', stop);
+    addToolUseIds(this.mainTurn, message.content);
   }
 
   private observeSystem(msg: Record<string, unknown>): void {
@@ -1001,6 +1333,10 @@ export class RunStreamObserver {
         return;
       }
       case 'init': {
+        // CLI 2.1.162 starts every segment (the first one and each
+        // background-task wake-up) with `system/init`.
+        if (this.mainTurn) this.mainTurn.segmentAfter = true;
+        this.segmentMainKeys.clear();
         if (Array.isArray(msg.tools)) {
           this.offered = new Set(msg.tools.filter((t): t is string => typeof t === 'string').map(canonicalToolName));
         }
@@ -1068,10 +1404,12 @@ export class RunStreamObserver {
         this.toolNames.set(block.id, block.name);
       }
     }
-    // Task-agent terminal failure (signal 2). Main-thread assistant errors are
-    // covered by the result message mapping and are not recorded here.
+    // Task-agent terminal failure (signal 2). A main-thread terminal error is
+    // recorded too (M0-G01): no `result` follows it inside a segment that a
+    // background task keeps open.
     const parent = msg.parent_tool_use_id;
     if (typeof parent !== 'string' || parent.length === 0) {
+      this.observeMainError(msg, message);
       this.observeMainAssistant(message);
       return;
     }
@@ -1106,10 +1444,12 @@ export class RunStreamObserver {
     for (const b of content) {
       const block = asRecord(b);
       if (block?.type !== 'tool_result') continue;
-      // OQ-20: the CLI executed a tool_use of the tracked main-thread turn.
+      // OQ-20: the CLI ran a tool_use of the tracked main-thread turn; only a
+      // non-error result proves it executed (M0-G03).
       const toolUseId = block.tool_use_id;
       if (mainThread && turn && typeof toolUseId === 'string' && turn.toolUseIds.has(toolUseId)) {
-        turn.executed = true;
+        turn.ranTools = true;
+        if (block.is_error !== true) turn.executed = true;
       }
       if (block.is_error !== true) continue;
       const id = typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined;
@@ -1152,17 +1492,21 @@ export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
 ): T & { forwardSubagentText: true; includePartialMessages: true } {
   const stopFailure: HookCallback = (input) => {
     try {
-      const rec = input as unknown as Record<string, unknown>;
-      const agentId = rec.agent_id;
-      // Main-thread StopFailure also ends the run with an error result, which
-      // mapSdkResultMessage handles; only task agents are recorded here.
-      if (typeof agentId === 'string' && agentId.length > 0) {
+      // Own-property reads (D-B2): an absent `agent_id` is the main thread.
+      const agentId = ownValue(input, 'agent_id');
+      const error = ownValue(input, 'error');
+      const lastMessage = ownValue(input, 'last_assistant_message');
+      if (typeof agentId !== 'string' || agentId.length === 0) {
+        // Main thread (M0-G01): no error `result` follows inside a segment a
+        // background task keeps open; deduped against one that does.
+        observer.recordMainStopFailure(error, lastMessage);
+      } else {
         const { key, label } = observer.agentKey(agentId);
-        const code = classifyTaskAgentError(rec.error);
-        const signals = [`StopFailure error=${describeValue(rec.error)}`];
+        const code = classifyTaskAgentError(error);
+        const signals = [`StopFailure error=${describeValue(error)}`];
         // For API errors the last message is the CLI's synthetic error text;
         // otherwise it may be model prose, which is not copied into the detail.
-        const ex = code === 'provider_error' ? excerpt(rec.last_assistant_message) : undefined;
+        const ex = code === 'provider_error' ? excerpt(lastMessage) : undefined;
         if (ex) signals.push(`cli: ${ex}`);
         failures.record(key, { code, agent: label, signals });
       }
@@ -1172,7 +1516,8 @@ export function withRunObservers<T extends ClaudeSdkPermissionOptions>(
     return Promise.resolve({});
   };
   const hooks: Partial<Record<HookEvent, HookCallbackMatcher[]>> = { ...permission.hooks };
-  hooks.StopFailure = [...(hooks.StopFailure ?? []), { hooks: [stopFailure] }];
+  const existing = ownValue(hooks, 'StopFailure');
+  hooks.StopFailure = [...(Array.isArray(existing) ? (existing as HookCallbackMatcher[]) : []), hookMatcher([stopFailure])];
   return { ...permission, hooks, forwardSubagentText: true, includePartialMessages: true };
 }
 
@@ -1192,7 +1537,7 @@ function applyRunFailures(base: SdkBoardResult, failures: RunFailureLedger, boar
       ...base,
       reason: {
         ...base.reason,
-        detail: `${base.reason.detail ?? base.reason.message} | task agents also failed: ${reason.detail}`,
+        detail: `${base.reason.detail ?? base.reason.message} | ${failures.subjects()} also failed: ${reason.detail}`,
       },
     };
     return out;
@@ -1256,12 +1601,209 @@ function applyRunLedgers(
  * refusal is returned as `blocked`, every other failure as `failed`.
  */
 export async function executeBoardMissionViaSdk(
-  params: ExecuteBoardMissionParams,
-  deps: ExecuteBoardMissionDeps = {},
+  paramsIn: ExecuteBoardMissionParams,
+  depsIn: ExecuteBoardMissionDeps = {},
+): Promise<SdkBoardResult> {
+  // Freeze-by-construction (D-B2): parameters, hooks and deps are read ONCE,
+  // as own properties, before anything else runs.
+  const params = captureMissionParams(paramsIn);
+  const deps = captureDeps(depsIn);
+  // Stale leftovers of crashed runs and the legacy persistent directories go
+  // first (best effort; executor-env.ts). Then THIS run's private state —
+  // the CLI's config directory and its support directory (the no-root cwd,
+  // the empty global git config and hooks dir) — fresh, random, outside
+  // every tool root, deleted on every exit path, never reused (M0-G06 D1).
+  const swept = sweepExecutorState();
+  if (swept.removed.length > 0) logger.info({ msg: 'executor state swept', removed: swept.removed });
+  const configDir = createExecutorConfigDir();
+  try {
+    return await executeBoardMissionInRun(params, deps, configDir);
+  } finally {
+    const removed = await removeExecutorConfigDir(configDir);
+    if (!removed) {
+      logger.warn({ msg: 'executor config dir could not be removed', boardId: params.boardId, dir: configDir });
+    }
+  }
+}
+
+interface CapturedDeps {
+  readonly loadSdk: () => Promise<ClaudeAgentSdkModule>;
+  readonly executorEnvOverrides: Readonly<Record<string, string>> | undefined;
+}
+
+function captureDeps(deps: unknown): CapturedDeps {
+  const load = ownValue(deps, 'loadSdk');
+  const overrides = ownValue(deps, 'executorEnvOverrides');
+  return nullRecord({
+    loadSdk: typeof load === 'function' ? (load as () => Promise<ClaudeAgentSdkModule>) : loadClaudeAgentSdk,
+    executorEnvOverrides:
+      overrides && typeof overrides === 'object' ? (overrides as Readonly<Record<string, string>>) : undefined,
+  });
+}
+
+/**
+ * Every option key the installed SDK (0.3.162) reads from `query()` options:
+ * the `Options` type in sdk.d.ts plus the undocumented keys its query
+ * builder destructures or reads (`getOAuthToken`, `getHostAuthToken`,
+ * `workload`, `appendSubagentSystemPrompt`,
+ * `webSearchIsolationExemptMcpServers`). The builder copies the options with
+ * an object rest (`{systemPrompt, …, ...q} = options`) into an ORDINARY
+ * object and destructures that, so an option we did not set was read from
+ * `Object.prototype` — `extraArgs` (arbitrary CLI flags),
+ * `pathToClaudeCodeExecutable`, `executable`, `settings`, `plugins`,
+ * `agents`, `resume`, … (M1 pre-flight D-B2). `hardenedQueryOptions` makes
+ * every one of them an OWN property. A test re-derives the list from the
+ * installed sdk.d.ts / sdk.mjs, so an SDK bump that adds a key fails.
+ */
+export const SDK_QUERY_OPTION_KEYS: readonly string[] = Object.freeze([
+  'abortController',
+  'additionalDirectories',
+  'agent',
+  'agentProgressSummaries',
+  'agents',
+  'allowDangerouslySkipPermissions',
+  'allowedTools',
+  'appendSubagentSystemPrompt',
+  'betas',
+  'canUseTool',
+  'continue',
+  'cwd',
+  'debug',
+  'debugFile',
+  'disallowedTools',
+  'effort',
+  'enableFileCheckpointing',
+  'env',
+  'executable',
+  'executableArgs',
+  'extraArgs',
+  'fallbackModel',
+  'forkSession',
+  'forwardSubagentText',
+  'getHostAuthToken',
+  'getOAuthToken',
+  'hooks',
+  'includeHookEvents',
+  'includePartialMessages',
+  'loadTimeoutMs',
+  'managedSettings',
+  'maxBudgetUsd',
+  'maxThinkingTokens',
+  'maxTurns',
+  'mcpServers',
+  'model',
+  'onElicitation',
+  'onUserDialog',
+  'outputFormat',
+  'pathToClaudeCodeExecutable',
+  'permissionMode',
+  'permissionPromptToolName',
+  'persistSession',
+  'planModeInstructions',
+  'plugins',
+  'promptSuggestions',
+  'resume',
+  'resumeSessionAt',
+  'sandbox',
+  'sessionId',
+  'sessionStore',
+  'sessionStoreFlush',
+  'settingSources',
+  'settings',
+  'skills',
+  'spawnClaudeCodeProcess',
+  'stderr',
+  'strictMcpConfig',
+  'systemPrompt',
+  'taskBudget',
+  'thinking',
+  'title',
+  'toolAliases',
+  'toolConfig',
+  'tools',
+  'webSearchIsolationExemptMcpServers',
+  'workload',
+]);
+
+/** `query()` options as a null-prototype record in which EVERY key in
+ * SDK_QUERY_OPTION_KEYS is an own property (`undefined` unless set), so the
+ * SDK's defaults — never an inherited value — apply to what we leave out. */
+export function hardenedQueryOptions<T extends object>(fields: T): T {
+  const out = Object.create(null) as Record<string, unknown>;
+  for (const k of SDK_QUERY_OPTION_KEYS) out[k] = undefined;
+  for (const k of Object.keys(fields)) out[k] = (fields as Record<string, unknown>)[k];
+  return out as T;
+}
+
+/**
+ * The executor's process spawn (`spawnClaudeCodeProcess`), equivalent to the
+ * SDK's default `spawnLocalProcess` (same command, args, cwd, abort signal,
+ * `windowsHide`, stdin/stdout piped; stderr ignored — the SDK pipes it only
+ * for `DEBUG_CLAUDE_AGENT_SDK` / an `stderr` callback, neither of which this
+ * runtime sets) with ONE difference: the environment and the spawn options
+ * are NULL-PROTOTYPE records holding only the own string entries the SDK
+ * built. Node's `spawn` enumerates `env` with `for…in`, so with the default
+ * spawner an enumerable property polluted onto `Object.prototype`
+ * (`RIPGREP_CONFIG_PATH`, `CLAUDE_CODE_*`, `GIT_*`, …) became a variable of
+ * the executor's process, bypassing the allowlist (executor-env.ts, OQ-22).
+ */
+export function spawnExecutorProcess(o: SpawnOptions): SpawnedProcess {
+  const command = ownValue(o, 'command');
+  const rawArgs = ownValue(o, 'args');
+  const args = Array.isArray(rawArgs) ? captureOwnData<unknown[]>(rawArgs) : undefined;
+  if (typeof command !== 'string' || !args || args.some((a) => typeof a !== 'string')) {
+    throw new Error('executor spawn refused: malformed command or arguments');
+  }
+  const envIn = ownValue(o, 'env');
+  const env = Object.create(null) as Record<string, string>;
+  if (envIn && typeof envIn === 'object') {
+    for (const k of Object.keys(envIn)) {
+      const v = (envIn as Record<string, unknown>)[k];
+      if (typeof v === 'string') env[k] = v;
+    }
+  }
+  const cwd = ownValue(o, 'cwd');
+  const signal = ownValue(o, 'signal');
+  const options = Object.create(null) as NodeSpawnOptions;
+  options.stdio = ['pipe', 'pipe', 'ignore'];
+  options.env = env;
+  options.windowsHide = true;
+  if (typeof cwd === 'string') options.cwd = cwd;
+  if (signal instanceof AbortSignal) options.signal = signal;
+  const child = spawn(command, args as string[], options);
+  if (!child.stdin || !child.stdout) throw new Error('executor spawn refused: stdio pipes missing');
+  const stdin = child.stdin;
+  const stdout = child.stdout;
+  return {
+    stdin,
+    stdout,
+    get killed() {
+      return child.killed;
+    },
+    get exitCode() {
+      return child.exitCode;
+    },
+    kill: (sig: NodeJS.Signals) => child.kill(sig),
+    on: ((event: string, listener: (...a: unknown[]) => void) => {
+      child.on(event, listener);
+    }) as SpawnedProcess['on'],
+    once: ((event: string, listener: (...a: unknown[]) => void) => {
+      child.once(event, listener);
+    }) as SpawnedProcess['once'],
+    off: ((event: string, listener: (...a: unknown[]) => void) => {
+      child.off(event, listener);
+    }) as SpawnedProcess['off'],
+  };
+}
+
+async function executeBoardMissionInRun(
+  params: CapturedMission,
+  deps: CapturedDeps,
+  configDir: string,
 ): Promise<SdkBoardResult> {
   let policy: ExecutionPolicy;
   try {
-    policy = await resolveBoardPolicy(params);
+    policy = await resolveCapturedPolicy(params, noRootWorkingDirectory(configDir));
   } catch (err) {
     const reason = err instanceof ToolPolicyError ? err.message : String(err);
     logger.warn({ msg: 'SDK board refused: tool policy', boardId: params.boardId, err: reason });
@@ -1299,75 +1841,124 @@ export async function executeBoardMissionViaSdk(
   // SDK throws "returned an error result" after an is_error result) keeps
   // that result's specific reason instead of a generic provider_error.
   let terminal: SdkBoardResult | null = null;
-  try {
-    const sdk = await (deps.loadSdk ?? loadClaudeAgentSdk)();
-    const gate = buildClaudeSdkPermissionOptions(policy, {
-      ...params.enforcement,
-      onDecision: (e) => {
-        if (!e.decision.allow) {
+  return runMission();
+
+  async function runMission(): Promise<SdkBoardResult> {
+    try {
+      const sdk = await deps.loadSdk();
+      // The hooks were resolved once at capture (own properties, frozen); the
+      // record literal below has every field as an OWN property.
+      const enforcement = params.enforcement;
+      const gate = buildClaudeSdkPermissionOptions(policy, {
+        approver: enforcement.approver,
+        pathGuard: enforcement.pathGuard,
+        onDecision: (e) => {
+          if (!e.decision.allow) {
+            logger.warn({
+              msg: 'tool call denied by policy',
+              boardId: params.boardId,
+              tool: e.toolName,
+              code: e.decision.code,
+              via: e.via,
+            });
+            denials.noteAudit({ toolName: e.toolName, source: 'policy-audit', reason: `${e.decision.code}: ${e.decision.reason}` });
+          }
+          enforcement.onDecision?.(e);
+        },
+      });
+      const observer = new RunStreamObserver(policy, failures, denials, truncations);
+      const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
+      // An explicit, allowlisted environment: `env` REPLACES the CLI's
+      // environment, so nothing ambient (RIPGREP_CONFIG_PATH, a falsy
+      // USE_BUILTIN_RIPGREP, CLAUDE_CODE_* toggles, …) reaches the executor,
+      // `CLAUDE_CONFIG_DIR` is a fresh private directory nothing could have
+      // planted into, and git is neutralised whatever the worktree's repo
+      // configuration says (M0-G06, FR-SEC-01, OQ-18, OQ-22; executor-env.ts).
+      const env = buildClaudeExecutorEnv(process.env, configDir, deps.executorEnvOverrides);
+      const q = sdk.query({
+        prompt: params.missionBrief,
+        // Every option the SDK reads is an OWN property (D-B2), and the
+        // executor process gets a null-prototype environment.
+        options: hardenedQueryOptions({
+          model: params.model,
+          systemPrompt: params.systemPrompt,
+          maxTurns: params.maxTurns,
+          ...permission,
+          mcpServers: filterMcpServers(policy, params.mcpServers),
+          env,
+          spawnClaudeCodeProcess: spawnExecutorProcess,
+        }),
+      });
+
+      // Await the terminal `result` message(s). Normally the last one observed
+      // wins, but a non-success result anywhere in the stream permanently
+      // disqualifies a later "success" from being reported (D1): once the
+      // stream has shown failure/blocked/interrupted, a subsequent success
+      // message cannot un-fail the mission.
+      let sawNonSuccessResult = false;
+      for await (const raw of q) {
+        // Each message is captured as own data into null-prototype records
+        // (D-B2): a field the stream did not carry (`stop_reason`,
+        // `permission_denials`, `agent_id`, …) is absent, never inherited.
+        const msg = captureOwnData<typeof raw>(raw, false);
+        observer.observe(msg);
+        if (msg.type !== 'result') continue;
+        const reported: unknown = (msg as { permission_denials?: unknown }).permission_denials;
+        if (Array.isArray(reported)) {
+          for (const d of reported as unknown[]) {
+            const id = d && typeof d === 'object' ? (d as { tool_use_id?: unknown }).tool_use_id : undefined;
+            denials.record(typeof id === 'string' ? id : undefined, {
+              toolName: denialToolName(d),
+              source: 'permission_denials',
+            });
+          }
+        }
+        const mapped = mapSdkResultMessage(msg, params.boardId, observer.takeFinalTurnEvidence());
+        if (mapped.status === 'succeeded' && sawNonSuccessResult) {
           logger.warn({
-            msg: 'tool call denied by policy',
+            msg: 'SDK board: later success result ignored after an earlier non-success result',
             boardId: params.boardId,
-            tool: e.toolName,
-            code: e.decision.code,
-            via: e.via,
           });
-          denials.noteAudit({ toolName: e.toolName, source: 'policy-audit', reason: `${e.decision.code}: ${e.decision.reason}` });
+          continue;
         }
-        params.enforcement?.onDecision?.(e);
-      },
-    });
-    const observer = new RunStreamObserver(policy, failures, denials, truncations);
-    const permission = withRunObservers(instrumentPermissionOptions(gate, denials), observer, failures);
-    const q = sdk.query({
-      prompt: params.missionBrief,
-      options: {
-        model: params.model,
-        systemPrompt: params.systemPrompt,
-        maxTurns: params.maxTurns ?? 8,
-        ...permission,
-        mcpServers: filterMcpServers(policy, params.mcpServers),
-      },
-    });
-
-    // Await the terminal `result` message(s). Normally the last one observed
-    // wins, but a non-success result anywhere in the stream permanently
-    // disqualifies a later "success" from being reported (D1): once the
-    // stream has shown failure/blocked/interrupted, a subsequent success
-    // message cannot un-fail the mission.
-    let sawNonSuccessResult = false;
-    for await (const msg of q) {
-      observer.observe(msg);
-      if (msg.type !== 'result') continue;
-      const reported: unknown = (msg as { permission_denials?: unknown }).permission_denials;
-      if (Array.isArray(reported)) {
-        for (const d of reported as unknown[]) {
-          const id = d && typeof d === 'object' ? (d as { tool_use_id?: unknown }).tool_use_id : undefined;
-          denials.record(typeof id === 'string' ? id : undefined, {
-            toolName: denialToolName(d),
-            source: 'permission_denials',
-          });
-        }
+        terminal = mapped;
+        if (mapped.status !== 'succeeded') sawNonSuccessResult = true;
       }
-      const mapped = mapSdkResultMessage(msg, params.boardId, observer.takeFinalTurnEvidence());
-      if (mapped.status === 'succeeded' && sawNonSuccessResult) {
-        logger.warn({
-          msg: 'SDK board: later success result ignored after an earlier non-success result',
-          boardId: params.boardId,
-        });
-        continue;
-      }
-      terminal = mapped;
-      if (mapped.status !== 'succeeded') sawNonSuccessResult = true;
-    }
 
-    if (!terminal) {
+      if (!terminal) {
+        return applyRunLedgers(
+          {
+            status: 'failed',
+            reason: {
+              code: 'no_terminal_result',
+              message: `Board ${params.boardId} executor stream ended without a terminal result.`,
+            },
+          },
+          failures,
+          denials,
+          params.boardId,
+          truncations,
+        );
+      }
+      return applyRunLedgers(terminal, failures, denials, params.boardId, truncations);
+    } catch (err) {
+      logger.warn({
+        msg: 'SDK board execution failed',
+        boardId: params.boardId,
+        err: String(err),
+      });
+      // A non-success result already observed is the more specific truth.
+      const observed: SdkBoardResult | null = terminal;
+      if (observed && observed.status !== 'succeeded') {
+        return applyRunLedgers(observed, failures, denials, params.boardId, truncations);
+      }
       return applyRunLedgers(
         {
           status: 'failed',
           reason: {
-            code: 'no_terminal_result',
-            message: `Board ${params.boardId} executor stream ended without a terminal result.`,
+            code: 'provider_error',
+            message: `Board ${params.boardId} executor failed before a terminal result.`,
+            detail: String(err),
           },
         },
         failures,
@@ -1376,31 +1967,5 @@ export async function executeBoardMissionViaSdk(
         truncations,
       );
     }
-    return applyRunLedgers(terminal, failures, denials, params.boardId, truncations);
-  } catch (err) {
-    logger.warn({
-      msg: 'SDK board execution failed',
-      boardId: params.boardId,
-      err: String(err),
-    });
-    // A non-success result already observed is the more specific truth.
-    const observed: SdkBoardResult | null = terminal;
-    if (observed && observed.status !== 'succeeded') {
-      return applyRunLedgers(observed, failures, denials, params.boardId, truncations);
-    }
-    return applyRunLedgers(
-      {
-        status: 'failed',
-        reason: {
-          code: 'provider_error',
-          message: `Board ${params.boardId} executor failed before a terminal result.`,
-          detail: String(err),
-        },
-      },
-      failures,
-      denials,
-      params.boardId,
-      truncations,
-    );
   }
 }
